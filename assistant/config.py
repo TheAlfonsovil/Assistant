@@ -11,8 +11,22 @@ class Settings(BaseSettings):
     tool_timeout: float = 60.0
     lease_seconds: int = 300
     ollama_timeout: float | None = None
+    collect_system_facts: bool = True
+    persist_system_facts: bool = True
+    persist_user_profile: bool = True
+    workspace_root: str = "."
+    user_name: str | None = None
+    user_birth_date: str | None = None
+    user_profession: str | None = None
+    user_degrees: str = ""
+    user_expertise: str = ""
 
-    model_config = SettingsConfigDict(env_prefix="ASSISTANT_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_prefix="ASSISTANT_",
+        env_file=".env",
+        env_ignore_empty=True,
+        extra="ignore",
+    )
 
 
 @lru_cache

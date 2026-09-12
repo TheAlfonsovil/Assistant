@@ -4,32 +4,12 @@ from typing import Annotated
 import typer
 from httpx import HTTPError
 
-from .application import TaskService
-from .config import get_settings
-from .devices.registry import build_tool_registry
 from .domain.models import TaskRequest
-from .infrastructure.db import Database
-from .llm import MockLLMProvider, OllamaLLMProvider
 from .observability import preview
 from .runtime import TaskRuntime
-from .startup.manager import StartupManager
+from .startup.bootstrap import create_context
 
 app = typer.Typer(help="Assistant Core CLI")
-
-
-async def _service(use_mock: bool, event_sink) -> tuple[Database, object, TaskService, object]:
-    settings = get_settings()
-    database = Database(settings.database_url)
-    await database.create_all()
-    session = database.sessions()
-    provider = (
-        MockLLMProvider()
-        if use_mock
-        else OllamaLLMProvider(settings.ollama_url, settings.ollama_model, settings.ollama_timeout)
-    )
-    service = TaskService(session, provider, build_tool_registry(), event_sink=event_sink)
-    startup = await StartupManager(database, settings, provider).initialize()
-    return database, session, service, startup
 
 
 @app.command("task")
@@ -79,11 +59,16 @@ def task(
             details = f" | nodo={event.node_id}" if fullflow and event.node_id else ""
             typer.echo(f"[Assistant] {message}{details}", err=event.event_type == "TASK_FAILED")
             if fullflow and event.event_type == "LLM_REQUEST":
-                typer.echo(f"        contexto enviado: {preview(event.payload.get('context'))}")
+                context = event.payload.get("context", {})
+                if isinstance(context, dict):
+                    typer.echo(f"        contexto: {', '.join(context.keys())}")
+                else:
+                    typer.echo("        contexto preparado")
             if fullflow and event.event_type == "LLM_RESPONSE":
                 typer.echo(f"        propuesta validada: {preview(event.payload)}")
 
-        database, session, service, startup = await _service(mock, print_event)
+        context = await create_context(use_mock=mock, event_sink=print_event)
+        service, startup = context.service, context.startup
         if fullflow:
             typer.echo(
                 f"[Assistant] startup: status={startup.status} database={startup.database_ready} "
@@ -94,15 +79,40 @@ def task(
         result = None
         try:
             result = await service.run_task(created.id)
+            if result and result.status.value in {"SUCCEEDED", "FAILED", "BLOCKED", "WAITING"} and hasattr(service.llm, "summarize"):
+                events = await service.repository.list_events(created.id)
+                evidence = [
+                    {
+                        "event": event.event_type,
+                        "payload": event.payload,
+                    }
+                    for event in events
+                    if event.event_type in {"TOOL_RESULT", "NODE_COMPLETED", "TASK_FAILED", "ACTION_PROPOSED"}
+                ]
+                report = await service.llm.summarize(
+                    {
+                        "phase": "FINAL_REPORT",
+                        "user_prompt": goal,
+                        "task": result.model_dump(mode="json"),
+                        "assistant_state": {"status": result.status},
+                        "events": evidence,
+                        "long_term_memory": [],
+                    }
+                )
+                typer.echo(f"[Assistant] Informe final: {report.title}")
+                typer.echo(report.summary)
+                for finding in report.findings:
+                    typer.echo(f"  Hallazgo: {finding}")
+                for recommendation in report.recommendations:
+                    typer.echo(f"  Mejora: {recommendation}")
+                if report.limitations:
+                    typer.echo(f"  Limitaciones: {'; '.join(report.limitations)}")
         except (HTTPError, OSError, ValueError) as error:
             typer.echo(f"[TASK_FAILED] id={created.id} error={error}", err=True)
         finally:
             if result:
                 typer.echo(f"[TASK_FINISHED] id={result.id} status={result.status}")
-            await session.close()
-            if hasattr(service.llm, "close"):
-                await service.llm.close()
-            await database.close()
+            await context.close()
 
     asyncio.run(run())
 
@@ -122,7 +132,8 @@ def run(
         async def print_event(event):
             typer.echo(f"[Assistant] {event.event_type} node={event.node_id or '-'} {preview(event.payload)}")
 
-        database, session, service, startup = await _service(mock, print_event)
+        context = await create_context(use_mock=mock, event_sink=print_event)
+        service, startup = context.service, context.startup
         typer.echo(
             f"[Assistant] startup: status={startup.status} database={startup.database_ready} "
             f"llm={startup.llm_ready} recovered_nodes={startup.recovered_nodes} "
@@ -137,10 +148,7 @@ def run(
                 typer.echo(f"[Assistant] background runtime active; interval={interval}s")
                 await runtime.run_forever()
         finally:
-            await session.close()
-            if hasattr(service.llm, "close"):
-                await service.llm.close()
-            await database.close()
+            await context.close()
 
     asyncio.run(loop())
 

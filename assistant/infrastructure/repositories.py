@@ -1,4 +1,5 @@
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -141,6 +142,51 @@ class TaskRepository:
                     break
         await self.session.commit()
         return matches
+
+    async def list_memory(self, limit: int = 50) -> list[MemoryRecord]:
+        result = await self.session.execute(
+            select(MemoryRow).order_by(MemoryRow.updated_at.desc()).limit(limit)
+        )
+        return [
+            MemoryRecord(
+                id=row.id,
+                kind=row.kind,
+                key=row.key,
+                value=row.value_json,
+                source=row.source,
+                confidence=row.confidence,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+                usage_count=row.usage_count,
+            )
+            for row in result.scalars()
+        ]
+
+    async def upsert_memory(
+        self, *, kind: str, key: str, value, source: str = "SYSTEM", confidence: float = 1.0
+    ) -> MemoryRecord:
+        result = await self.session.execute(
+            select(MemoryRow).where(MemoryRow.kind == kind, MemoryRow.key == key)
+        )
+        row = result.scalars().first()
+        now = datetime.now(UTC)
+        if row is None:
+            memory = MemoryRecord(
+                kind=kind, key=key, value=value, source=source, confidence=confidence,
+                created_at=now, updated_at=now,
+            )
+            await self.save_memory(memory)
+            return memory
+        row.value_json = value
+        row.source = source
+        row.confidence = confidence
+        row.updated_at = now
+        await self.session.commit()
+        return MemoryRecord(
+            id=row.id, kind=row.kind, key=row.key, value=row.value_json,
+            source=row.source, confidence=row.confidence, created_at=row.created_at,
+            updated_at=row.updated_at, usage_count=row.usage_count,
+        )
 
     async def save_node(self, node: TaskNode) -> None:
         row = await self.session.get(NodeRow, node.id)

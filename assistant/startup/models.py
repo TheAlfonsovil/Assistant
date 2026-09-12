@@ -3,6 +3,8 @@ from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
+from assistant.domain.models import MemoryRecord, UserProfile
+
 
 class ReadinessStatus(StrEnum):
     READY = "READY"
@@ -18,6 +20,10 @@ class StartupReport(BaseModel):
     llm_model: str | None = None
     recovered_nodes: int = 0
     unfinished_tasks: int = 0
+    first_initialization: bool = False
+    loaded_memories: list[MemoryRecord] = Field(default_factory=list)
+    system_facts: dict[str, str] = Field(default_factory=dict)
+    user_profile: UserProfile | None = None
     checks: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

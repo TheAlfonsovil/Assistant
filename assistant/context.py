@@ -9,14 +9,29 @@ from .domain.models import Operation, OperationResult, Task, TaskNode
 class ContextBuilder:
     """Builds role-specific, bounded contexts for each LLM phase."""
 
-    def __init__(self, repository, tools):
+    def __init__(self, repository, tools, workspace_root: str = "."):
         self.repository = repository
         self.tools = tools
+        self.workspace_root = workspace_root
 
     async def for_planner(self, task: Task) -> dict[str, Any]:
         memories = await self.repository.search_memory(task.goal)
+        if hasattr(self.repository, "list_memory"):
+            profiles = [
+                memory
+                for memory in await self.repository.list_memory()
+                if memory.kind == "user_profile"
+            ]
+            known_ids = {memory.id for memory in memories}
+            memories.extend(profile for profile in profiles if profile.id not in known_ids)
         return {
             "phase": "PLANNER",
+            "user_prompt": task.goal,
+            "assistant_state": {
+                "task_status": task.status,
+                "memory_loaded": True,
+                "workspace_root": self.workspace_root,
+            },
             "task": {
                 "id": task.id,
                 "goal": task.goal,
@@ -32,7 +47,9 @@ class ContextBuilder:
                 "max_tool_calls": task.budget.max_tool_calls,
             },
             "available_tools": [definition.model_dump() for definition in self.tools.definitions()],
+            "available_actions": [definition.model_dump() for definition in self.tools.definitions()],
             "relevant_memory": [memory.model_dump(mode="json") for memory in memories],
+            "long_term_memory": [memory.model_dump(mode="json") for memory in memories],
         }
 
     async def for_resolver(self, task: Task, node: TaskNode, graph: TaskGraph) -> dict[str, Any]:
@@ -51,6 +68,12 @@ class ContextBuilder:
                 )
         return {
             "phase": "NODE_RESOLVER",
+            "user_prompt": task.goal,
+            "assistant_state": {
+                "task_status": task.status,
+                "node_status": node.status,
+                "workspace_root": self.workspace_root,
+            },
             "task": {"id": task.id, "goal": task.goal, "status": task.status},
             "node": {
                 "id": node.id,
@@ -63,6 +86,7 @@ class ContextBuilder:
             },
             "dependency_results": dependency_results,
             "available_tools": [definition.model_dump() for definition in self.tools.definitions()],
+            "available_actions": [definition.model_dump() for definition in self.tools.definitions()],
             "constraints": {"deadline": task.deadline, "cancelled": task.status.value == "CANCELLED"},
         }
 

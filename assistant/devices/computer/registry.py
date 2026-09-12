@@ -1,5 +1,5 @@
-"""Computer branch registry facade."""
+"""Computer branch registration facade."""
 
-from assistant.devices.registry import build_tool_registry
+from .actions import register_actions
 
-__all__ = ["build_tool_registry"]
+__all__ = ["register_actions"]

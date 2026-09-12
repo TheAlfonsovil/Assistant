@@ -186,6 +186,16 @@ class MemoryRecord(BaseModel):
     usage_count: int = 0
 
 
+class UserProfile(BaseModel):
+    """Durable user context explicitly supplied by the user."""
+
+    name: str
+    birth_date: str | None = None
+    profession: str | None = None
+    degrees: list[str] = Field(default_factory=list)
+    expertise: list[str] = Field(default_factory=list)
+
+
 class TaskRequest(BaseModel):
     goal: str = Field(min_length=1, max_length=10000)
     description: str = ""

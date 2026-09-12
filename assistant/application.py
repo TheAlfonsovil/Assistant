@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import re
 import socket
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import uuid4
 
 from httpx import HTTPError
@@ -33,13 +35,21 @@ logger = logging.getLogger(__name__)
 
 
 class TaskService:
-    def __init__(self, session, llm: LLMProvider, tools: ToolRegistry, verifier=None, event_sink=None):
+    def __init__(
+        self,
+        session,
+        llm: LLMProvider,
+        tools: ToolRegistry,
+        verifier=None,
+        event_sink=None,
+        workspace_root: str = ".",
+    ):
         self.repository = TaskRepository(session, event_sink=event_sink)
         self.session = session
         self.llm = llm
         self.tools = tools
         self.verifier = verifier or DeterministicVerifier()
-        self.context_builder = ContextBuilder(self.repository, tools)
+        self.context_builder = ContextBuilder(self.repository, tools, workspace_root=workspace_root)
         self.owner = f"{socket.gethostname()}:{id(self)}"
 
     async def create_task(self, request: TaskRequest) -> Task:
@@ -346,6 +356,41 @@ class TaskService:
             if decision.action == "COMPLETE":
                 node.status = NodeStatus.SUCCEEDED
                 await self.repository.save_node(node)
+                return True
+            if decision.action == "CREATE_ACTION":
+                proposal = decision.action_proposal
+                if proposal is None or not proposal.code.strip():
+                    node.status = NodeStatus.BLOCKED
+                    node.error = "LLM requested CREATE_ACTION without reviewable code"
+                    task.status = TaskStatus.BLOCKED
+                    task.failure_reason = node.error
+                    await self.repository.save_node(node)
+                    await self.repository.save_task(task)
+                    return True
+                safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "-", proposal.name).strip("-") or "generated-action"
+                extension = {"python": ".py", "powershell": ".ps1", "javascript": ".js"}.get(
+                    proposal.language.lower(), ".txt"
+                )
+                artifact_path = Path("data") / "generated_actions" / f"{safe_name}{extension}"
+                artifact_path.parent.mkdir(parents=True, exist_ok=True)
+                artifact_path.write_text(proposal.code, encoding="utf-8")
+                node.status = NodeStatus.WAITING
+                node.output_data = {
+                    "action_proposal": proposal.model_dump(mode="json"),
+                    "artifact": str(artifact_path),
+                    "review_required": True,
+                }
+                task.status = TaskStatus.WAITING
+                await self.repository.save_node(node)
+                await self.repository.save_task(task)
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task_id,
+                        node_id=node.id,
+                        event_type="ACTION_PROPOSED",
+                        payload={"artifact": str(artifact_path), "name": proposal.name},
+                    )
+                )
                 return True
             if decision.operation is None:
                 node.status = NodeStatus.BLOCKED

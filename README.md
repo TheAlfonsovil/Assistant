@@ -2,6 +2,30 @@
 
 Persistent local task engine built with Python 3.12+, SQLite, SQLAlchemy 2, Pydantic, FastAPI, asyncio and Ollama.
 
+## Structure
+
+The project is organized by responsibility first and by device second:
+
+```text
+startup/   load, LLM readiness, recovery
+devices/   computer, mobile, home, robot
+tools.py   stable action contract and dispatch
+application.py / runtime.py   task graph and scheduler
+domain/ + infrastructure/    rules and persistence
+```
+
+The computer branch is the real branch in V1. Its actions live in
+`assistant/devices/computer/actions.py`; mobile, home and robot are explicit
+mock branches. To add an action, implement `Tool`, define its permissions and
+register it in `register_actions`. To add a device, create its package and add
+one `DeviceBranch` in `assistant/devices/registry.py`. See
+[docs/architecture.md](docs/architecture.md) for the complete map.
+
+The initial user profile is read from `ASSISTANT_USER_*` variables in `.env`
+and persisted as one structured `user_profile` memory. The planner receives
+that profile together with task-relevant memories. The included
+`.env.example` shows the profile fields and ISO date format.
+
 ## Quick start
 
 ```powershell
@@ -35,7 +59,11 @@ La ejecución normal muestra el resultado resumido. Para inspeccionar el ciclo c
 
 El comando normal usa Ollama y espera sin límite de tiempo mientras el modelo genera una respuesta local. Usa `--fullflow` para ver la interacción humana completa entre Planner, Resolver, tools y Verifier. Para validar el circuito sin cargar el modelo usa `assistant task --mock --fullflow "tarea de prueba"`.
 
-`assistant run` mantiene vivo el Task Manager: recupera tareas pendientes desde SQLite y las procesa en segundo plano. Usa `assistant run --once` para una pasada única. Cuando no hay trabajo, espera; no crea tareas infinitas de mantenimiento.
+`assistant run` mantiene vivo el Task Manager. Al iniciar carga la configuración,
+crea el esquema, comprueba que el LLM está listo, recupera nodos que quedaron en
+ejecución y continúa con las tareas pendientes desde SQLite. Usa
+`assistant run --once` para una pasada única. Cuando no hay trabajo, espera; no
+crea tareas infinitas de mantenimiento.
 
 Para analizar estructura y relaciones del código, una operación puede usar la capability `project.analyze`. Devuelve archivos examinados, lenguajes, símbolos y aristas de imports; no se confunde con `filesystem.exists`, que solo comprueba una ruta. La memoria persistente vive en SQLite y sus recuerdos relevantes se incorporan al contexto del Planner.
 

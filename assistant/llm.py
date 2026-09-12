@@ -8,11 +8,22 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .domain.models import Operation, VerificationDecision
+from .prompts.v1.template import render
+
+
+class ActionProposal(BaseModel):
+    name: str
+    description: str
+    language: str = "python"
+    code: str
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    safety: str = "review_required"
 
 
 class NodeDecision(BaseModel):
     action: str
     operation: Operation | None = None
+    action_proposal: ActionProposal | None = None
     subtasks: list[str] = Field(default_factory=list)
     reason: str | None = None
 
@@ -35,11 +46,22 @@ class VerificationResult(BaseModel):
     reason: str = ""
 
 
+class FinalReport(BaseModel):
+    title: str
+    summary: str
+    findings: list[str] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    limitations: list[str] = Field(default_factory=list)
+    confidence: str = "medium"
+
+
 class LLMProvider(Protocol):
     async def decide(self, context: dict[str, Any]) -> NodeDecision: ...
     async def plan(self, context: dict[str, Any]) -> PlanProposal: ...
     async def replan(self, context: dict[str, Any]) -> NodeDecision: ...
     async def verify(self, context: dict[str, Any]) -> VerificationResult: ...
+    async def summarize(self, context: dict[str, Any]) -> FinalReport: ...
 
 
 class MockLLMProvider:
@@ -70,15 +92,29 @@ class MockLLMProvider:
             else VerificationDecision.RETRY
         )
 
+    async def summarize(self, context: dict[str, Any]) -> FinalReport:
+        return FinalReport(
+            title="Assistant task report",
+            summary="Task completed with the configured mock provider.",
+            evidence=[f"events={len(context.get('events', []))}"],
+            confidence="high",
+        )
+
 
 class OllamaLLMProvider:
-    def __init__(self, base_url: str, model: str, timeout: float | None = None, client: httpx.AsyncClient | None = None):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout: float | None = None,
+        client: httpx.AsyncClient | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.client = client or httpx.AsyncClient(timeout=timeout)
 
     async def check_ready(self) -> bool:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=None) as client:
             response = await client.get(f"{self.base_url}/api/tags")
             response.raise_for_status()
             models = response.json().get("models", [])
@@ -87,9 +123,10 @@ class OllamaLLMProvider:
     async def _ask(self, role: str, context: dict[str, Any], schema: type[BaseModel]) -> BaseModel:
         prompt_path = Path(__file__).parent / "prompts" / "v1" / f"{role.lower()}.md"
         instructions = prompt_path.read_text(encoding="utf-8")
+        rendered_instructions = render(instructions, context, schema.model_json_schema())
         prompt = {
             "role": role,
-            "instructions": instructions,
+            "instructions": rendered_instructions,
             "context": context,
         }
         response = await self.client.post(
@@ -117,6 +154,9 @@ class OllamaLLMProvider:
 
     async def verify(self, context: dict[str, Any]) -> VerificationResult:
         return await self._ask("VERIFIER", context, VerificationResult)
+
+    async def summarize(self, context: dict[str, Any]) -> FinalReport:
+        return await self._ask("FINAL_REPORT", context, FinalReport)
 
     async def close(self) -> None:
         await self.client.aclose()

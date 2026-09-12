@@ -22,14 +22,22 @@ class ProjectAnalyzer:
             languages = Counter(path.suffix.lower() or "[no extension]" for path in files)
             symbols: list[dict[str, Any]] = []
             edges: list[dict[str, str]] = []
+            modules: list[dict[str, str]] = []
             for path in files:
                 if path.suffix.lower() == ".py":
+                    modules.append(
+                        {
+                            "module": path.with_suffix("").relative_to(started_files).as_posix().replace("/", "."),
+                            "file": str(path.relative_to(started_files)),
+                        }
+                    )
                     self._analyze_python(path, started_files, symbols, edges)
             output = {
                 "root": str(started_files),
                 "files_analyzed": [str(path.relative_to(started_files)) for path in files],
                 "file_count": len(files),
                 "languages": dict(languages),
+                "modules": modules[:2000],
                 "symbols": symbols[:2000],
                 "dependency_edges": edges[:4000],
                 "truncated": len(files) >= max_files,
