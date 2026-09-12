@@ -80,6 +80,8 @@ el número de tareas activas y el último error aparecen en `/health`. Al inicia
 crea el esquema, comprueba que el LLM está listo, recupera nodos que quedaron en
 ejecución y continúa con las tareas pendientes desde SQLite. Usa
 `assistant run --once` para una pasada única.
+`/health` también expone contadores acumulados del runtime: pasadas, tareas
+despachadas, errores por tarea, pasadas idle y pasadas sin LLM disponible.
 
 Cuando una tarea queda en `WAITING`, el cliente puede aportar la respuesta sin
 reiniciar el flujo usando `POST /tasks/{id}/input` con `node_id` e `input`.
@@ -113,13 +115,16 @@ generada automáticamente.
 Las notificaciones usan la herramienta registrada `notify.send`. En el despliegue
 local se persisten en `data/notifications.jsonl`; la entrega externa requiere un
 adaptador, pero el nodo conserva el mismo lease, presupuesto, idempotencia y
-verificación que cualquier otra operación.
+verificación que cualquier otra operación. Un nodo `DECISION` evalúa una expresión
+estructurada segura sin llamar de nuevo al LLM y puede cancelar ramas declaradas.
 
-El planner puede generar nodos `OPERATION`, `SUBTASK`, `WAIT` y `VERIFY`.
+El planner puede generar nodos `OPERATION`, `SUBTASK`, `WAIT`, `VERIFY`,
+`CONDITION`, `DECISION` y `NOTIFY`.
 `WAIT` conserva el input enviado por el usuario y `VERIFY` valida las
-dependencias completadas sin consumir otra llamada al LLM. Los tipos
-`CONDITION` y `NOTIFY` se bloquean explícitamente hasta que exista un lenguaje
-de condiciones y un adaptador de notificaciones.
+dependencias completadas sin consumir otra llamada al LLM. Las operaciones se
+validan antes de invocar la herramienta: el runtime comprueba que existen la
+herramienta y el método, que los argumentos tienen el tipo declarado, que los
+campos obligatorios están presentes y que el timeout es válido.
 
 El planner tiene un presupuesto de `max_plan_nodes` (100 por defecto). Si una
 propuesta supera ese límite, debe devolver `subtasks` y el motor persiste esas
@@ -149,7 +154,7 @@ proceden del registro estructurado, no de memoria libre ni de una ruta inventada
 por el LLM.
 
 The default provider is Ollama at `http://localhost:11434` using
-`qwen3.8-flash-next`. The local integration uses low temperature (`0.1`) and a
+`smtek/Qwen3.8-27B:Q3_K_M`. The local integration uses low temperature (`0.1`) and a
 `32768` token context by default because Planner and Resolver responses are
 schema-constrained decisions, not creative text. Set values in `.env` using
 `.env.example` as a template. Tests use mock providers and tools, so Ollama is

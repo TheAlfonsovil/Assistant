@@ -22,7 +22,10 @@ async def lifespan(app: FastAPI):
     runtime = TaskRuntime(
         context.service.repository,
         lambda task_id: context.service.run_task(task_id, wait_for_retry=False),
-        idle_cycle=IdleCycle(on_idle=context.service.reconcile_idle),
+        idle_cycle=IdleCycle(
+            on_idle=context.service.reconcile_idle,
+            supervise=lambda has_work: context.service.reconcile_idle(),
+        ),
         is_ready=lambda: context.startup.llm_ready,
     )
     worker = asyncio.create_task(runtime.run_forever(), name="assistant-task-runtime")
@@ -62,6 +65,7 @@ async def health(request: Request):
             "last_started_at": runtime.last_started_at,
             "last_completed_at": runtime.last_completed_at,
             "last_error": runtime.last_error,
+            "metrics": runtime.metrics_snapshot(),
         },
     }
 

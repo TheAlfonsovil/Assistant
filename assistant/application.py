@@ -733,6 +733,12 @@ class TaskService:
         if respond is None:
             await self._save_fallback_response(task, "final response provider unavailable")
             return
+        used_llm_calls = int(task.metadata.get("llm_calls", 0))
+        if used_llm_calls >= task.budget.max_llm_calls:
+            await self._save_fallback_response(task, "final response budget exhausted")
+            return
+        task.metadata["llm_calls"] = used_llm_calls + 1
+        await self.repository.save_task(task)
         try:
             events = await self.repository.list_events(task.id)
             response_context = {
@@ -842,22 +848,22 @@ class TaskService:
     async def _handle_structural_node(
         self, task: Task, node: TaskNode, graph: TaskGraph
     ) -> bool:
-        if node.type is NodeType.CONDITION:
+        if node.type in {NodeType.CONDITION, NodeType.DECISION}:
             result = self._evaluate_condition(node, graph)
-            node.output_data = {"condition": result}
+            node.output_data = {"decision" if node.type is NodeType.DECISION else "condition": result}
             node.status = NodeStatus.SUCCEEDED
             await self.repository.save_node(node)
             await self.repository.save_event(
                 TaskEvent(
                     task_id=task.id,
                     node_id=node.id,
-                    event_type="CONDITION_EVALUATED",
-                    payload={"result": result},
+                    event_type="DECISION_EVALUATED" if node.type is NodeType.DECISION else "CONDITION_EVALUATED",
+                    payload={"result": result, "operator": node.metadata.get("operator", "truthy")},
                 )
             )
-            if not result:
-                for target_id in node.metadata.get("on_false", []):
-                    await self._cancel_branch(task, graph, target_id)
+            branch_key = "skip_on_true" if result else "skip_on_false"
+            for target_id in node.metadata.get(branch_key, []):
+                await self._cancel_branch(task, graph, target_id)
             task.status = TaskStatus.READY
             await self.repository.save_task(task)
             return True
@@ -915,22 +921,6 @@ class TaskService:
                         payload={"decision": "SUCCESS", "kind": "structural"},
                     )
                 )
-            return True
-        if node.type in {NodeType.CONDITION, NodeType.NOTIFY}:
-            node.status = NodeStatus.BLOCKED
-            node.error = f"{node.type.value.lower()} nodes are not supported by the local runtime"
-            task.status = TaskStatus.BLOCKED
-            task.failure_reason = node.error
-            await self.repository.save_node(node)
-            await self.repository.save_task(task)
-            await self.repository.save_event(
-                TaskEvent(
-                    task_id=task.id,
-                    node_id=node.id,
-                    event_type="NODE_BLOCKED",
-                    payload={"reason": node.error},
-                )
-            )
             return True
         return False
 
@@ -1110,7 +1100,7 @@ class TaskService:
                     for proposed in proposal.nodes
                 ]
                 for proposed, planned in zip(proposal.nodes, planned_models):
-                    for key in ("on_false", "on_true"):
+                    for key in ("skip_on_false", "skip_on_true"):
                         if key in proposed.metadata:
                             planned.metadata[key] = [
                                 node_ids.get(target, target)
@@ -1447,6 +1437,24 @@ class TaskService:
                 if not await self._consume_budget(task, "tool_calls", task.budget.max_tool_calls):
                     await self._block_node_for_budget(task, node, "tool_calls")
                     return True
+                operation_error = self.tools.validate_operation(operation)
+                if operation_error:
+                    node.status = NodeStatus.BLOCKED
+                    node.error = operation_error
+                    task.status = TaskStatus.BLOCKED
+                    task.failure_reason = operation_error
+                    task.finished_at = datetime.now(UTC)
+                    await self.repository.save_node(node)
+                    await self.repository.save_task(task)
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            node_id=node.id,
+                            event_type="OPERATION_REJECTED",
+                            payload={"error": operation_error},
+                        )
+                    )
+                    return True
                 operation_result, lease_held = await self._execute_tool_with_lease(
                     node.id, operation, max(300, int(operation.timeout) + 60)
                 )
@@ -1608,30 +1616,7 @@ class TaskService:
                         payload={"action": replanned.action, "reason": replanned.reason},
                     )
                 )
-                if replanned.action == "SUBTASKS" and replanned.subtasks:
-                    for description in replanned.subtasks:
-                        child = TaskNode(
-                            task_id=task.id,
-                            type=NodeType.SUBTASK,
-                            description=description,
-                            status=NodeStatus.READY,
-                        )
-                        await self.repository.save_node(child)
-                        await self.repository.save_edge(
-                            task.id, GraphEdge(from_node=node.id, to_node=child.id)
-                        )
-                    node.status = NodeStatus.SUCCEEDED
-                    task.status = TaskStatus.READY
-                elif replanned.action == "COMPLETE":
-                    node.status = NodeStatus.SUCCEEDED
-                    task.status = TaskStatus.READY
-                else:
-                    node.status = NodeStatus.BLOCKED
-                    node.error = replanned.reason or "replanning failed"
-                    task.status = TaskStatus.BLOCKED
-                    task.failure_reason = node.error
-                await self.repository.save_node(node)
-                await self.repository.save_task(task)
+                await self._apply_replan_decision(task, node, replanned)
             else:
                 reason = result.get("error") or "operation failed"
                 await self._fail_node(task, node, reason)
@@ -1639,6 +1624,75 @@ class TaskService:
             return True
         finally:
             await self.release_lease(node.id)
+
+    async def _apply_replan_decision(
+        self, task: Task, node: TaskNode, decision
+    ) -> bool:
+        if decision.action == "SUBTASKS" and decision.subtasks:
+            for description in decision.subtasks:
+                child = TaskNode(
+                    task_id=task.id,
+                    type=NodeType.SUBTASK,
+                    description=description,
+                    status=NodeStatus.READY,
+                )
+                await self.repository.save_node(child)
+                await self.repository.save_edge(
+                    task.id, GraphEdge(from_node=node.id, to_node=child.id)
+                )
+            node.status = NodeStatus.SUCCEEDED
+            task.status = TaskStatus.READY
+        elif decision.action == "COMPLETE":
+            node.status = NodeStatus.SUCCEEDED
+            task.status = TaskStatus.READY
+        elif decision.action == "RETRY_NODE":
+            node.status = NodeStatus.READY
+            node.retry_count += 1
+            node.error = decision.reason
+            task.status = TaskStatus.READY
+            task.failure_reason = None
+        elif decision.action == "RESTART_TASK":
+            graph = await self.graph(task.id)
+            root = next((item for item in graph.nodes.values() if item.type is NodeType.TASK), None)
+            if root is None:
+                return False
+            await self.repository.reset_task_graph(task.id, root.id)
+            root.status = NodeStatus.READY
+            root.error = None
+            task.status = TaskStatus.QUEUED
+            task.failure_reason = None
+            task.finished_at = None
+            await self.repository.save_node(root)
+        elif decision.action == "FIX" and decision.subtasks:
+            previous_id = None
+            for index, description in enumerate(decision.subtasks):
+                recovery_node = TaskNode(
+                    task_id=task.id,
+                    type=NodeType.SUBTASK,
+                    description=description,
+                    status=NodeStatus.READY,
+                    metadata={
+                        "recovery_target_id": node.id,
+                        "recovery_finalize": index == len(decision.subtasks) - 1,
+                    },
+                )
+                await self.repository.save_node(recovery_node)
+                if previous_id:
+                    await self.repository.save_edge(
+                        task.id, GraphEdge(from_node=previous_id, to_node=recovery_node.id)
+                    )
+                previous_id = recovery_node.id
+            node.metadata["recovery_pending"] = True
+            task.status = TaskStatus.READY
+        else:
+            node.status = NodeStatus.BLOCKED
+            node.error = decision.reason or "replanning returned no executable strategy"
+            task.status = TaskStatus.BLOCKED
+            task.failure_reason = node.error
+            task.finished_at = datetime.now(UTC)
+        await self.repository.save_node(node)
+        await self.repository.save_task(task)
+        return True
 
     async def run_task(
         self, task_id: str, max_steps: int = 100, wait_for_retry: bool = True

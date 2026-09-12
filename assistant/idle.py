@@ -9,18 +9,41 @@ class IdleCycle:
         create_task: Callable[[str], Awaitable[object]] | None = None,
         interval: float = 30.0,
         on_idle: Callable[[], Awaitable[object]] | None = None,
+        supervise: Callable[[bool], Awaitable[object]] | None = None,
+        supervision_interval: float | None = None,
     ):
         self.create_task = create_task
         self.interval = interval
         self.on_idle = on_idle
+        self.supervise = supervise
+        self.supervision_interval = supervision_interval if supervision_interval is not None else interval
         self.stop_requested = False
         self._last_idle_at: float | None = None
+        self._last_supervision_at: float | None = None
         self._idle_running = False
+        self.last_supervision_result: object | None = None
 
     async def run_once(self, has_work: bool = False) -> object | None:
         now = monotonic()
-        if has_work or self.stop_requested or self._idle_running:
+        if self.stop_requested or self._idle_running:
             return None
+        self._idle_running = True
+        try:
+            result = None
+            if (
+                self.supervise
+                and (
+                    self._last_supervision_at is None
+                    or now - self._last_supervision_at >= self.supervision_interval
+                )
+            ):
+                self._last_supervision_at = now
+                result = await self.supervise(has_work)
+                self.last_supervision_result = result
+            if has_work:
+                return result
+        finally:
+            self._idle_running = False
         if self._last_idle_at is not None and now - self._last_idle_at < self.interval:
             return None
         self._last_idle_at = now

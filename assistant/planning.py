@@ -3,7 +3,7 @@ from __future__ import annotations
 from .llm import PlanProposal
 
 
-_ALLOWED_TYPES = {"OPERATION", "SUBTASK", "DECISION", "VERIFY", "WAIT", "CONDITION"}
+_ALLOWED_TYPES = {"OPERATION", "SUBTASK", "DECISION", "VERIFY", "WAIT", "CONDITION", "NOTIFY"}
 _ALLOWED_CONDITION_OPERATORS = {
     "truthy",
     "falsy",
@@ -39,7 +39,10 @@ def validate_plan_quality(proposal: PlanProposal, max_nodes: int) -> None:
     if len(set(ids)) != len(ids):
         raise PlanQualityError("planner returned duplicate node ids")
     known_ids = set(ids)
-    if not any(item.type in {"OPERATION", "SUBTASK", "VERIFY", "WAIT", "CONDITION"} for item in proposal.nodes):
+    if not any(
+        item.type in {"OPERATION", "SUBTASK", "VERIFY", "WAIT", "CONDITION", "DECISION", "NOTIFY"}
+        for item in proposal.nodes
+    ):
         raise PlanQualityError("planner returned no executable node")
 
     for item in proposal.nodes:
@@ -52,22 +55,32 @@ def validate_plan_quality(proposal: PlanProposal, max_nodes: int) -> None:
             raise PlanQualityError(
                 f"node {item.id} references unknown dependencies: {sorted(unknown)}"
             )
-        for branch_key in ("on_false", "on_true"):
+        for branch_key in ("skip_on_false", "skip_on_true"):
             targets = item.metadata.get(branch_key, [])
             if not isinstance(targets, list) or any(target not in known_ids for target in targets):
                 raise PlanQualityError(f"node {item.id} has invalid {branch_key} targets")
-        if item.type == "CONDITION":
+            if item.id in targets:
+                raise PlanQualityError(f"node {item.id} cannot branch to itself")
+        unknown_dependency_types = set(item.dependency_types) - set(item.dependencies)
+        if unknown_dependency_types:
+            raise PlanQualityError(
+                f"node {item.id} declares dependency types for unknown dependencies: "
+                f"{sorted(unknown_dependency_types)}"
+            )
+        if not isinstance(item.acceptance, dict):
+            raise PlanQualityError(f"node {item.id} has invalid acceptance evidence")
+        if item.type in {"CONDITION", "DECISION"}:
             operator = item.metadata.get("operator", "truthy")
             if operator not in _ALLOWED_CONDITION_OPERATORS:
                 raise PlanQualityError(
-                    f"condition node {item.id} uses unsupported operator {operator}"
+                    f"{item.type.lower()} node {item.id} uses unsupported operator {operator}"
                 )
             if "value" not in item.metadata and not item.metadata.get("source_node_id"):
                 raise PlanQualityError(
-                    f"condition node {item.id} needs value or source_node_id"
+                    f"{item.type.lower()} node {item.id} needs value or source_node_id"
                 )
             source_id = item.metadata.get("source_node_id")
             if source_id and source_id not in known_ids:
                 raise PlanQualityError(
-                    f"condition node {item.id} references unknown source {source_id}"
+                    f"{item.type.lower()} node {item.id} references unknown source {source_id}"
                 )

@@ -36,8 +36,19 @@ class TaskRuntime:
         self.last_completed_at: datetime | None = None
         self.last_error: str | None = None
         self.last_active_count = 0
+        self.metrics = {
+            "passes": 0,
+            "tasks_dispatched": 0,
+            "task_errors": 0,
+            "idle_passes": 0,
+            "not_ready_passes": 0,
+            "runtime_errors": 0,
+        }
         self.worker_id = f"{socket.gethostname()}:{uuid4()}"
         self.started_at = datetime.now(UTC)
+
+    def metrics_snapshot(self) -> dict[str, int]:
+        return dict(self.metrics)
 
     async def _persist_heartbeat(self) -> None:
         save = getattr(self.repository, "save_worker_heartbeat", None)
@@ -54,10 +65,13 @@ class TaskRuntime:
         )
 
     async def run_once(self) -> int:
+        self.metrics["passes"] += 1
         self.last_started_at = datetime.now(UTC)
         await self._persist_heartbeat()
         if not self.is_ready():
+            self.metrics["not_ready_passes"] += 1
             await self.idle_cycle.run_once(has_work=False)
+            self.metrics["idle_passes"] += 1
             self.last_active_count = 0
             self.last_completed_at = datetime.now(UTC)
             await self._persist_heartbeat()
@@ -69,12 +83,14 @@ class TaskRuntime:
         ]
         for task in sorted(active, key=lambda item: (-item.priority, item.created_at)):
             try:
+                self.metrics["tasks_dispatched"] += 1
                 await self.execute_task(task.id)
             except Exception:
+                self.metrics["task_errors"] += 1
                 logger.exception("Task worker iteration failed for %s", task.id)
                 continue
-        if not active:
-            await self.idle_cycle.run_once(has_work=False)
+        await self.idle_cycle.run_once(has_work=bool(active))
+        self.metrics["idle_passes"] += 1
         self.last_active_count = len(active)
         self.last_completed_at = datetime.now(UTC)
         await self._persist_heartbeat()
@@ -88,6 +104,7 @@ class TaskRuntime:
                 self.last_error = None
                 backoff = self.interval
             except Exception as error:
+                self.metrics["runtime_errors"] += 1
                 self.last_error = str(error)
                 logger.exception("Task runtime pass failed")
                 await self._persist_heartbeat()

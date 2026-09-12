@@ -58,6 +58,28 @@ async def test_idle_cycle_skips_creation_when_work_exists_and_can_stop():
     cycle = IdleCycle(lambda goal: _record(goals, goal), interval=0)
     assert await cycle.run_once(has_work=True) is None
     assert goals == []
+
+
+@pytest.mark.asyncio
+async def test_idle_cycle_supervises_active_work_without_creating_maintenance():
+    supervised = []
+    goals = []
+
+    async def supervise(has_work):
+        supervised.append(has_work)
+        return 1
+
+    cycle = IdleCycle(
+        lambda goal: _record(goals, goal),
+        interval=60,
+        supervise=supervise,
+        supervision_interval=0,
+    )
+
+    assert await cycle.run_once(has_work=True) == 1
+    assert supervised == [True]
+    assert goals == []
+    assert cycle.last_supervision_result == 1
     cycle.stop()
     await cycle.run_forever()
     assert goals == []

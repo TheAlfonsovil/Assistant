@@ -72,6 +72,17 @@ class ContextBuilder:
                         "error": dependency.error,
                     }
                 )
+        completed_results = [
+            {
+                "node_id": candidate.id,
+                "description": candidate.description,
+                "output": compact(candidate.output_data, limit=3000),
+            }
+            for candidate in graph.nodes.values()
+            if candidate.id != node.id
+            and candidate.status.value == "SUCCEEDED"
+            and candidate.output_data
+        ][-12:]
         return {
             "phase": "NODE_RESOLVER",
             "user_prompt": task.goal,
@@ -99,6 +110,7 @@ class ContextBuilder:
                 "review_status": node.metadata.get("review_status"),
             },
             "dependency_results": dependency_results,
+            "completed_results": completed_results,
             "available_tools": [definition.model_dump() for definition in self.tools.definitions()],
             "available_actions": [definition.model_dump() for definition in self.tools.definitions()],
             "constraints": {

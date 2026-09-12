@@ -152,7 +152,10 @@ def run(
             service.repository,
             lambda task_id: service.run_task(task_id, wait_for_retry=False),
             interval,
-            idle_cycle=IdleCycle(on_idle=service.reconcile_idle),
+            idle_cycle=IdleCycle(
+                on_idle=service.reconcile_idle,
+                supervise=lambda has_work: service.reconcile_idle(),
+            ),
             is_ready=lambda: startup.llm_ready,
         )
         try:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from pathlib import Path
@@ -66,7 +67,11 @@ class NotificationTool(Tool):
         name="notify",
         description="Persist a user notification for a local adapter to deliver",
         methods=["send"],
-        argument_schema={"channel": "string", "message": "string", "metadata": "object"},
+        argument_schema={
+            "channel": {"type": "string"},
+            "message": {"type": "string", "required": True},
+            "metadata": {"type": "object"},
+        },
         permissions=["notification.write"],
     )
 
@@ -104,6 +109,7 @@ class ToolRegistry:
         }
         if tools is None:
             register_actions(self)
+            self.register(NotificationTool())
 
     def register(self, tool: Tool) -> None:
         self._tools[tool.definition.name] = tool
@@ -115,11 +121,24 @@ class ToolRegistry:
         tool = self._tools.get(name)
         return tool.definition if tool else None
 
+    def validate_operation(self, operation: Operation) -> str | None:
+        if not math.isfinite(operation.timeout) or operation.timeout <= 0:
+            return "operation timeout must be a finite positive number"
+        definition = self.definition(operation.tool)
+        if definition is None:
+            return f"Unknown tool: {operation.tool}"
+        if operation.method not in definition.methods:
+            return f"Unknown method: {operation.tool}.{operation.method}"
+        return self._arguments_match_schema(definition, operation.args)
+
     @staticmethod
     def _arguments_match_schema(definition: ToolDefinition, args: dict[str, Any]) -> str | None:
         for name, schema in definition.argument_schema.items():
             expected = schema.get("type") if isinstance(schema, dict) else schema
+            required = isinstance(schema, dict) and schema.get("required", False)
             if name not in args:
+                if required:
+                    return f"argument '{name}' is required"
                 continue
             value = args[name]
             valid = (

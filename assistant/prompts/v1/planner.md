@@ -71,7 +71,8 @@ Rules:
   {"contains": ["expected text"]}. Include it whenever the node has a
   testable completion condition.
 - metadata is reserved for structural nodes. For CONDITION use a safe operator
-  plus value/source_node_id/field and optional on_false node ids; never provide
+  plus value/source_node_id/field and optional skip_on_false/skip_on_true node ids;
+  these identify branches to skip after the condition is evaluated; never provide
   executable expressions.
 - type must be one of OPERATION, SUBTASK, DECISION, VERIFY, WAIT, CONDITION. Use OPERATION for notifications that have a registered tool; use DECISION only when the resolver must choose among subsequent work paths.
 - Do not include operations or tool arguments in the plan.

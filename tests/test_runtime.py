@@ -91,6 +91,97 @@ async def test_tool_registry_rejects_arguments_with_wrong_declared_type():
 
 
 @pytest.mark.asyncio
+async def test_notification_tool_is_registered_and_persists_node_result(tmp_path):
+    class NotifyProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[PlanNodeProposal(id="notify", description="send notification", type="NOTIFY")]
+            )
+
+        async def decide(self, context):
+            return NodeDecision(
+                action="OPERATION",
+                operation=Operation(
+                    tool="notify",
+                    method="send",
+                    args={"channel": "local", "message": "task complete"},
+                ),
+            )
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'notify-node.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        path = tmp_path / "notifications.jsonl"
+        registry = ToolRegistry([NotificationTool(path)])
+        service = TaskService(session, NotifyProvider(), registry)
+        task = await service.create_task(TaskRequest(goal="notify me"))
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        node = (await service.repository.list_nodes(task.id))[-1]
+        assert node.output_data["output"]["message"] == "task complete"
+        assert '"message": "task complete"' in path.read_text(encoding="utf-8")
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_decision_node_evaluates_without_calling_resolver(tmp_path):
+    class DecisionProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[
+                    PlanNodeProposal(
+                        id="decision",
+                        description="evaluate decision",
+                        type="DECISION",
+                        metadata={"value": True, "operator": "truthy", "skip_on_true": ["skip"]},
+                    ),
+                    PlanNodeProposal(id="skip", description="skipped branch"),
+                ]
+            )
+
+        async def decide(self, context):
+            raise AssertionError("structural decision must not call resolver")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'decision-node.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, DecisionProvider(), ToolRegistry())
+        task = await service.create_task(TaskRequest(goal="evaluate decision"))
+
+        result = await service.run_task(task.id)
+        nodes = await service.repository.list_nodes(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert next(node for node in nodes if node.description == "skipped branch").status is NodeStatus.CANCELLED
+        assert any(event.event_type == "DECISION_EVALUATED" for event in await service.repository.list_events(task.id))
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_operation_is_rejected_before_tool_execution(tmp_path):
+    class InvalidOperationProvider(MockLLMProvider):
+        async def decide(self, context):
+            return NodeDecision(
+                action="OPERATION",
+                operation=Operation(tool="missing", method="run"),
+            )
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'invalid-operation.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, InvalidOperationProvider(), ToolRegistry())
+        task = await service.create_task(TaskRequest(goal="invalid operation"))
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.BLOCKED
+        assert any(event.event_type == "OPERATION_REJECTED" for event in await service.repository.list_events(task.id))
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_codegraph_builds_module_nodes_and_import_edges(tmp_path):
     (tmp_path / "main.py").write_text("import helper\ndef run():\n    return helper.value\n", encoding="utf-8")
     (tmp_path / "helper.py").write_text("value = 1\n", encoding="utf-8")
@@ -265,7 +356,7 @@ async def test_condition_node_skips_false_branch(tmp_path):
                         id="gate",
                         description="check gate",
                         type="CONDITION",
-                        metadata={"value": False, "on_false": ["skip"]},
+                        metadata={"value": False, "skip_on_false": ["skip"]},
                     ),
                     PlanNodeProposal(
                         id="skip",
@@ -298,6 +389,71 @@ async def test_condition_node_skips_false_branch(tmp_path):
             event.event_type == "CONDITION_EVALUATED"
             for event in await service.repository.list_events(task.id)
         )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_complex_graph_combines_condition_and_mixed_dependencies(tmp_path):
+    class MixedGraphProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[
+                    PlanNodeProposal(
+                        id="gate",
+                        description="evaluate gate",
+                        type="CONDITION",
+                        metadata={"value": True, "skip_on_true": ["optional"]},
+                    ),
+                    PlanNodeProposal(
+                        id="work", description="run work", dependencies=["gate"]
+                    ),
+                    PlanNodeProposal(
+                        id="optional",
+                        description="optional work",
+                        type="SUBTASK",
+                        dependencies=["gate"],
+                    ),
+                    PlanNodeProposal(
+                        id="cleanup",
+                        description="always cleanup",
+                        type="SUBTASK",
+                        dependencies=["work"],
+                        dependency_types={"work": DependencyType.ALWAYS},
+                    ),
+                    PlanNodeProposal(
+                        id="failure-path",
+                        description="handle failure",
+                        type="SUBTASK",
+                        dependencies=["work"],
+                        dependency_types={"work": DependencyType.FAILURE},
+                    ),
+                ]
+            )
+
+        async def decide(self, context):
+            if context["node"]["description"] == "run work":
+                return NodeDecision(action="OPERATION", operation=self.operation)
+            return NodeDecision(action="COMPLETE")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'complex-graph.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MixedGraphProvider(Operation(tool="mock.always_fail", method="run")),
+            ToolRegistry([MockTool("always_fail")]),
+        )
+        task = await service.create_task(TaskRequest(goal="run mixed graph"))
+        task.budget.max_recovery_attempts = 0
+        await service.repository.save_task(task)
+
+        result = await service.run_task(task.id)
+        nodes = {node.description: node for node in await service.repository.list_nodes(task.id)}
+
+        assert result.status is TaskStatus.FAILED
+        assert nodes["optional work"].status is NodeStatus.CANCELLED
+        assert nodes["always cleanup"].status is NodeStatus.SUCCEEDED
+        assert nodes["handle failure"].status is NodeStatus.SUCCEEDED
     await database.close()
 
 
@@ -507,6 +663,14 @@ async def test_runtime_processes_only_active_tasks_once():
     runtime = TaskRuntime(Repository(), lambda task_id: _record_task(called, task_id))
     assert await runtime.run_once() == 0
     assert called == []
+    assert runtime.metrics_snapshot() == {
+        "passes": 1,
+        "tasks_dispatched": 0,
+        "task_errors": 0,
+        "idle_passes": 1,
+        "not_ready_passes": 0,
+        "runtime_errors": 0,
+    }
 
 
 @pytest.mark.asyncio
@@ -525,6 +689,7 @@ async def test_runtime_does_not_consume_tasks_when_llm_is_not_ready():
     assert await runtime.run_once() == 0
     assert called == []
     assert runtime.last_active_count == 0
+    assert runtime.metrics_snapshot()["not_ready_passes"] == 1
 
 
 async def _record_task(called, task_id):
@@ -548,6 +713,35 @@ async def test_runtime_completes_persisted_task(tmp_path):
         nodes = await service.repository.list_nodes(task.id)
         assert nodes[0].status is NodeStatus.SUCCEEDED
         assert await service.repository.list_events(task.id)
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_final_response_consumes_llm_budget_without_changing_terminal_status(tmp_path):
+    class CountingProvider(MockLLMProvider):
+        def __init__(self):
+            super().__init__(Operation(tool="mock.success", method="run"))
+            self.responses = 0
+
+        async def respond(self, context):
+            self.responses += 1
+            return await super().respond(context)
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'final-response-budget.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        provider = CountingProvider()
+        service = TaskService(session, provider, ToolRegistry([MockTool("success")]))
+        task = await service.create_task(TaskRequest(goal="count final response"))
+        task.budget.max_llm_calls = 3
+        await service.repository.save_task(task)
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert result.metadata["llm_calls"] == 3
+        assert provider.responses == 1
+        assert result.metadata["final_response"]
     await database.close()
 
 
@@ -1122,6 +1316,29 @@ async def test_replan_failure_blocks_with_explicit_event(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_recovery_budget_exhaustion_leaves_failed_node_terminal(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'recovery-budget.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(Operation(tool="mock.always_fail", method="run")),
+            ToolRegistry([MockTool("always_fail")]),
+        )
+        task = await service.create_task(TaskRequest(goal="exhaust recovery"))
+        task.budget.max_recovery_attempts = 0
+        await service.repository.save_task(task)
+
+        result = await service.run_task(task.id)
+        events = await service.repository.list_events(task.id)
+
+        assert result.status is TaskStatus.FAILED
+        assert not any(event.event_type == "RECOVERY_ANALYZED" for event in events)
+        assert (await service.repository.list_nodes(task.id))[-1].status is NodeStatus.FAILED
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_wait_user_can_be_resumed(tmp_path):
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'wait.db'}")
     await database.create_all()
@@ -1599,16 +1816,15 @@ async def test_structural_verify_node_checks_successful_dependencies(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("node_type", [NodeType.NOTIFY])
-async def test_unsupported_structural_nodes_block_explicitly(tmp_path, node_type):
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / f'unsupported-{node_type.value}.db'}")
+async def test_notify_node_is_no_longer_treated_as_unsupported_structural_node(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'notify-node-compat.db'}")
     await database.create_all()
     async with database.sessions() as session:
         service = TaskService(session, MockLLMProvider(), ToolRegistry())
-        task = await service.create_task(TaskRequest(goal="unsupported structural node"))
+        task = await service.create_task(TaskRequest(goal="notify from node"))
         root = (await service.repository.list_nodes(task.id))[0]
         root.status = NodeStatus.SUCCEEDED
-        node = TaskNode(task_id=task.id, type=node_type, description="unsupported", status=NodeStatus.READY)
+        node = TaskNode(task_id=task.id, type=NodeType.NOTIFY, description="notify", status=NodeStatus.READY)
         await service.repository.save_node(root)
         await service.repository.save_node(node)
         task.status = TaskStatus.READY
@@ -1616,6 +1832,6 @@ async def test_unsupported_structural_nodes_block_explicitly(tmp_path, node_type
 
         result = await service.run_task(task.id)
 
-        assert result.status is TaskStatus.BLOCKED
-        assert "not supported" in (await service.repository.get_node(node.id)).error
+        assert result.status is TaskStatus.SUCCEEDED
+        assert (await service.repository.get_node(node.id)).status is NodeStatus.SUCCEEDED
     await database.close()

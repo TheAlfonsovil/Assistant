@@ -78,6 +78,11 @@ La arquitectura ya permite crecer por dispositivos y acciones sin tocar el motor
 - Las operaciones no idempotentes no reintentan automáticamente fallos retryable sin una clave de idempotencia explícita.
 - El lease se amplía según el timeout de la operación antes de invocar la herramienta.
 - Los fallos del replanner se persisten como `REPLAN_FAILED` y bloquean explícitamente la tarea.
+- El replanner admite reintento dirigido, reinicio de tarea, ramas `FIX`, subtareas alternativas y finalización controlada.
+- `NOTIFY` persiste su entrega como operación normal y `DECISION` evalúa expresiones estructuradas sin consumir una llamada al LLM.
+- El preflight rechaza herramientas, métodos, argumentos obligatorios y timeouts inválidos antes de ejecutar efectos externos.
+- El ciclo idle reconcilia periódicamente incluso mientras existen tareas activas y mantiene separado el mantenimiento con cooldown.
+- El contexto del resolver incluye resultados completados acotados para propagar evidencia entre ramas del grafo.
 - La ejecución del grafo permanece secuencial por decisión de diseño actual.
 - Las herramientas largas mantienen el lease mediante renovaciones periódicas; si se pierde, el resultado no entra en verificación.
 - Ollama tiene timeout de cliente, límites de prompt/respuesta y circuit breaker configurable.
