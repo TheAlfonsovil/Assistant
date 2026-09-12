@@ -43,6 +43,22 @@ class Database:
             columns = {column["name"] for column in inspector.get_columns("tasks")}
             if "project_id" not in columns:
                 connection.execute(text("ALTER TABLE tasks ADD COLUMN project_id VARCHAR(36)"))
+        if "projects" in inspector.get_table_names():
+            columns = {column["name"] for column in inspector.get_columns("projects")}
+            if "codegraph" not in columns:
+                connection.execute(text("ALTER TABLE projects ADD COLUMN codegraph JSON"))
+            if "codegraph_updated_at" not in columns:
+                connection.execute(
+                    text("ALTER TABLE projects ADD COLUMN codegraph_updated_at DATETIME")
+                )
+            if "codegraph_version" not in columns:
+                connection.execute(
+                    text("ALTER TABLE projects ADD COLUMN codegraph_version INTEGER DEFAULT 0")
+                )
+        if "memories" in inspector.get_table_names():
+            columns = {column["name"] for column in inspector.get_columns("memories")}
+            if "expires_at" not in columns:
+                connection.execute(text("ALTER TABLE memories ADD COLUMN expires_at DATETIME"))
 
     async def session(self) -> AsyncIterator[AsyncSession]:
         async with self.sessions() as session:

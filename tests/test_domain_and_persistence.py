@@ -1,3 +1,5 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from assistant.domain.errors import GraphCycleError
@@ -68,4 +70,34 @@ async def test_sqlite_persists_and_searches_long_term_memory(tmp_path):
         )
         memories = await repository.search_memory("Python project")
         assert memories[0].value == "Python"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_expiration_redaction_deletion_and_export(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'memory-governance.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        expired = await repository.upsert_memory(
+            kind="temporary",
+            key="old",
+            value="remove me",
+            expires_at=datetime.now(UTC) - timedelta(seconds=1),
+        )
+        current = await repository.upsert_memory(
+            kind="secret",
+            key="token",
+            value="do not expose",
+        )
+
+        assert await repository.search_memory("old") == []
+        redacted = await repository.redact_memory(current.id)
+        assert redacted.value == "[REDACTED]"
+        assert (await repository.search_memory("token"))[0].value == "[REDACTED]"
+        exported = await repository.export_memory()
+        assert all(item["id"] != expired.id for item in exported)
+        assert await repository.purge_expired_memory() == 1
+        assert await repository.delete_memory(current.id) is True
+        assert await repository.list_memory() == []
     await database.close()

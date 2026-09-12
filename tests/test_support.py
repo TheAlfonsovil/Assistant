@@ -23,6 +23,16 @@ def test_deterministic_verifier_classifies_results():
     )
 
 
+def test_deterministic_verifier_requires_declared_evidence():
+    verifier = DeterministicVerifier()
+    result = OperationResult(
+        success=True,
+        output={"text": "tests failed"},
+        metadata={"expected": {"contains": ["tests passed"]}},
+    )
+    assert verifier.verify(result).decision is VerificationDecision.RETRY
+
+
 @pytest.mark.asyncio
 async def test_idle_cycle_uses_normal_task_creation_path():
     goals = []
@@ -30,6 +40,16 @@ async def test_idle_cycle_uses_normal_task_creation_path():
     created = await cycle.run_once()
     assert created == goals[0]
     assert goals[0].startswith("Assistant maintenance")
+
+
+@pytest.mark.asyncio
+async def test_idle_cycle_applies_cooldown_between_maintenance_tasks():
+    goals = []
+    cycle = IdleCycle(lambda goal: _record(goals, goal), interval=60)
+
+    await cycle.run_once()
+    assert await cycle.run_once() is None
+    assert len(goals) == 1
 
 
 @pytest.mark.asyncio

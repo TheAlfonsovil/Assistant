@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Awaitable, Callable
+from time import monotonic
 
 
 class IdleCycle:
@@ -13,15 +14,25 @@ class IdleCycle:
         self.interval = interval
         self.on_idle = on_idle
         self.stop_requested = False
+        self._last_idle_at: float | None = None
+        self._idle_running = False
 
     async def run_once(self, has_work: bool = False) -> object | None:
-        if has_work:
+        now = monotonic()
+        if has_work or self.stop_requested or self._idle_running:
             return None
-        if self.on_idle:
-            return await self.on_idle()
-        if self.create_task:
-            return await self.create_task("Assistant maintenance: check persisted task health")
-        return None
+        if self._last_idle_at is not None and now - self._last_idle_at < self.interval:
+            return None
+        self._last_idle_at = now
+        self._idle_running = True
+        try:
+            if self.on_idle:
+                return await self.on_idle()
+            if self.create_task:
+                return await self.create_task("Assistant maintenance: check persisted task health")
+            return None
+        finally:
+            self._idle_running = False
 
     async def run_forever(self) -> None:
         while not self.stop_requested:

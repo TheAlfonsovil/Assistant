@@ -119,3 +119,33 @@ relevant records, plus explicit profile/system facts. Each record includes its
 kind, key, value, provenance and confidence and is labelled as data-only. A
 memory value never supplies a project path or overrides the registered project
 context; project identity is resolved structurally before prompting the LLM.
+
+## Relationship graphs
+
+`codegraph.build` analyzes a user project and returns bounded module, symbol and
+import relationships. `codegraph.system` analyzes the Assistant source itself
+and returns module, symbol, containment, import and resolvable call edges.
+
+The system graph is not injected into every prompt by default. A task can opt in
+with `metadata.include_system_graph=true`; the planner and node resolver then
+receive a bounded `system_graph` context. `metadata.system_graph_max_files`
+controls the source scope so graph context remains useful without overwhelming
+the LLM. The graph is context data only and does not override task, project or
+tool contracts.
+
+## Failure recovery
+
+Terminal node failures are analyzed by the replanner within a bounded recovery
+budget. It may retry the failed node, create a persisted fix branch, restart the
+task graph, or block the task. Fix branches retain the original failure and use
+the Git capabilities exposed by the project when available; a branch is not
+merged or redeployed unless the corresponding tool is registered and the plan
+explicitly requests it. This keeps recovery honest for projects that have no
+deployment adapter.
+
+The local `deployment` tool provides the stable methods `build`, `test`,
+`deploy`, `verify`, and `rollback`. Each call requires a command declared by
+the project in the operation arguments, so the Assistant can support scripts,
+containers, services, or another local target without assuming one platform.
+Deployment recovery should follow `build -> test -> deploy -> verify`; when
+verification fails, `rollback` is available as an explicit recovery step.

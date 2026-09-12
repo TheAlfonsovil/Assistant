@@ -27,8 +27,10 @@ from assistant.domain.models import (
     TaskNode,
     TaskRequest,
     TaskStatus,
+    VerificationDecision,
 )
 from assistant.infrastructure.db import Database
+from assistant.infrastructure.orm import LeaseRow
 from assistant.infrastructure.repositories import TaskRepository
 from assistant.llm import (
     ActionProposal,
@@ -39,19 +41,20 @@ from assistant.llm import (
     OllamaLLMProvider,
     PlanNodeProposal,
     PlanProposal,
+    VerificationResult,
 )
 from assistant.project_analysis import ProjectAnalyzer
 from assistant.prompts.v1.template import render
 from assistant.recovery import RecoveryManager
 from assistant.runtime import TaskRuntime
 from assistant.startup.manager import StartupManager
-from assistant.tools import MockTool, Tool, ToolDefinition, ToolRegistry
+from assistant.tools import MockTool, NotificationTool, Tool, ToolDefinition, ToolRegistry
 
 
 def test_device_registry_exposes_four_branches_and_computer_actions():
     assert [branch.name for branch in DEVICE_BRANCHES] == ["computer", "mobile", "home", "robot"]
     definitions = {definition.name for definition in build_tool_registry().definitions()}
-    assert {"filesystem", "shell", "git", "project", "codegraph", "system", "web", "browser"} <= definitions
+    assert {"filesystem", "shell", "git", "deployment", "project", "codegraph", "system", "web", "browser"} <= definitions
     assert {"device.mobile", "device.home", "device.robot"} <= definitions
 
 
@@ -77,6 +80,17 @@ async def test_computer_filesystem_info_and_search(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_tool_registry_rejects_arguments_with_wrong_declared_type():
+    result = await build_tool_registry().execute(
+        Operation(tool="project", method="analyze", args={"root": 123})
+    )
+
+    assert result.success is False
+    assert result.error_type is ErrorType.INVALID_ARGUMENT
+    assert "root" in result.error
+
+
+@pytest.mark.asyncio
 async def test_codegraph_builds_module_nodes_and_import_edges(tmp_path):
     (tmp_path / "main.py").write_text("import helper\ndef run():\n    return helper.value\n", encoding="utf-8")
     (tmp_path / "helper.py").write_text("value = 1\n", encoding="utf-8")
@@ -88,6 +102,27 @@ async def test_codegraph_builds_module_nodes_and_import_edges(tmp_path):
     assert result.success is True
     assert {node["kind"] for node in result.output["graph"]["nodes"]} == {"module", "symbol"}
     assert any(edge["to"] == "helper" for edge in result.output["graph"]["edges"])
+
+
+@pytest.mark.asyncio
+async def test_codegraph_builds_system_relationships_and_prompt_context(tmp_path):
+    (tmp_path / "a.py").write_text("def helper():\n    return 1\ndef run():\n    return helper()\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("import a\n", encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(tool="codegraph", method="system", args={"root": str(tmp_path)})
+    )
+
+    assert result.success is True
+    assert any(node["kind"] == "module" for node in result.output["graph"]["nodes"])
+    assert any(edge["kind"] == "contains" for edge in result.output["graph"]["edges"])
+    assert any(edge["kind"] == "calls" for edge in result.output["graph"]["edges"])
+
+    context = ContextBuilder(object(), ToolRegistry([]), workspace_root=str(tmp_path))
+    planner_context = await context.for_planner(
+        Task(goal="understand the system", metadata={"include_system_graph": True})
+    )
+    assert planner_context["system_graph"]["graph"]["nodes"]
 
 
 @pytest.mark.asyncio
@@ -198,7 +233,71 @@ async def test_create_action_proposal_waits_for_review(tmp_path, monkeypatch):
         result = await service.run_task(task.id)
 
         assert result.status is TaskStatus.WAITING
+        node = (await service.repository.list_nodes(task.id))[-1]
         assert (tmp_path / "data" / "generated_actions" / "inspect.py").exists()
+        assert node.metadata["review_required"] is True
+        approved = await service.approve_action(task.id, node.id, True)
+        assert approved.status is TaskStatus.READY
+        assert any(
+            event.event_type == "ACTION_APPROVED"
+            for event in await service.repository.list_events(task.id)
+        )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_tool_persists_local_delivery(tmp_path):
+    path = tmp_path / "notifications.jsonl"
+    result = await NotificationTool(path).execute(
+        "send", {"channel": "desktop", "message": "ready"}, 1
+    )
+    assert result.success is True
+    assert '"message": "ready"' in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_condition_node_skips_false_branch(tmp_path):
+    class ConditionalProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[
+                    PlanNodeProposal(
+                        id="gate",
+                        description="check gate",
+                        type="CONDITION",
+                        metadata={"value": False, "on_false": ["skip"]},
+                    ),
+                    PlanNodeProposal(
+                        id="skip",
+                        description="skipped branch",
+                        dependencies=["gate"],
+                    ),
+                    PlanNodeProposal(
+                        id="continue",
+                        description="continue branch",
+                        dependencies=["gate"],
+                    ),
+                ]
+            )
+
+        async def decide(self, context):
+            return NodeDecision(action="COMPLETE")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'condition.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, ConditionalProvider(), ToolRegistry())
+        task = await service.create_task(TaskRequest(goal="branch safely"))
+        result = await service.run_task(task.id)
+        nodes = await service.repository.list_nodes(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert next(node for node in nodes if node.description == "skipped branch").status is NodeStatus.CANCELLED
+        assert next(node for node in nodes if node.description == "continue branch").status is NodeStatus.SUCCEEDED
+        assert any(
+            event.event_type == "CONDITION_EVALUATED"
+            for event in await service.repository.list_events(task.id)
+        )
     await database.close()
 
 
@@ -287,6 +386,7 @@ async def test_ollama_provider_sends_versioned_prompt_and_json_schema():
     payload = json.loads(requests[0].content)
     prompt = payload["prompt"]
     assert payload["format"]["type"] == "object"
+    assert payload["options"] == {"temperature": 0.1, "num_ctx": 32768}
     assert "Valid example:" in prompt
     await provider.close()
 
@@ -311,6 +411,60 @@ async def test_ollama_provider_traces_prompt_and_validated_response():
     ]
     assert traces[0]["prompt_chars"] > 0
     assert traces[1]["validated"]["nodes"] == []
+
+
+@pytest.mark.asyncio
+async def test_ollama_circuit_breaker_opens_after_repeated_failures():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="unavailable")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OllamaLLMProvider(
+        "http://ollama.test",
+        "test-model",
+        client=client,
+        failure_threshold=2,
+        recovery_timeout=60,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await provider.plan({"task": {"goal": "first"}})
+    with pytest.raises(httpx.HTTPStatusError):
+        await provider.plan({"task": {"goal": "second"}})
+    assert provider.circuit_state == "OPEN"
+    with pytest.raises(RuntimeError, match="circuit breaker is open"):
+        await provider.plan({"task": {"goal": "blocked"}})
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_execution_renews_lease_while_operation_is_running(tmp_path):
+    class SlowTool(Tool):
+        definition = ToolDefinition(name="slow", description="slow", methods=["run"])
+
+        async def execute(self, method, args, timeout):
+            await asyncio.sleep(0.25)
+            return OperationResult(success=True, output="done")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'lease-loop.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, MockLLMProvider(), ToolRegistry([SlowTool()]))
+        renewals = []
+
+        async def renew(node_id, seconds):
+            renewals.append((node_id, seconds))
+            return True
+
+        service.renew_lease = renew
+        result, held = await service._execute_tool_with_lease(
+            "node-1", Operation(tool="slow", method="run", timeout=0.5), 0.3
+        )
+
+        assert result.success is True
+        assert held is True
+        assert renewals
+    await database.close()
 
 
 @pytest.mark.asyncio
@@ -419,6 +573,47 @@ async def test_running_task_with_active_lease_is_not_reconciled_as_blocked(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_lease_can_be_renewed_by_its_owner(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'renew-lease.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, MockLLMProvider(), ToolRegistry())
+        task = await service.create_task(TaskRequest(goal="renew lease"))
+        node = (await service.repository.list_nodes(task.id))[0]
+        assert await service.acquire_lease(node.id, seconds=1) is True
+        before = (await session.get(LeaseRow, node.id)).expires_at
+        assert await service.renew_lease(node.id, seconds=120) is True
+        after = (await session.get(LeaseRow, node.id)).expires_at
+        assert after > before
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_active_lease_cannot_be_taken_by_another_worker(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'lease-contention.db'}")
+    await database.create_all()
+    async with database.sessions() as first_session, database.sessions() as second_session:
+        first = TaskService(first_session, MockLLMProvider(), ToolRegistry())
+        second = TaskService(second_session, MockLLMProvider(), ToolRegistry())
+        task = await first.create_task(TaskRequest(goal="lease contention"))
+        node = (await first.repository.list_nodes(task.id))[0]
+
+        assert await first.acquire_lease(node.id, seconds=120) is True
+        assert await second.acquire_lease(node.id, seconds=120) is False
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_deployment_requires_explicit_project_command(tmp_path):
+    registry = build_tool_registry()
+    invalid = await registry.execute(
+        Operation(tool="deployment", method="deploy", args={"cwd": str(tmp_path)})
+    )
+    assert invalid.success is False
+    assert invalid.error_type is ErrorType.INVALID_ARGUMENT
+
+
+@pytest.mark.asyncio
 async def test_llm_timeout_blocks_task_and_generates_final_response(tmp_path):
     class HangingProvider(MockLLMProvider):
         async def plan(self, context):
@@ -485,11 +680,85 @@ async def test_single_project_is_selected_and_analysis_uses_registered_path(tmp_
         project = await service.create_project(Project(name="main", path=str(project_path)))
         task = await service.create_task(TaskRequest(goal="audit the project"))
 
+        refreshed = await service.refresh_project_codegraph(project.id)
+        persisted_project = await service.get_project(project.id)
+        assert refreshed.codegraph_version == 1
+        assert persisted_project.codegraph["root"] == str(project_path.resolve())
+
         assert task.project_id == project.id
         result = await service.run_task(task.id)
         node = (await service.repository.list_nodes(task.id))[-1]
         assert result.status is TaskStatus.SUCCEEDED
         assert node.output_data["output"]["root"] == str(project_path.resolve())
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_project_selection_waits_for_explicit_input(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'ambiguous-project.db'}")
+    await database.create_all()
+    first_path = tmp_path / "first"
+    second_path = tmp_path / "second"
+    first_path.mkdir()
+    second_path.mkdir()
+    async with database.sessions() as session:
+        service = TaskService(session, MockLLMProvider(), ToolRegistry())
+        first = await service.create_project(Project(name="first", path=str(first_path)))
+        await service.create_project(Project(name="second", path=str(second_path)))
+
+        task = await service.create_task(TaskRequest(goal="audit a project"))
+
+        assert task.status is TaskStatus.WAITING
+        with pytest.raises(ValueError, match="project selection"):
+            await service.resume_task(task.id)
+
+        resumed = await service.submit_task_input(
+            task.id, {"project_id": first.id}
+        )
+        assert resumed.status is TaskStatus.QUEUED
+        assert resumed.project_id == first.id
+        assert "clarification" not in resumed.metadata
+
+        result = await service.run_task(task.id)
+        assert result.status is TaskStatus.SUCCEEDED
+        assert any(
+            node.description == "execute configured mock operation"
+            for node in await service.repository.list_nodes(task.id)
+        )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_planner_acceptance_evidence_is_persisted_and_checked(tmp_path):
+    class AcceptanceProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[
+                    PlanNodeProposal(
+                        id="checked",
+                        description="checked operation",
+                        acceptance={"contains": ["ok"]},
+                    )
+                ]
+            )
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'acceptance.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            AcceptanceProvider(Operation(tool="mock.success", method="run", args={"output": "ok"})),
+            ToolRegistry([MockTool("success")]),
+        )
+        task = await service.create_task(TaskRequest(goal="check evidence"))
+
+        result = await service.run_task(task.id)
+        nodes = await service.repository.list_nodes(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        checked = next(node for node in nodes if node.description == "checked operation")
+        assert checked.metadata["acceptance"] == {"contains": ["ok"]}
+        assert "checked operation" in result.result_summary
     await database.close()
 
 
@@ -529,6 +798,30 @@ async def test_recovery_requeues_parent_task_and_running_node(tmp_path):
         assert (await repository.get_task(task.id)).status is TaskStatus.READY
         assert (await repository.get_node(node.id)).status is NodeStatus.READY
         assert (await repository.get_node(node.id)).error == "recovered after process restart"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_requeues_interrupted_verification(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'recovery-verifying.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        task = Task(goal="recover verification", status=TaskStatus.VERIFYING)
+        node = TaskNode(
+            task_id=task.id,
+            type=NodeType.OPERATION,
+            description="interrupted verification",
+            status=NodeStatus.VERIFYING,
+        )
+        await repository.save_task(task)
+        await repository.save_node(node)
+
+        recovered = await RecoveryManager(session).recover()
+
+        assert recovered == 1
+        assert (await repository.get_task(task.id)).status is TaskStatus.READY
+        assert (await repository.get_node(node.id)).status is NodeStatus.READY
     await database.close()
 
 
@@ -639,6 +932,88 @@ async def test_planner_preserves_typed_dependency_edges(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_failure_and_always_dependencies_run_before_terminal_failure(tmp_path):
+    class CleanupProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[
+                    PlanNodeProposal(id="work", description="work", type="OPERATION"),
+                    PlanNodeProposal(
+                        id="cleanup",
+                        description="cleanup",
+                        type="OPERATION",
+                        dependencies=["work"],
+                        dependency_types={"work": DependencyType.ALWAYS},
+                    ),
+                ]
+            )
+
+        async def decide(self, context):
+            if context["node"]["description"] == "cleanup":
+                return NodeDecision(action="COMPLETE")
+            return NodeDecision(action="OPERATION", operation=self.operation)
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'cleanup.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            CleanupProvider(Operation(tool="mock.always_fail", method="run")),
+            ToolRegistry([MockTool("always_fail")]),
+        )
+        task = await service.create_task(TaskRequest(goal="run cleanup after failure"))
+
+        result = await service.run_task(task.id)
+        nodes = await service.repository.list_nodes(task.id)
+
+        assert result.status is TaskStatus.FAILED
+        assert next(node for node in nodes if node.description == "work").status is NodeStatus.FAILED
+        assert next(node for node in nodes if node.description == "cleanup").status is NodeStatus.SUCCEEDED
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_node_can_run_fix_branch_then_resume_original_node(tmp_path):
+    class FixProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[PlanNodeProposal(id="work", description="work", type="OPERATION")]
+            )
+
+        async def decide(self, context):
+            if context["node"]["description"] == "apply correction":
+                return NodeDecision(action="COMPLETE")
+            return NodeDecision(action="OPERATION", operation=self.operation)
+
+        async def replan(self, context):
+            return NodeDecision(
+                action="FIX",
+                subtasks=["apply correction"],
+                reason="the failed operation needs a repair before retry",
+            )
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'fix-recovery.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        provider = FixProvider(Operation(tool="mock.fail_once", method="run"))
+        service = TaskService(session, provider, ToolRegistry([MockTool("fail_once")]))
+        task = await service.create_task(TaskRequest(goal="repair and retry"))
+        task.budget.max_retries = 0
+        await service.repository.save_task(task)
+
+        result = await service.run_task(task.id)
+        nodes = await service.repository.list_nodes(task.id)
+        events = await service.repository.list_events(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert {node.description for node in nodes} >= {"work", "apply correction"}
+        assert next(node for node in nodes if node.description == "work").status is NodeStatus.SUCCEEDED
+        assert any(event.event_type == "RECOVERY_FIX_BRANCH_CREATED" for event in events)
+        assert any(event.event_type == "RECOVERY_TARGET_REQUEUED" for event in events)
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_retries_transient_tool_failure(tmp_path):
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'retry.db'}")
     await database.create_all()
@@ -653,6 +1028,27 @@ async def test_runtime_retries_transient_tool_failure(tmp_path):
         result = await service.run_task(task.id)
         assert result.status is TaskStatus.SUCCEEDED
         assert tool.calls == 2
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_non_idempotent_retryable_failure_is_not_replayed_without_key(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'non-idempotent-retry.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        tool = MockTool("fail_once")
+        tool.definition.idempotent = False
+        service = TaskService(
+            session,
+            MockLLMProvider(Operation(tool="mock.fail_once", method="run")),
+            ToolRegistry([tool]),
+        )
+        task = await service.create_task(TaskRequest(goal="do not duplicate effect"))
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.FAILED
+        assert tool.calls == 1
     await database.close()
 
 
@@ -693,6 +1089,39 @@ async def test_replan_creates_changed_subtasks_and_completes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_replan_failure_blocks_with_explicit_event(tmp_path):
+    class ReplanVerifier:
+        def verify(self, result):
+            from assistant.domain.models import VerificationDecision
+            from assistant.llm import VerificationResult
+            return VerificationResult(decision=VerificationDecision.REPLAN, reason="replan needed")
+
+    class FailingReplanProvider(MockLLMProvider):
+        async def replan(self, context):
+            raise ValueError("replanner unavailable")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'replan-failure.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            FailingReplanProvider(Operation(tool="mock.always_fail", method="run")),
+            ToolRegistry([MockTool("always_fail")]),
+            verifier=ReplanVerifier(),
+        )
+        task = await service.create_task(TaskRequest(goal="failed replan"))
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.BLOCKED
+        assert any(
+            event.event_type == "REPLAN_FAILED"
+            for event in await service.repository.list_events(task.id)
+        )
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_wait_user_can_be_resumed(tmp_path):
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'wait.db'}")
     await database.create_all()
@@ -711,6 +1140,31 @@ async def test_wait_user_can_be_resumed(tmp_path):
         resumed = await service.resume_task(task.id)
         assert resumed.status is TaskStatus.READY
         assert (await service.repository.get_node(node.id)).status is NodeStatus.READY
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_resume_requires_exactly_one_waiting_node(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'multiple-waits.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, MockLLMProvider(), ToolRegistry())
+        task = await service.create_task(TaskRequest(goal="multiple waits"))
+        first = (await service.repository.list_nodes(task.id))[0]
+        second = TaskNode(
+            task_id=task.id,
+            type=NodeType.WAIT,
+            description="second wait",
+            status=NodeStatus.WAITING,
+        )
+        first.status = NodeStatus.WAITING
+        task.status = TaskStatus.WAITING
+        await service.repository.save_node(first)
+        await service.repository.save_node(second)
+        await service.repository.save_task(task)
+
+        with pytest.raises(ValueError, match="exactly one waiting node"):
+            await service.resume_task(task.id)
     await database.close()
 
 
@@ -870,11 +1324,42 @@ async def test_blocked_node_reconciles_task_state(tmp_path):
         result = await service.run_task(task.id)
 
         assert result.status is TaskStatus.BLOCKED
-        assert result.failure_reason == "task has blocked nodes"
+        assert result.failure_reason == "LLM returned no operation"
         assert any(
-            event.event_type == "TASK_NO_PROGRESS"
+            event.event_type == "NODE_BLOCKED"
             for event in await service.repository.list_events(task.id)
         )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_verifier_block_is_persisted_as_blocked_task(tmp_path):
+    class BlockingVerifier:
+        def verify(self, result):
+            return VerificationResult(
+                decision=VerificationDecision.BLOCK,
+                reason="manual review is required",
+            )
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'verifier-block.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(Operation(tool="mock.success", method="run")),
+            ToolRegistry([MockTool("success")]),
+            verifier=BlockingVerifier(),
+        )
+        task = await service.create_task(TaskRequest(goal="block after verification"))
+
+        result = await service.run_task(task.id)
+        node = (await service.repository.list_nodes(task.id))[-1]
+        events = await service.repository.list_events(task.id)
+
+        assert result.status is TaskStatus.BLOCKED
+        assert result.failure_reason == "manual review is required"
+        assert node.status is NodeStatus.BLOCKED
+        assert any(event.event_type == "NODE_BLOCKED" for event in events)
     await database.close()
 
 
@@ -1114,7 +1599,7 @@ async def test_structural_verify_node_checks_successful_dependencies(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("node_type", [NodeType.CONDITION, NodeType.NOTIFY])
+@pytest.mark.parametrize("node_type", [NodeType.NOTIFY])
 async def test_unsupported_structural_nodes_block_explicitly(tmp_path, node_type):
     database = Database(f"sqlite+aiosqlite:///{tmp_path / f'unsupported-{node_type.value}.db'}")
     await database.create_all()

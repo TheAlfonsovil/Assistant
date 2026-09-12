@@ -83,6 +83,19 @@ class LeaseRow(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class WorkerHeartbeatRow(Base):
+    __tablename__ = "worker_heartbeat"
+
+    worker_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    active_count: Mapped[int] = mapped_column(Integer, default=0)
+    pass_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class IdempotencyRow(Base):
     __tablename__ = "operation_results"
 
@@ -102,6 +115,7 @@ class MemoryRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     usage_count: Mapped[int] = mapped_column(Integer, default=0)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ProjectRow(Base):
@@ -119,3 +133,6 @@ class ProjectRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_audited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    codegraph: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    codegraph_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    codegraph_version: Mapped[int] = mapped_column(Integer, default=0)

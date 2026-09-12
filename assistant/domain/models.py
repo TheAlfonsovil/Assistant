@@ -80,6 +80,7 @@ class VerificationDecision(StrEnum):
 class TaskBudget(BaseModel):
     max_llm_calls: int = 20
     max_retries: int = 3
+    max_recovery_attempts: int = 2
     max_execution_time: float = 3600.0
     max_tool_calls: int = 50
     max_plan_nodes: int = 100
@@ -98,6 +99,9 @@ class Project(BaseModel):
     updated_at: datetime = Field(default_factory=utcnow)
     last_used_at: datetime | None = None
     last_audited_at: datetime | None = None
+    codegraph: dict[str, Any] | None = None
+    codegraph_updated_at: datetime | None = None
+    codegraph_version: int = 0
 
 
 class Operation(BaseModel):
@@ -201,6 +205,7 @@ class MemoryRecord(BaseModel):
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
     usage_count: int = 0
+    expires_at: datetime | None = None
 
 
 class UserProfile(BaseModel):

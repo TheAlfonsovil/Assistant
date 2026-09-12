@@ -148,7 +148,7 @@ class GitTool(ShellTool):
     definition = ToolDefinition(
         name="git",
         description="Read and modify the local git repository",
-        methods=["status", "diff", "log", "branch", "checkout", "add", "commit"],
+        methods=["status", "diff", "log", "branch", "branch_create", "checkout", "add", "commit", "merge"],
         permissions=["git"],
         idempotent=False,
     )
@@ -159,9 +159,11 @@ class GitTool(ShellTool):
             "diff": "git diff",
             "log": "git log --oneline -20",
             "branch": "git branch",
+            "branch_create": "git switch -c",
             "checkout": "git checkout",
             "add": "git add",
             "commit": "git commit",
+            "merge": "git merge --no-edit",
         }
         if method not in commands:
             return OperationResult(
@@ -170,7 +172,7 @@ class GitTool(ShellTool):
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
         command = commands[method]
-        if method in {"checkout", "add", "commit"}:
+        if method in {"branch_create", "checkout", "add", "commit", "merge"}:
             target = args.get("target") or args.get("message")
             if not isinstance(target, str):
                 return OperationResult(
@@ -201,6 +203,39 @@ class ProjectTool(Tool):
         return await ProjectAnalyzer().analyze(args["root"], int(args.get("max_files", 500)))
 
 
+class DeploymentTool(ShellTool):
+    definition = ToolDefinition(
+        name="deployment",
+        description="Run project-declared build, test, deploy, verify, and rollback commands",
+        methods=["build", "test", "deploy", "verify", "rollback"],
+        argument_schema={
+            "command": {"type": "string"},
+            "cwd": {"type": "string"},
+            "timeout": {"type": "number"},
+        },
+        permissions=["deployment"],
+        idempotent=False,
+    )
+
+    async def execute(self, method: str, args: dict[str, Any], timeout: float) -> OperationResult:
+        started = datetime.now(UTC)
+        command = args.get("command")
+        if method not in self.definition.methods or not isinstance(command, str) or not command.strip():
+            return OperationResult(
+                success=False,
+                error=f"deployment.{method} requires a project-declared command",
+                error_type=ErrorType.INVALID_ARGUMENT,
+                started_at=started,
+            )
+        result = await super().execute(
+            "exec",
+            {"command": command, "cwd": args.get("cwd"), "timeout": args.get("timeout", timeout)},
+            timeout,
+        )
+        result.side_effects = [method] if method in {"deploy", "rollback"} else []
+        return result
+
+
 def register_actions(registry) -> None:
     """Register every real computer action in one discoverable place."""
     from .browser import BrowserTool
@@ -212,6 +247,7 @@ def register_actions(registry) -> None:
         FilesystemTool(),
         ShellTool(),
         GitTool(),
+        DeploymentTool(),
         ProjectTool(),
         CodeGraphTool(),
         SystemInfoTool(),
@@ -224,6 +260,7 @@ def register_actions(registry) -> None:
 __all__ = [
     "FilesystemTool",
     "GitTool",
+    "DeploymentTool",
     "ProjectTool",
     "ShellTool",
     "register_actions",

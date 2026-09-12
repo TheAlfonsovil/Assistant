@@ -10,6 +10,7 @@ from .domain.models import (
     TaskRedefinitionRequest,
     TaskRequest,
 )
+from .idle import IdleCycle
 from .runtime import TaskRuntime
 from .startup.bootstrap import AssistantContext, create_context
 
@@ -21,6 +22,7 @@ async def lifespan(app: FastAPI):
     runtime = TaskRuntime(
         context.service.repository,
         lambda task_id: context.service.run_task(task_id, wait_for_retry=False),
+        idle_cycle=IdleCycle(on_idle=context.service.reconcile_idle),
         is_ready=lambda: context.startup.llm_ready,
     )
     worker = asyncio.create_task(runtime.run_forever(), name="assistant-task-runtime")
@@ -64,9 +66,46 @@ async def health(request: Request):
     }
 
 
+@app.get("/memory")
+async def list_memory(request: Request):
+    return [
+        memory.model_dump(mode="json")
+        for memory in await service(request).service.repository.list_memory()
+    ]
+
+
+@app.get("/memory/export")
+async def export_memory(request: Request):
+    return await service(request).service.repository.export_memory()
+
+
+@app.post("/memory/{memory_id}/redact")
+async def redact_memory(request: Request, memory_id: str):
+    memory = await service(request).service.repository.redact_memory(memory_id)
+    if memory is None:
+        raise HTTPException(404, "Memory not found")
+    return memory.model_dump(mode="json")
+
+
+@app.delete("/memory/{memory_id}")
+async def delete_memory(request: Request, memory_id: str):
+    if not await service(request).service.repository.delete_memory(memory_id):
+        raise HTTPException(404, "Memory not found")
+    return {"deleted": True, "id": memory_id}
+
+
+@app.post("/memory/purge-expired")
+async def purge_expired_memory(request: Request):
+    count = await service(request).service.repository.purge_expired_memory()
+    return {"purged": count}
+
+
 @app.post("/tasks")
 async def create_task(request: Request, task_request: TaskRequest):
-    task = await service(request).service.create_task(task_request)
+    try:
+        task = await service(request).service.create_task(task_request)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
     return {"id": task.id, "status": task.status}
 
 
@@ -111,6 +150,17 @@ async def audit_project(request: Request, project_id: str):
     if not task:
         raise HTTPException(404, "Project not found or disabled")
     return {"id": task.id, "status": task.status, "project_id": task.project_id}
+
+
+@app.post("/projects/{project_id}/codegraph/refresh")
+async def refresh_project_codegraph(request: Request, project_id: str):
+    try:
+        project = await service(request).service.refresh_project_codegraph(project_id)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    if not project:
+        raise HTTPException(404, "Project not found")
+    return project.model_dump(mode="json")
 
 
 @app.get("/tasks")
@@ -185,6 +235,19 @@ async def submit_task_input(request: Request, task_id: str, task_input: TaskInpu
         raise HTTPException(409, str(error)) from error
     if not task:
         raise HTTPException(404, "Task not found")
+    return task.model_dump(mode="json")
+
+
+@app.post("/tasks/{task_id}/nodes/{node_id}/approval")
+async def approve_action(request: Request, task_id: str, node_id: str, body: dict[str, bool]):
+    try:
+        task = await service(request).service.approve_action(
+            task_id, node_id, bool(body.get("approved", False))
+        )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if not task:
+        raise HTTPException(404, "Task or node not found")
     return task.model_dump(mode="json")
 
 

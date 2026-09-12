@@ -6,7 +6,7 @@ from typing import Any
 
 from assistant.devices.base import DeviceBranch
 from assistant.domain.models import OperationResult
-from assistant.tools import Tool, ToolDefinition, ToolRegistry
+from assistant.tools import NotificationTool, Tool, ToolDefinition, ToolRegistry
 
 
 class MockDeviceTool(Tool):
@@ -46,6 +46,7 @@ class DeviceRegistry:
     def register(self, registry: ToolRegistry) -> None:
         from assistant.devices.computer.actions import register_actions
 
+        registry.register(NotificationTool())
         for branch in self.branches:
             if branch.name == "computer" and branch.status == "ACTIVE":
                 register_actions(registry)

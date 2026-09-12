@@ -87,6 +87,15 @@ Las respuestas finales se generan una sola vez desde el servicio y quedan
 persistidas en `task.metadata.final_response`, por lo que CLI y API comparten
 el mismo resultado.
 
+Si existen varios proyectos habilitados y ninguno es explícito o predeterminado,
+la tarea queda en `WAITING` y expone una aclaración `project_selection`. El
+cliente debe enviar `project_id` o `project_name` mediante el endpoint de input.
+Tras esa selección la tarea vuelve a `QUEUED` y siempre atraviesa el Planner
+antes de ejecutar nodos. Los nodos del planner pueden declarar
+evidencia de aceptación, por ejemplo `{"exit_code": 0}` o
+`{"contains": ["tests passed"]}`; esa evidencia se conserva en el grafo y se
+comprueba antes de marcar la operación como correcta.
+
 Una tarea `BLOCKED` no se reanuda de forma ambigua. El usuario puede aportar
 una solución con el mismo endpoint de input, redefinirla completamente con
 `POST /tasks/{id}/redefine`, cancelarla con `POST /tasks/{id}/cancel` o
@@ -95,6 +104,16 @@ tarea, elimina su subgrafo anterior y reinicia la planificación; eliminar
 borra también nodos, edges, eventos y leases asociados. Estas operaciones
 modifican la tarea, no el runtime, los prompts ni los contratos internos del
 asistente.
+
+Una verificación puede devolver `BLOCK` cuando el resultado requiere revisión
+humana. En ese caso el nodo conserva su resultado y motivo, la tarea queda en
+`BLOCKED` y se registra `NODE_BLOCKED`; no se reintenta ni se ejecuta una acción
+generada automáticamente.
+
+Las notificaciones usan la herramienta registrada `notify.send`. En el despliegue
+local se persisten en `data/notifications.jsonl`; la entrega externa requiere un
+adaptador, pero el nodo conserva el mismo lease, presupuesto, idempotencia y
+verificación que cualquier otra operación.
 
 El planner puede generar nodos `OPERATION`, `SUBTASK`, `WAIT` y `VERIFY`.
 `WAIT` conserva el input enviado por el usuario y `VERIFY` valida las
@@ -129,6 +148,11 @@ marca como datos, nunca como instrucciones. La identidad y la ruta del proyecto
 proceden del registro estructurado, no de memoria libre ni de una ruta inventada
 por el LLM.
 
-The default provider is Ollama at `http://localhost:11434` using `smtek/Qwen3.8-27B:Q3_K_M`. Set values in `.env` using `.env.example` as a template. Tests use mock providers and tools, so Ollama is not required for the test suite.
+The default provider is Ollama at `http://localhost:11434` using
+`qwen3.8-flash-next`. The local integration uses low temperature (`0.1`) and a
+`32768` token context by default because Planner and Resolver responses are
+schema-constrained decisions, not creative text. Set values in `.env` using
+`.env.example` as a template. Tests use mock providers and tools, so Ollama is
+not required for the test suite.
 
 See [docs/architecture.md](docs/architecture.md) and [docs/task-lifecycle.md](docs/task-lifecycle.md) for the design.

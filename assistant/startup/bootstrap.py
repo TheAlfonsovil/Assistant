@@ -43,7 +43,13 @@ async def create_context(
             resolved_settings.ollama_url,
             resolved_settings.ollama_model,
             resolved_settings.ollama_timeout,
+            temperature=resolved_settings.ollama_temperature,
+            num_ctx=resolved_settings.ollama_num_ctx,
             trace_sink=trace_sink,
+            failure_threshold=resolved_settings.ollama_failure_threshold,
+            recovery_timeout=resolved_settings.ollama_recovery_timeout,
+            max_prompt_chars=resolved_settings.ollama_max_prompt_chars,
+            max_response_chars=resolved_settings.ollama_max_response_chars,
         )
     )
     startup = await StartupManager(database, resolved_settings, provider).initialize()

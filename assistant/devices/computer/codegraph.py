@@ -5,25 +5,32 @@ from __future__ import annotations
 from typing import Any
 
 from assistant.domain.models import ErrorType, OperationResult
-from assistant.project_analysis import ProjectAnalyzer
+from assistant.project_analysis import ProjectAnalyzer, SystemGraphAnalyzer
 from assistant.tools import Tool, ToolDefinition
 
 
 class CodeGraphTool(Tool):
     definition = ToolDefinition(
         name="codegraph",
-        description="Build a bounded architecture and dependency graph for a local project",
-        methods=["build"],
-        argument_schema={"root": {"type": "string"}, "max_files": {"type": "integer"}},
+        description="Build bounded project or Assistant system relationship graphs",
+        methods=["build", "system"],
+        argument_schema={
+            "root": {"type": "string"},
+            "max_files": {"type": "integer"},
+        },
         permissions=["filesystem.read", "project.analysis"],
     )
 
     async def execute(self, method: str, args: dict[str, Any], timeout: float) -> OperationResult:
-        if method != "build" or not isinstance(args.get("root"), str):
+        if method not in {"build", "system"} or not isinstance(args.get("root"), str):
             return OperationResult(
                 success=False,
-                error="codegraph.build requires a root directory",
+                error="codegraph requires a root directory and a supported method",
                 error_type=ErrorType.INVALID_ARGUMENT,
+            )
+        if method == "system":
+            return await SystemGraphAnalyzer().analyze(
+                args["root"], int(args.get("max_files", 300))
             )
         result = await ProjectAnalyzer().analyze(args["root"], int(args.get("max_files", 500)))
         if not result.success:

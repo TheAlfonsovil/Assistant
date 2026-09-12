@@ -95,3 +95,80 @@ class ProjectAnalyzer:
                     edges.append({"from": module, "to": alias.name, "kind": "imports"})
             elif isinstance(node, ast.ImportFrom):
                 edges.append({"from": module, "to": node.module or "", "kind": "imports"})
+
+
+class SystemGraphAnalyzer:
+    """Builds a bounded relationship graph for the Assistant source itself."""
+
+    async def analyze(self, root: str, max_files: int = 300) -> OperationResult:
+        started_at = datetime.now(UTC)
+        try:
+            project_root = Path(root).resolve()
+            files = await asyncio.to_thread(ProjectAnalyzer._collect_files, project_root, max_files)
+            files = [path for path in files[:max_files] if path.suffix.lower() == ".py"]
+            nodes: list[dict[str, Any]] = []
+            edges: list[dict[str, str]] = []
+            symbols_by_name: dict[str, str] = {}
+            parsed: list[tuple[Path, ast.AST, str]] = []
+
+            for path in files:
+                relative = path.relative_to(project_root).as_posix()
+                module_id = f"module:{relative}"
+                nodes.append({"id": module_id, "kind": "module", "name": relative})
+                try:
+                    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                except (OSError, SyntaxError, UnicodeDecodeError):
+                    continue
+                parsed.append((path, tree, module_id))
+                for item in ast.walk(tree):
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        symbol_id = f"symbol:{relative}:{item.lineno}:{item.name}"
+                        nodes.append({
+                            "id": symbol_id,
+                            "kind": "symbol",
+                            "name": item.name,
+                            "file": relative,
+                            "line": item.lineno,
+                        })
+                        edges.append({"from": module_id, "to": symbol_id, "kind": "contains"})
+                        symbols_by_name.setdefault(item.name, symbol_id)
+
+            for path, tree, module_id in parsed:
+                for item in ast.walk(tree):
+                    if isinstance(item, ast.Import):
+                        for alias in item.names:
+                            edges.append({"from": module_id, "to": f"import:{alias.name}", "kind": "imports"})
+                    elif isinstance(item, ast.ImportFrom):
+                        imported = item.module or "."
+                        edges.append({"from": module_id, "to": f"import:{imported}", "kind": "imports"})
+                    elif isinstance(item, ast.Call):
+                        called = item.func.id if isinstance(item.func, ast.Name) else None
+                        target = symbols_by_name.get(called) if called else None
+                        if target:
+                            edges.append({"from": module_id, "to": target, "kind": "calls"})
+
+            output = {
+                "root": str(project_root),
+                "files_analyzed": [path.relative_to(project_root).as_posix() for path in files],
+                "graph": {
+                    "nodes": nodes[:4000],
+                    "edges": edges[:8000],
+                    "truncated": len(nodes) > 4000 or len(edges) > 8000,
+                },
+            }
+            finished_at = datetime.now(UTC)
+            return OperationResult(
+                success=True,
+                output=output,
+                started_at=started_at,
+                finished_at=finished_at,
+                duration=(finished_at - started_at).total_seconds(),
+            )
+        except (OSError, ValueError) as error:
+            return OperationResult(
+                success=False,
+                error=str(error),
+                error_type=ErrorType.NOT_FOUND if isinstance(error, FileNotFoundError) else ErrorType.INVALID_ARGUMENT,
+                retryable=False,
+                started_at=started_at,
+            )

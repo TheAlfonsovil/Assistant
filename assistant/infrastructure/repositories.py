@@ -1,12 +1,22 @@
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+import json
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from assistant.domain.models import GraphEdge, MemoryRecord, Project, Task, TaskEvent, TaskNode
 
-from .orm import EdgeRow, EventRow, LeaseRow, MemoryRow, NodeRow, ProjectRow, TaskRow
+from .orm import (
+    EdgeRow,
+    EventRow,
+    LeaseRow,
+    MemoryRow,
+    NodeRow,
+    ProjectRow,
+    TaskRow,
+    WorkerHeartbeatRow,
+)
 
 
 def task_to_row(task: Task) -> TaskRow:
@@ -106,6 +116,38 @@ class TaskRepository:
         result = await self.session.execute(select(TaskRow).order_by(TaskRow.created_at.desc()))
         return [row_to_task(row) for row in result.scalars()]
 
+    async def save_worker_heartbeat(
+        self,
+        worker_id: str,
+        started_at: datetime,
+        heartbeat_at: datetime,
+        last_started_at: datetime | None,
+        last_completed_at: datetime | None,
+        last_error: str | None,
+        active_count: int,
+    ) -> None:
+        row = await self.session.get(WorkerHeartbeatRow, worker_id)
+        if row is None:
+            row = WorkerHeartbeatRow(
+                worker_id=worker_id,
+                started_at=started_at,
+                heartbeat_at=heartbeat_at,
+                last_started_at=last_started_at,
+                last_completed_at=last_completed_at,
+                last_error=last_error,
+                active_count=active_count,
+                pass_count=1,
+            )
+            self.session.add(row)
+        else:
+            row.heartbeat_at = heartbeat_at
+            row.last_started_at = last_started_at
+            row.last_completed_at = last_completed_at
+            row.last_error = last_error
+            row.active_count = active_count
+            row.pass_count += 1
+        await self.session.commit()
+
     async def create_project(self, project: Project) -> Project:
         row = ProjectRow(**project.model_dump(mode="python"))
         self.session.add(row)
@@ -154,7 +196,8 @@ class TaskRepository:
     def _row_to_project(row: ProjectRow) -> Project:
         return Project.model_validate({key: getattr(row, key) for key in (
             "id", "name", "path", "description", "project_type", "audit_prompt", "enabled", "is_default",
-            "created_at", "updated_at", "last_used_at", "last_audited_at",
+            "created_at", "updated_at", "last_used_at", "last_audited_at", "codegraph",
+            "codegraph_updated_at", "codegraph_version",
         )})
 
     async def save_memory(self, memory: MemoryRecord) -> None:
@@ -169,6 +212,7 @@ class TaskRepository:
             "created_at": memory.created_at,
             "updated_at": memory.updated_at,
             "usage_count": memory.usage_count,
+            "expires_at": memory.expires_at,
         }
         if row is None:
             self.session.add(MemoryRow(**values))
@@ -177,19 +221,41 @@ class TaskRepository:
                 setattr(row, key, value)
         await self.session.commit()
 
+    @staticmethod
+    def _memory_expired(row: MemoryRow, now: datetime | None = None) -> bool:
+        expires_at = row.expires_at
+        if expires_at is None:
+            return False
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=UTC)
+        return expires_at <= (now or datetime.now(UTC))
+
+    @staticmethod
+    def _memory_record(row: MemoryRow) -> MemoryRecord:
+        return MemoryRecord(
+            id=row.id,
+            kind=row.kind,
+            key=row.key,
+            value=row.value_json,
+            source=row.source,
+            confidence=row.confidence,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
+            usage_count=row.usage_count,
+            expires_at=row.expires_at,
+        )
+
     async def search_memory(self, query: str, limit: int = 10) -> list[MemoryRecord]:
         result = await self.session.execute(select(MemoryRow).order_by(MemoryRow.updated_at.desc()))
         terms = {term.lower() for term in query.split() if len(term) > 2}
         matches = []
         for row in result.scalars():
+            if self._memory_expired(row):
+                continue
             haystack = f"{row.kind} {row.key} {row.value_json}".lower()
             if not terms or any(term in haystack for term in terms):
                 row.usage_count += 1
-                matches.append(MemoryRecord(
-                    id=row.id, kind=row.kind, key=row.key, value=row.value_json,
-                    source=row.source, confidence=row.confidence, created_at=row.created_at,
-                    updated_at=row.updated_at, usage_count=row.usage_count,
-                ))
+                matches.append(self._memory_record(row))
                 if len(matches) == limit:
                     break
         await self.session.commit()
@@ -199,23 +265,17 @@ class TaskRepository:
         result = await self.session.execute(
             select(MemoryRow).order_by(MemoryRow.updated_at.desc()).limit(limit)
         )
-        return [
-            MemoryRecord(
-                id=row.id,
-                kind=row.kind,
-                key=row.key,
-                value=row.value_json,
-                source=row.source,
-                confidence=row.confidence,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-                usage_count=row.usage_count,
-            )
-            for row in result.scalars()
-        ]
+        return [self._memory_record(row) for row in result.scalars() if not self._memory_expired(row)]
 
     async def upsert_memory(
-        self, *, kind: str, key: str, value, source: str = "SYSTEM", confidence: float = 1.0
+        self,
+        *,
+        kind: str,
+        key: str,
+        value,
+        source: str = "SYSTEM",
+        confidence: float = 1.0,
+        expires_at: datetime | None = None,
     ) -> MemoryRecord:
         result = await self.session.execute(
             select(MemoryRow).where(MemoryRow.kind == kind, MemoryRow.key == key)
@@ -225,7 +285,7 @@ class TaskRepository:
         if row is None:
             memory = MemoryRecord(
                 kind=kind, key=key, value=value, source=source, confidence=confidence,
-                created_at=now, updated_at=now,
+                created_at=now, updated_at=now, expires_at=expires_at,
             )
             await self.save_memory(memory)
             return memory
@@ -233,12 +293,42 @@ class TaskRepository:
         row.source = source
         row.confidence = confidence
         row.updated_at = now
+        row.expires_at = expires_at
         await self.session.commit()
-        return MemoryRecord(
-            id=row.id, kind=row.kind, key=row.key, value=row.value_json,
-            source=row.source, confidence=row.confidence, created_at=row.created_at,
-            updated_at=row.updated_at, usage_count=row.usage_count,
-        )
+        return self._memory_record(row)
+
+    async def delete_memory(self, memory_id: str) -> bool:
+        result = await self.session.execute(delete(MemoryRow).where(MemoryRow.id == memory_id))
+        await self.session.commit()
+        return bool(result.rowcount)
+
+    async def redact_memory(self, memory_id: str) -> MemoryRecord | None:
+        row = await self.session.get(MemoryRow, memory_id)
+        if row is None:
+            return None
+        row.value_json = "[REDACTED]"
+        row.source = "REDACTED"
+        row.confidence = 0.0
+        row.updated_at = datetime.now(UTC)
+        await self.session.commit()
+        return self._memory_record(row)
+
+    async def purge_expired_memory(self) -> int:
+        now = datetime.now(UTC)
+        result = await self.session.execute(select(MemoryRow))
+        expired_ids = [row.id for row in result.scalars() if self._memory_expired(row, now)]
+        if expired_ids:
+            await self.session.execute(delete(MemoryRow).where(MemoryRow.id.in_(expired_ids)))
+            await self.session.commit()
+        return len(expired_ids)
+
+    async def export_memory(self, include_expired: bool = False) -> list[dict]:
+        result = await self.session.execute(select(MemoryRow).order_by(MemoryRow.updated_at.desc()))
+        return [
+            json.loads(self._memory_record(row).model_dump_json())
+            for row in result.scalars()
+            if include_expired or not self._memory_expired(row)
+        ]
 
     async def save_node(self, node: TaskNode) -> None:
         row = await self.session.get(NodeRow, node.id)

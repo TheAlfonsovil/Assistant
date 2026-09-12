@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -57,6 +59,41 @@ class MockTool(Tool):
         )
 
 
+class NotificationTool(Tool):
+    """Persists local notifications without pretending to deliver them externally."""
+
+    definition = ToolDefinition(
+        name="notify",
+        description="Persist a user notification for a local adapter to deliver",
+        methods=["send"],
+        argument_schema={"channel": "string", "message": "string", "metadata": "object"},
+        permissions=["notification.write"],
+    )
+
+    def __init__(self, path: str | Path = "data/notifications.jsonl"):
+        self.path = Path(path)
+
+    async def execute(self, method: str, args: dict[str, Any], timeout: float) -> OperationResult:
+        channel = str(args.get("channel", "local"))
+        message = str(args.get("message", "")).strip()
+        if not message:
+            return OperationResult(
+                success=False,
+                error="notification message is required",
+                error_type=ErrorType.INVALID_ARGUMENT,
+            )
+        record = {
+            "channel": channel,
+            "message": message,
+            "metadata": args.get("metadata", {}),
+            "created_at": datetime.now(UTC).isoformat(),
+        }
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return OperationResult(success=True, output=record, side_effects=["notification.persisted"])
+
+
 class ToolRegistry:
     def __init__(self, tools: list[Tool] | None = None):
         from .devices.computer.actions import register_actions
@@ -74,6 +111,30 @@ class ToolRegistry:
     def definitions(self) -> list[ToolDefinition]:
         return [tool.definition for tool in self._tools.values()]
 
+    def definition(self, name: str) -> ToolDefinition | None:
+        tool = self._tools.get(name)
+        return tool.definition if tool else None
+
+    @staticmethod
+    def _arguments_match_schema(definition: ToolDefinition, args: dict[str, Any]) -> str | None:
+        for name, schema in definition.argument_schema.items():
+            expected = schema.get("type") if isinstance(schema, dict) else schema
+            if name not in args:
+                continue
+            value = args[name]
+            valid = (
+                (expected == "string" and isinstance(value, str))
+                or (expected == "integer" and isinstance(value, int) and not isinstance(value, bool))
+                or (expected == "number" and isinstance(value, (int, float)) and not isinstance(value, bool))
+                or (expected == "boolean" and isinstance(value, bool))
+                or (expected == "object" and isinstance(value, dict))
+                or (expected == "array" and isinstance(value, list))
+                or expected in (None, "")
+            )
+            if not valid:
+                return f"argument '{name}' must be of type {expected}"
+        return None
+
     async def execute(self, operation: Operation) -> OperationResult:
         tool = self._tools.get(operation.tool)
         if tool is None:
@@ -86,6 +147,13 @@ class ToolRegistry:
             return OperationResult(
                 success=False,
                 error=f"Unknown method: {operation.method}",
+                error_type=ErrorType.INVALID_ARGUMENT,
+            )
+        schema_error = self._arguments_match_schema(tool.definition, operation.args)
+        if schema_error:
+            return OperationResult(
+                success=False,
+                error=schema_error,
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
         started = perf_counter()
@@ -117,6 +185,7 @@ __all__ = [
     "FilesystemTool",
     "GitTool",
     "MockTool",
+    "NotificationTool",
     "ProjectTool",
     "ShellTool",
     "Tool",

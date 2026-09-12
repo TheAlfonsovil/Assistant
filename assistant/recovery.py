@@ -12,7 +12,9 @@ class RecoveryManager:
 
     async def recover(self) -> int:
         now = datetime.now(UTC)
-        await self.session.execute(delete(LeaseRow).where(LeaseRow.expires_at <= now))
+        expired_leases = await self.session.execute(
+            delete(LeaseRow).where(LeaseRow.expires_at <= now)
+        )
         result = await self.session.execute(
             select(NodeRow).where(
                 NodeRow.status.in_([NodeStatus.RUNNING.value, NodeStatus.VERIFYING.value])
@@ -42,6 +44,6 @@ class RecoveryManager:
             row.status = TaskStatus.QUEUED.value
             row.failure_reason = "planning recovered after process restart"
             recovered += 1
-        if recovered:
+        if recovered or expired_leases.rowcount:
             await self.session.commit()
         return recovered

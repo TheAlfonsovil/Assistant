@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
+from uuid import uuid4
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
@@ -34,13 +36,31 @@ class TaskRuntime:
         self.last_completed_at: datetime | None = None
         self.last_error: str | None = None
         self.last_active_count = 0
+        self.worker_id = f"{socket.gethostname()}:{uuid4()}"
+        self.started_at = datetime.now(UTC)
+
+    async def _persist_heartbeat(self) -> None:
+        save = getattr(self.repository, "save_worker_heartbeat", None)
+        if save is None:
+            return
+        await save(
+            self.worker_id,
+            self.started_at,
+            datetime.now(UTC),
+            self.last_started_at,
+            self.last_completed_at,
+            self.last_error,
+            self.last_active_count,
+        )
 
     async def run_once(self) -> int:
         self.last_started_at = datetime.now(UTC)
+        await self._persist_heartbeat()
         if not self.is_ready():
             await self.idle_cycle.run_once(has_work=False)
             self.last_active_count = 0
             self.last_completed_at = datetime.now(UTC)
+            await self._persist_heartbeat()
             return 0
         tasks = await self.repository.list_tasks()
         active = [
@@ -57,6 +77,7 @@ class TaskRuntime:
             await self.idle_cycle.run_once(has_work=False)
         self.last_active_count = len(active)
         self.last_completed_at = datetime.now(UTC)
+        await self._persist_heartbeat()
         return len(active)
 
     async def run_forever(self) -> None:
@@ -69,6 +90,7 @@ class TaskRuntime:
             except Exception as error:
                 self.last_error = str(error)
                 logger.exception("Task runtime pass failed")
+                await self._persist_heartbeat()
                 backoff = min(self.max_backoff, max(self.interval, backoff * 2))
             await asyncio.sleep(backoff)
 

@@ -11,6 +11,12 @@ class Settings(BaseSettings):
     tool_timeout: float = 60.0
     lease_seconds: int = 300
     ollama_timeout: float | None = None
+    ollama_temperature: float = 0.1
+    ollama_num_ctx: int = 32768
+    ollama_failure_threshold: int = 3
+    ollama_recovery_timeout: float = 30.0
+    ollama_max_prompt_chars: int = 200000
+    ollama_max_response_chars: int = 1000000
     collect_system_facts: bool = True
     persist_system_facts: bool = True
     persist_user_profile: bool = True

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Callable
@@ -37,6 +38,8 @@ class PlanNodeProposal(BaseModel):
     dependencies: list[str] = Field(default_factory=list)
     dependency_types: dict[str, DependencyType] = Field(default_factory=dict)
     priority: int = 0
+    acceptance: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PlanProposal(BaseModel):
@@ -132,24 +135,67 @@ class OllamaLLMProvider:
         model: str,
         timeout: float | None = None,
         client: httpx.AsyncClient | None = None,
+        temperature: float = 0.1,
+        num_ctx: int = 32768,
         trace_sink: Callable[[dict[str, Any]], None] | None = None,
+        failure_threshold: int = 3,
+        recovery_timeout: float = 30.0,
+        max_prompt_chars: int = 200_000,
+        max_response_chars: int = 1_000_000,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.client = client or httpx.AsyncClient(timeout=timeout)
+        self.temperature = temperature
+        self.num_ctx = num_ctx
         self.trace_sink = trace_sink
+        self.request_timeout = timeout if timeout is not None else 300.0
+        self.failure_threshold = max(1, failure_threshold)
+        self.recovery_timeout = max(0.1, recovery_timeout)
+        self.max_prompt_chars = max(1, max_prompt_chars)
+        self.max_response_chars = max(1, max_response_chars)
+        self._consecutive_failures = 0
+        self._circuit_opened_at: float | None = None
+
+    @property
+    def circuit_state(self) -> str:
+        if self._circuit_opened_at is None:
+            return "CLOSED"
+        if time.monotonic() - self._circuit_opened_at >= self.recovery_timeout:
+            return "HALF_OPEN"
+        return "OPEN"
+
+    def _ensure_circuit_available(self) -> None:
+        if self.circuit_state == "OPEN":
+            raise RuntimeError("LLM circuit breaker is open")
+
+    def _record_success(self) -> None:
+        self._consecutive_failures = 0
+        self._circuit_opened_at = None
+
+    def _record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self.failure_threshold:
+            self._circuit_opened_at = time.monotonic()
 
     async def check_ready(self) -> bool:
-        async with httpx.AsyncClient(timeout=None) as client:
-            response = await client.get(f"{self.base_url}/api/tags")
+        async with httpx.AsyncClient(timeout=self.request_timeout) as client:
+            response = await asyncio.wait_for(
+                client.get(f"{self.base_url}/api/tags"), timeout=self.request_timeout
+            )
             response.raise_for_status()
             models = response.json().get("models", [])
             return any(item.get("name") == self.model for item in models)
 
     async def _ask(self, role: str, context: dict[str, Any], schema: type[BaseModel]) -> BaseModel:
+        self._ensure_circuit_available()
         prompt_path = Path(__file__).parent / "prompts" / "v1" / f"{role.lower()}.md"
         instructions = prompt_path.read_text(encoding="utf-8")
         rendered_instructions = render(instructions, context, schema.model_json_schema())
+        if len(rendered_instructions) > self.max_prompt_chars:
+            raise ValueError(
+                f"LLM prompt exceeds limit of {self.max_prompt_chars} characters"
+            )
         prompt = {
             "role": role,
             "instructions": rendered_instructions,
@@ -165,22 +211,39 @@ class OllamaLLMProvider:
                 "prompt_preview": rendered_instructions[:4000],
             }
         )
-        response = await self.client.post(
-            f"{self.base_url}/api/generate",
-            json={
-                "model": self.model,
-                "prompt": json.dumps(prompt, default=str),
-                "stream": False,
-                "format": schema.model_json_schema(),
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
-        raw = payload.get("response", payload)
+        try:
+            response = await asyncio.wait_for(
+                self.client.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "prompt": json.dumps(prompt, default=str),
+                        "stream": False,
+                        "format": schema.model_json_schema(),
+                        "options": {
+                            "temperature": self.temperature,
+                            "num_ctx": self.num_ctx,
+                        },
+                    },
+                ),
+                timeout=self.request_timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            raw = payload.get("response", payload)
+            raw_chars = len(raw) if isinstance(raw, str) else len(json.dumps(raw, default=str))
+            if raw_chars > self.max_response_chars:
+                raise ValueError(
+                    f"LLM response exceeds limit of {self.max_response_chars} characters"
+                )
+        except (httpx.HTTPError, TimeoutError, ValueError):
+            self._record_failure()
+            raise
         try:
             parsed = json.loads(raw) if isinstance(raw, str) else raw
             validated = schema.model_validate(parsed)
         except (TypeError, ValueError) as error:
+            self._record_failure()
             self._trace(
                 {
                     "phase": "LLM_RESPONSE_INVALID",
@@ -192,6 +255,7 @@ class OllamaLLMProvider:
                 }
             )
             raise
+        self._record_success()
         self._trace(
             {
                 "phase": "LLM_RESPONSE_PARSED",
