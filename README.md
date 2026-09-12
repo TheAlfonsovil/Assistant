@@ -51,6 +51,11 @@ assistant task --fullflow "revisa el proyecto y ejecuta los tests"
 uvicorn assistant.api:app --reload
 ```
 
+Con la API levantada, abre el [dashboard](http://127.0.0.1:8000/dashboard) para
+visualizar tareas, grafos, eventos, salud, métricas, proyectos y memoria, y para
+crear o intervenir tareas desde el navegador. La guía completa de instalación,
+configuración, órdenes y monitorización está en [INITIALIZE.md](INITIALIZE.md).
+
 La ejecución normal muestra el resultado resumido. Para inspeccionar el ciclo completo usa `--fullflow`:
 
 ```text

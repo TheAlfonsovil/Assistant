@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101c2c">
+  <title>Assistant Control Room</title>
+  <link rel="stylesheet" href="/dashboard/style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark">A</span><div><strong>Assistant</strong><span>control room</span></div></div>
+      <div class="topbar-actions"><span id="last-refresh" class="muted">Conectando...</span><button id="refresh" class="icon-button" title="Actualizar ahora">↻</button><a href="/docs" class="button ghost">API docs</a></div>
+    </header>
+    <main>
+      <section class="hero"><div><p class="eyebrow">LOCAL OPERATIONS / 24·7</p><h1>Todo lo que está pasando,<br><em>en una sola mirada.</em></h1><p class="hero-copy">Tareas persistentes, decisiones del grafo, salud del runtime y memoria operativa.</p></div><div id="hero-health" class="health-orb"><span></span><div><b>Runtime</b><strong id="hero-status">--</strong></div></div></section>
+      <section class="stats-grid" id="stats"></section>
+      <section class="workspace-grid">
+        <article class="panel task-panel"><div class="panel-heading"><div><p class="eyebrow">WORK QUEUE</p><h2>Tareas actuales</h2></div><button id="new-task" class="button primary">+ Nueva orden</button></div><div id="task-list" class="task-list"></div></article>
+        <aside class="panel pulse-panel"><div class="panel-heading"><div><p class="eyebrow">SIGNAL</p><h2>Distribución</h2></div><span class="live-dot">LIVE</span></div><div id="status-chart" class="status-chart"></div><div id="runtime-metrics" class="metrics-list"></div></aside>
+      </section>
+      <section class="lower-grid">
+        <article class="panel"><div class="panel-heading"><div><p class="eyebrow">STREAM</p><h2>Actividad reciente</h2></div></div><div id="event-stream" class="event-stream"></div></article>
+        <article class="panel"><div class="panel-heading"><div><p class="eyebrow">CONTEXT</p><h2>Proyectos y memoria</h2></div></div><div id="context-summary" class="context-summary"></div></article>
+      </section>
+      <section id="detail-panel" class="panel detail-panel hidden"><div class="panel-heading"><div><p class="eyebrow">TASK INSPECTOR</p><h2 id="detail-title">Selecciona una tarea</h2></div><button id="close-detail" class="icon-button" title="Cerrar">×</button></div><div id="detail-content"></div></section>
+    </main>
+  </div>
+  <div id="modal" class="modal hidden"><div class="modal-card"><div class="panel-heading"><div><p class="eyebrow">NEW REQUEST</p><h2>Lanzar una orden</h2></div><button id="close-modal" class="icon-button">×</button></div><form id="task-form"><label>Objetivo<textarea id="goal" required placeholder="Ej.: revisa el proyecto y ejecuta los tests"></textarea></label><label>Proyecto<select id="project"><option value="">Resolver automáticamente</option></select></label><label>Prioridad<input id="priority" type="number" value="0"></label><button class="button primary" type="submit">Enviar al runtime</button></form></div></div>
+  <div id="toast" class="toast"></div>
+  <script src="/dashboard/app.js"></script>
+</body>
+</html>
