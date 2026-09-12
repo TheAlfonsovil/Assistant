@@ -39,6 +39,7 @@ class ContextBuilder:
                 "max_retries": task.budget.max_retries,
                 "max_execution_time": task.budget.max_execution_time,
                 "max_tool_calls": task.budget.max_tool_calls,
+                "max_plan_nodes": task.budget.max_plan_nodes,
             },
             "available_tools": [definition.model_dump() for definition in self.tools.definitions()],
             "available_actions": [definition.model_dump() for definition in self.tools.definitions()],

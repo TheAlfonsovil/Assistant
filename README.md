@@ -102,6 +102,21 @@ dependencias completadas sin consumir otra llamada al LLM. Los tipos
 `CONDITION` y `NOTIFY` se bloquean explícitamente hasta que exista un lenguaje
 de condiciones y un adaptador de notificaciones.
 
+El planner tiene un presupuesto de `max_plan_nodes` (100 por defecto). Si una
+propuesta supera ese límite, debe devolver `subtasks` y el motor persiste esas
+subtareas en lugar de convertir un plan enorme en cientos de nodos. Las
+dependencias pueden declarar `SUCCESS`, `FAILURE` o `ALWAYS`. Una acción fallida
+entra primero en verificación: `RETRY` vuelve a `READY` con backoff; si agota
+los reintentos o no es reintentable, la acción y la tarea quedan en `FAILED`.
+`BLOCKED` se reserva para intervención humana, capacidad no soportada o un
+grafo sin progreso. Durante la comprobación de un resultado, el estado de la
+tarea también es `VERIFYING`.
+
+Una respuesta directa, como `cuanto es 2 + 2`, se persiste como resultado final
+de la tarea y se devuelve al usuario sin crear nodos de ejecución ni pedir una
+segunda respuesta al LLM. Tras un reinicio, los nodos que estaban en
+`RUNNING` o `VERIFYING` vuelven a `READY` junto con su tarea padre.
+
 Para analizar estructura y relaciones del código, una operación puede usar la capability `project.analyze`. Devuelve archivos examinados, lenguajes, símbolos y aristas de imports; no se confunde con `filesystem.exists`, que solo comprueba una ruta. Para tareas de ordenador, `system.info` devuelve estado local básico y `browser.inspect` inventaría navegadores y pestañas observables. `browser.open` abre una URL pública, `browser.close_tab` cierra una pestaña identificada, `browser.close_site` cierra las pestañas observadas de un sitio y `browser.close_browser` cierra el proceso Windows identificado. Cada interacción se registra en `data/browser-interactions.jsonl` con origen, identidad, URL, objetivo y resultado. La memoria persistente vive en SQLite y sus recuerdos relevantes se incorporan al contexto del Planner.
 
 Para que Chrome o Edge expongan sus pestañas y URLs, hay que iniciarlo con un puerto DevTools, por ejemplo `--remote-debugging-port=9222`. Sin ese canal, Windows solo permite identificar la ventana/proceso del navegador; el sistema informa esa limitación y no afirma conocer sus pestañas.

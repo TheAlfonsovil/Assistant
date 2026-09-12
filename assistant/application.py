@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from .context import ContextBuilder
 from .domain.graph import TaskGraph
 from .domain.models import (
+    DependencyType,
     GraphEdge,
     NodeStatus,
     NodeType,
@@ -32,7 +33,7 @@ from .domain.models import (
 )
 from .infrastructure.orm import IdempotencyRow, LeaseRow
 from .infrastructure.repositories import TaskRepository
-from .llm import LLMProvider
+from .llm import AssistantResponse, LLMProvider
 from .observability import compact
 from .scheduler import NodeScheduler
 from .tools import ToolRegistry
@@ -338,6 +339,44 @@ class TaskService:
         node.error = f"{key} budget exhausted"
         await self.repository.save_node(node)
 
+    async def _create_subtask_nodes(self, task: Task, parent: TaskNode, descriptions: list[str]) -> None:
+        for description in descriptions:
+            child = TaskNode(
+                task_id=task.id,
+                parent_node_id=parent.id,
+                type=NodeType.SUBTASK,
+                description=description,
+                status=NodeStatus.READY,
+                max_retries=task.budget.max_retries,
+            )
+            await self.repository.save_node(child)
+            await self.repository.save_edge(
+                task.id, GraphEdge(from_node=parent.id, to_node=child.id)
+            )
+
+    async def _complete_direct_answer(self, task: Task, root_node: TaskNode, answer: str) -> None:
+        task.status = TaskStatus.SUCCEEDED
+        task.result_summary = answer
+        task.finished_at = datetime.now(UTC)
+        root_node.status = NodeStatus.SUCCEEDED
+        root_node.output_data = {"answer": answer}
+        await self.repository.save_node(root_node)
+        task.metadata["final_response"] = AssistantResponse(
+            response_type="answer",
+            title="Respuesta",
+            summary=answer,
+            evidence=["Respuesta directa del planner; no se requirieron acciones externas."],
+            confidence="high",
+        ).model_dump(mode="json")
+        await self.repository.save_task(task)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="TASK_COMPLETED",
+                payload={"kind": "direct_answer", "answer": answer},
+            )
+        )
+
     @staticmethod
     def _operation_key(task_id: str, node_id: str, operation) -> str:
         payload = json.dumps(
@@ -546,24 +585,51 @@ class TaskService:
                 planned_nodes = await self.repository.list_nodes(task.id)
                 root_node = next((item for item in planned_nodes if item.type is NodeType.TASK), None)
                 if proposal.answer is not None and not proposal.nodes:
-                    task.status = TaskStatus.SUCCEEDED
-                    task.result_summary = proposal.answer
-                    task.finished_at = datetime.now(UTC)
-                    if root_node:
+                    if root_node is not None:
+                        await self._complete_direct_answer(task, root_node, proposal.answer)
+                    return False
+                if not proposal.nodes:
+                    if proposal.subtasks and root_node is not None:
+                        await self._create_subtask_nodes(task, root_node, proposal.subtasks)
                         root_node.status = NodeStatus.SUCCEEDED
-                        root_node.output_data = {"answer": proposal.answer}
                         await self.repository.save_node(root_node)
+                        task.status = TaskStatus.READY
+                        await self.repository.save_task(task)
+                        await self.repository.save_event(
+                            TaskEvent(
+                                task_id=task_id,
+                                node_id=root_node.id,
+                                event_type="PLAN_DECOMPOSED",
+                                payload={"original_nodes": 0, "subtasks": len(proposal.subtasks)},
+                            )
+                        )
+                        return True
+                    raise ValueError("planner returned an empty plan")
+                if len(proposal.nodes) > task.budget.max_plan_nodes:
+                    if not proposal.subtasks:
+                        raise ValueError(
+                            f"planner returned {len(proposal.nodes)} nodes; "
+                            f"decomposition into at most {task.budget.max_plan_nodes} subtasks is required"
+                        )
+                    if root_node is None:
+                        raise ValueError("task root node is missing")
+                    await self._create_subtask_nodes(task, root_node, proposal.subtasks)
+                    root_node.status = NodeStatus.SUCCEEDED
+                    await self.repository.save_node(root_node)
+                    task.status = TaskStatus.READY
                     await self.repository.save_task(task)
                     await self.repository.save_event(
                         TaskEvent(
                             task_id=task_id,
-                            event_type="TASK_COMPLETED",
-                            payload={"kind": "direct_answer", "answer": proposal.answer},
+                            node_id=root_node.id,
+                            event_type="PLAN_DECOMPOSED",
+                            payload={
+                                "original_nodes": len(proposal.nodes),
+                                "subtasks": len(proposal.subtasks),
+                            },
                         )
                     )
-                    return False
-                if not proposal.nodes:
-                    raise ValueError("planner returned an empty plan")
+                    return True
                 if len({proposed.id for proposed in proposal.nodes}) != len(proposal.nodes):
                     raise ValueError("planner returned duplicate node ids")
                 node_ids = {proposed.id: str(uuid4()) for proposed in proposal.nodes}
@@ -584,10 +650,14 @@ class TaskService:
                     for dependency in proposed.dependencies:
                         if dependency not in node_ids:
                             raise ValueError(f"Unknown planner dependency: {dependency}")
+                        dependency_type = proposed.dependency_types.get(
+                            dependency, DependencyType.SUCCESS
+                        )
                         planned_edges.append(
                             GraphEdge(
                                 from_node=node_ids[dependency],
                                 to_node=node_ids[proposed.id],
+                                dependency_type=dependency_type,
                             )
                         )
                 TaskGraph(planned_models, planned_edges)
@@ -679,6 +749,19 @@ class TaskService:
                 await self.repository.save_task(task)
                 await self.repository.save_event(
                     TaskEvent(task_id=task_id, event_type="TASK_COMPLETED")
+                )
+                return False
+            if any(node.status is NodeStatus.FAILED for node in graph.nodes.values()):
+                task.status = TaskStatus.FAILED
+                task.failure_reason = "task has failed nodes"
+                task.finished_at = datetime.now(UTC)
+                await self.repository.save_task(task)
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task_id,
+                        event_type="TASK_FAILED",
+                        payload={"reason": task.failure_reason},
+                    )
                 )
                 return False
             if any(node.status is NodeStatus.WAITING for node in graph.nodes.values()):
@@ -904,7 +987,9 @@ class TaskService:
                     )
                     await self.session.commit()
             node.status = NodeStatus.VERIFYING
+            task.status = TaskStatus.VERIFYING
             await self.repository.save_node(node)
+            await self.repository.save_task(task)
             await self.repository.save_event(
                 TaskEvent(task_id=task_id, node_id=node.id, event_type="NODE_VERIFYING")
             )
@@ -919,8 +1004,10 @@ class TaskService:
             )
             if verification.decision.value == "SUCCESS":
                 node.status = NodeStatus.SUCCEEDED
+                task.status = TaskStatus.READY
                 node.output_data = result
                 await self.repository.save_node(node)
+                await self.repository.save_task(task)
                 await self.repository.save_event(
                     TaskEvent(task_id=task_id, node_id=node.id, event_type="NODE_COMPLETED", payload={"status": node.status})
                 )
@@ -933,12 +1020,29 @@ class TaskService:
                     datetime.now(UTC) + timedelta(seconds=delay)
                 ).isoformat()
                 await self.repository.save_node(node)
+                task.status = TaskStatus.READY
+                await self.repository.save_task(task)
                 await self.repository.save_event(
                     TaskEvent(
                         task_id=task_id,
                         node_id=node.id,
                         event_type="RETRY_SCHEDULED",
                         payload={"attempt": node.retry_count, "delay_seconds": delay},
+                    )
+                )
+            elif verification.decision.value == "RETRY":
+                node.status = NodeStatus.FAILED
+                node.error = result.get("error") or "retry limit exhausted"
+                task.status = TaskStatus.FAILED
+                task.failure_reason = node.error
+                await self.repository.save_node(node)
+                await self.repository.save_task(task)
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task_id,
+                        node_id=node.id,
+                        event_type="TASK_FAILED",
+                        payload={"phase": "verification", "error": node.error},
                     )
                 )
             elif verification.decision.value == "WAIT_USER":
@@ -997,12 +1101,20 @@ class TaskService:
                 await self.repository.save_node(node)
                 await self.repository.save_task(task)
             else:
-                node.status = NodeStatus.BLOCKED
+                node.status = NodeStatus.FAILED
                 node.error = result.get("error")
-                task.status = TaskStatus.BLOCKED
+                task.status = TaskStatus.FAILED
                 task.failure_reason = node.error
                 await self.repository.save_node(node)
                 await self.repository.save_task(task)
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task_id,
+                        node_id=node.id,
+                        event_type="TASK_FAILED",
+                        payload={"phase": "verification", "error": node.error},
+                    )
+                )
             return True
         finally:
             await self.release_lease(node.id)

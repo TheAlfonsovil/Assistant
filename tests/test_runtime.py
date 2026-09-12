@@ -14,6 +14,7 @@ from assistant.devices.computer.web import WebTool
 from assistant.devices.registry import DEVICE_BRANCHES, build_tool_registry
 from assistant.domain.graph import TaskGraph
 from assistant.domain.models import (
+    DependencyType,
     ErrorType,
     GraphEdge,
     MemoryRecord,
@@ -503,6 +504,137 @@ async def test_recovery_requeues_planning_tasks(tmp_path):
         recovered = await RecoveryManager(session).recover()
         assert recovered == 1
         assert (await repository.get_task(task.id)).status is TaskStatus.QUEUED
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_requeues_parent_task_and_running_node(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'recovery-running.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        task = Task(goal="recover running", status=TaskStatus.RUNNING)
+        node = TaskNode(
+            task_id=task.id,
+            type=NodeType.OPERATION,
+            description="interrupted operation",
+            status=NodeStatus.RUNNING,
+        )
+        await repository.save_task(task)
+        await repository.save_node(node)
+
+        recovered = await RecoveryManager(session).recover()
+
+        assert recovered == 1
+        assert (await repository.get_task(task.id)).status is TaskStatus.READY
+        assert (await repository.get_node(node.id)).status is NodeStatus.READY
+        assert (await repository.get_node(node.id)).error == "recovered after process restart"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_answer_persists_exact_user_facing_response(tmp_path):
+    class DirectAnswerProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(answer="4")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'direct-response.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, DirectAnswerProvider(), ToolRegistry())
+        task = await service.create_task(TaskRequest(goal="cuanto es 2 + 2"))
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert result.result_summary == "4"
+        assert result.metadata["final_response"]["summary"] == "4"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_operation_failure_is_terminal_failed(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'failed-operation.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(Operation(tool="mock.always_fail", method="run")),
+            ToolRegistry([MockTool("always_fail")]),
+        )
+        task = await service.create_task(TaskRequest(goal="run failing operation"))
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.FAILED
+        assert (await service.repository.list_nodes(task.id))[-1].status is NodeStatus.FAILED
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_large_plan_is_decomposed_before_persisting_all_nodes(tmp_path):
+    class LargePlanProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[
+                    PlanNodeProposal(id=f"step-{index}", description=f"step {index}")
+                    for index in range(101)
+                ],
+                subtasks=["inspect the first half", "inspect the second half"],
+            )
+
+        async def decide(self, context):
+            return NodeDecision(action="COMPLETE", reason="subtask complete")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'large-plan.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, LargePlanProvider(), ToolRegistry())
+        task = await service.create_task(TaskRequest(goal="large plan"))
+
+        result = await service.run_task(task.id)
+        nodes = await service.repository.list_nodes(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert {node.description for node in nodes} >= {
+            "inspect the first half",
+            "inspect the second half",
+        }
+        assert len(nodes) == 3
+        assert any(
+            event.event_type == "PLAN_DECOMPOSED"
+            for event in await service.repository.list_events(task.id)
+        )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_planner_preserves_typed_dependency_edges(tmp_path):
+    class TypedPlanProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[
+                    PlanNodeProposal(id="first", description="first"),
+                    PlanNodeProposal(
+                        id="cleanup",
+                        description="cleanup",
+                        dependencies=["first"],
+                        dependency_types={"first": DependencyType.ALWAYS},
+                    ),
+                ]
+            )
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'typed-edges.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, TypedPlanProvider(), ToolRegistry())
+        task = await service.create_task(TaskRequest(goal="typed edges"))
+
+        await service.execute_once(task.id)
+        edges = await service.repository.list_edges(task.id)
+
+        assert len(edges) == 1
+        assert edges[0].dependency_type is DependencyType.ALWAYS
     await database.close()
 
 

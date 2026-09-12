@@ -82,6 +82,7 @@ class TaskBudget(BaseModel):
     max_retries: int = 3
     max_execution_time: float = 3600.0
     max_tool_calls: int = 50
+    max_plan_nodes: int = 100
 
 
 class Project(BaseModel):

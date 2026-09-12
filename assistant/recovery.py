@@ -19,10 +19,22 @@ class RecoveryManager:
             )
         )
         recovered = 0
+        recovered_task_ids = set()
         for row in result.scalars():
             row.status = NodeStatus.READY.value
             row.error = "recovered after process restart"
+            row.finished_at = None
+            recovered_task_ids.add(row.task_id)
             recovered += 1
+        if recovered_task_ids:
+            tasks = await self.session.execute(
+                select(TaskRow).where(TaskRow.id.in_(recovered_task_ids))
+            )
+            for row in tasks.scalars():
+                if row.status in {TaskStatus.RUNNING.value, TaskStatus.VERIFYING.value}:
+                    row.status = TaskStatus.READY.value
+                    row.finished_at = None
+                    row.failure_reason = "node recovered after process restart"
         planning = await self.session.execute(
             select(TaskRow).where(TaskRow.status == TaskStatus.PLANNING.value)
         )

@@ -9,7 +9,7 @@ from typing import Any, Protocol
 import httpx
 from pydantic import BaseModel, Field
 
-from .domain.models import Operation, VerificationDecision
+from .domain.models import DependencyType, Operation, VerificationDecision
 from .prompts.v1.template import render
 
 
@@ -35,6 +35,7 @@ class PlanNodeProposal(BaseModel):
     description: str
     type: str = "OPERATION"
     dependencies: list[str] = Field(default_factory=list)
+    dependency_types: dict[str, DependencyType] = Field(default_factory=dict)
     priority: int = 0
 
 
@@ -42,6 +43,7 @@ class PlanProposal(BaseModel):
     task_id: str | None = None
     nodes: list[PlanNodeProposal] = Field(default_factory=list)
     answer: str | None = None
+    subtasks: list[str] = Field(default_factory=list)
 
 
 class VerificationResult(BaseModel):

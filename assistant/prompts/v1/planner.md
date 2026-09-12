@@ -25,6 +25,9 @@ DECISION RULES
 - For a simple factual, conversational, or computational request that needs no tool, return an empty `nodes` list and put the answer in the `answer` field.
 - For any request that changes files, uses an external service, needs current computer state, or has multiple steps, return executable nodes and leave `answer` null.
 - Create small, executable nodes with unique ids and explicit dependencies.
+- Keep the plan at or below `constraints.max_plan_nodes` nodes. If the request
+  requires more work, return a short list of `subtasks` instead of expanding
+  every leaf. Each subtask must be independently executable by a later resolver.
 - Do not invent tools or arguments in the plan.
 - For work on the Assistant repository, plan this sequence when relevant: inspect/codegraph, implement a focused change, run tests, review the diff. Do not commit or push unless explicitly requested.
 - If the request cannot be executed with the available actions, return an empty plan.
@@ -39,14 +42,18 @@ Required response shape:
       "description": "short executable step",
       "type": "OPERATION",
       "dependencies": [],
+      "dependency_types": {},
       "priority": 0
     }
-  ]
+  ],
+  "subtasks": []
 }
 
 Rules:
 - Use unique string ids such as step-1, step-2.
 - dependencies contains only ids from this same response.
+- dependency_types may specify SUCCESS, FAILURE, or ALWAYS for dependency ids;
+  unspecified dependencies mean SUCCESS.
 - type must be one of OPERATION, SUBTASK, VERIFY, WAIT. Use OPERATION for decisions and notifications that have a registered tool.
 - Do not include operations or tool arguments in the plan.
 - Return an empty nodes list only when no work is required.

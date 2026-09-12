@@ -23,5 +23,5 @@ class DeterministicVerifier:
                 reason=result.error or "user input required",
             )
         return VerificationResult(
-            decision=VerificationDecision.BLOCK, reason=result.error or "operation failed"
+            decision=VerificationDecision.FAIL, reason=result.error or "operation failed"
         )
