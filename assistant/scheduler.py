@@ -16,10 +16,37 @@ class NodeScheduler:
             TaskStatus.BLOCKED,
         }:
             return None
+        now = datetime.now(UTC)
         for node in graph.ready_nodes():
-            if node.status is NodeStatus.READY and (
-                not node.metadata.get("deadline")
-                or datetime.now(UTC).isoformat() <= node.metadata["deadline"]
-            ):
-                return node
+            if node.status is not NodeStatus.READY:
+                continue
+            if self._timestamp_is_at_or_before(node.metadata.get("deadline"), now):
+                continue
+            if self._timestamp_is_after(node.metadata.get("next_retry_at"), now):
+                continue
+            return node
         return None
+
+    @staticmethod
+    def _timestamp_is_after(value, now: datetime) -> bool:
+        if not value:
+            return False
+        try:
+            timestamp = datetime.fromisoformat(value)
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=UTC)
+            return timestamp > now
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _timestamp_is_at_or_before(value, now: datetime) -> bool:
+        if not value:
+            return False
+        try:
+            timestamp = datetime.fromisoformat(value)
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=UTC)
+            return timestamp <= now
+        except (TypeError, ValueError):
+            return False

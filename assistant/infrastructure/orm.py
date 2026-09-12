@@ -15,6 +15,7 @@ class TaskRow(Base):
     parent_task_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     root_task_id: Mapped[str] = mapped_column(String(36), nullable=False)
     source: Mapped[str] = mapped_column(String(32), nullable=False)
+    project_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     goal: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -101,3 +102,20 @@ class MemoryRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     usage_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ProjectRow(Base):
+    __tablename__ = "projects"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str] = mapped_column(Text, default="")
+    project_type: Mapped[str] = mapped_column(String(32), default="code")
+    audit_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(default=True)
+    is_default: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_audited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

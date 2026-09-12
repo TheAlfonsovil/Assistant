@@ -89,7 +89,18 @@ class ToolRegistry:
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
         started = perf_counter()
-        result = await tool.execute(operation.method, operation.args, operation.timeout)
+        try:
+            result = await asyncio.wait_for(
+                tool.execute(operation.method, operation.args, operation.timeout),
+                timeout=operation.timeout,
+            )
+        except TimeoutError:
+            result = OperationResult(
+                success=False,
+                error=f"tool timed out after {operation.timeout}s",
+                error_type=ErrorType.TIMEOUT,
+                retryable=True,
+            )
         finished_at = datetime.now(UTC)
         return result.model_copy(
             update={

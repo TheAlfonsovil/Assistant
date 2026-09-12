@@ -4,9 +4,9 @@ from datetime import UTC, datetime
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from assistant.domain.models import GraphEdge, MemoryRecord, Task, TaskEvent, TaskNode
+from assistant.domain.models import GraphEdge, MemoryRecord, Project, Task, TaskEvent, TaskNode
 
-from .orm import EdgeRow, EventRow, MemoryRow, NodeRow, TaskRow
+from .orm import EdgeRow, EventRow, LeaseRow, MemoryRow, NodeRow, ProjectRow, TaskRow
 
 
 def task_to_row(task: Task) -> TaskRow:
@@ -27,6 +27,7 @@ def row_to_task(row: TaskRow) -> Task:
                     "parent_task_id",
                     "root_task_id",
                     "source",
+                    "project_id",
                     "goal",
                     "description",
                     "priority",
@@ -104,6 +105,57 @@ class TaskRepository:
     async def list_tasks(self) -> list[Task]:
         result = await self.session.execute(select(TaskRow).order_by(TaskRow.created_at.desc()))
         return [row_to_task(row) for row in result.scalars()]
+
+    async def create_project(self, project: Project) -> Project:
+        row = ProjectRow(**project.model_dump(mode="python"))
+        self.session.add(row)
+        await self.session.commit()
+        return project
+
+    async def get_project(self, project_id: str) -> Project | None:
+        row = await self.session.get(ProjectRow, project_id)
+        return self._row_to_project(row) if row else None
+
+    async def list_projects(self, enabled_only: bool = False) -> list[Project]:
+        query = select(ProjectRow).order_by(ProjectRow.is_default.desc(), ProjectRow.updated_at.desc())
+        if enabled_only:
+            query = query.where(ProjectRow.enabled.is_(True))
+        result = await self.session.execute(query)
+        return [self._row_to_project(row) for row in result.scalars()]
+
+    async def update_project(self, project: Project) -> Project:
+        row = await self.session.get(ProjectRow, project.id)
+        if row is None:
+            raise KeyError(f"Project not found: {project.id}")
+        project.updated_at = datetime.now(UTC)
+        for key, value in project.model_dump(mode="python").items():
+            setattr(row, key, value)
+        await self.session.commit()
+        return project
+
+    async def delete_project(self, project_id: str) -> bool:
+        result = await self.session.execute(delete(ProjectRow).where(ProjectRow.id == project_id))
+        await self.session.commit()
+        return result.rowcount > 0
+
+    async def resolve_project(self, project_id: str | None = None, project_name: str | None = None) -> Project | None:
+        if project_id:
+            return await self.get_project(project_id)
+        projects = await self.list_projects(enabled_only=True)
+        if project_name:
+            matches = [item for item in projects if item.name.casefold() == project_name.casefold()]
+            return matches[0] if len(matches) == 1 else None
+        defaults = [item for item in projects if item.is_default]
+        if len(defaults) == 1:
+            return defaults[0]
+        return projects[0] if len(projects) == 1 else None
+
+    @staticmethod
+    def _row_to_project(row: ProjectRow) -> Project:
+        return Project.model_validate({key: getattr(row, key) for key in (
+            "id", "name", "path", "description", "project_type", "audit_prompt", "enabled", "is_default",
+            "created_at", "updated_at", "last_used_at", "last_audited_at",
+        )})
 
     async def save_memory(self, memory: MemoryRecord) -> None:
         row = await self.session.get(MemoryRow, memory.id)
@@ -238,3 +290,30 @@ class TaskRepository:
     async def clear_edges(self, task_id: str) -> None:
         await self.session.execute(delete(EdgeRow).where(EdgeRow.task_id == task_id))
         await self.session.commit()
+
+    async def reset_task_graph(self, task_id: str, root_node_id: str) -> None:
+        node_ids = await self.session.execute(
+            select(NodeRow.id).where(NodeRow.task_id == task_id, NodeRow.id != root_node_id)
+        )
+        child_ids = list(node_ids.scalars())
+        if child_ids:
+            await self.session.execute(delete(LeaseRow).where(LeaseRow.node_id.in_(child_ids)))
+        await self.session.execute(delete(EdgeRow).where(EdgeRow.task_id == task_id))
+        await self.session.execute(
+            delete(NodeRow).where(NodeRow.task_id == task_id, NodeRow.id != root_node_id)
+        )
+        await self.session.commit()
+
+    async def delete_task(self, task_id: str) -> bool:
+        node_ids = await self.session.execute(
+            select(NodeRow.id).where(NodeRow.task_id == task_id)
+        )
+        ids = list(node_ids.scalars())
+        if ids:
+            await self.session.execute(delete(LeaseRow).where(LeaseRow.node_id.in_(ids)))
+        await self.session.execute(delete(EventRow).where(EventRow.task_id == task_id))
+        await self.session.execute(delete(EdgeRow).where(EdgeRow.task_id == task_id))
+        await self.session.execute(delete(NodeRow).where(NodeRow.task_id == task_id))
+        result = await self.session.execute(delete(TaskRow).where(TaskRow.id == task_id))
+        await self.session.commit()
+        return result.rowcount > 0

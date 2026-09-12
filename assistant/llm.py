@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -39,6 +41,7 @@ class PlanNodeProposal(BaseModel):
 class PlanProposal(BaseModel):
     task_id: str | None = None
     nodes: list[PlanNodeProposal] = Field(default_factory=list)
+    answer: str | None = None
 
 
 class VerificationResult(BaseModel):
@@ -46,9 +49,12 @@ class VerificationResult(BaseModel):
     reason: str = ""
 
 
-class FinalReport(BaseModel):
+class AssistantResponse(BaseModel):
+    response_type: str = "answer"
     title: str
     summary: str
+    sections: dict[str, list[str]] = Field(default_factory=dict)
+    next_actions: list[str] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
@@ -56,12 +62,16 @@ class FinalReport(BaseModel):
     confidence: str = "medium"
 
 
+# Compatibility name for callers of the first reporting implementation.
+FinalReport = AssistantResponse
+
+
 class LLMProvider(Protocol):
     async def decide(self, context: dict[str, Any]) -> NodeDecision: ...
     async def plan(self, context: dict[str, Any]) -> PlanProposal: ...
     async def replan(self, context: dict[str, Any]) -> NodeDecision: ...
     async def verify(self, context: dict[str, Any]) -> VerificationResult: ...
-    async def summarize(self, context: dict[str, Any]) -> FinalReport: ...
+    async def respond(self, context: dict[str, Any]) -> AssistantResponse: ...
 
 
 class MockLLMProvider:
@@ -79,7 +89,15 @@ class MockLLMProvider:
         return NodeDecision(action="OPERATION", operation=self.operation)
 
     async def plan(self, context: dict[str, Any]) -> PlanProposal:
-        return PlanProposal()
+        return PlanProposal(
+            nodes=[
+                PlanNodeProposal(
+                    id="mock-operation",
+                    description="execute configured mock operation",
+                    type="OPERATION",
+                )
+            ]
+        )
 
     async def replan(self, context: dict[str, Any]) -> NodeDecision:
         return NodeDecision(action="COMPLETE", reason="mock replan completed")
@@ -92,13 +110,17 @@ class MockLLMProvider:
             else VerificationDecision.RETRY
         )
 
-    async def summarize(self, context: dict[str, Any]) -> FinalReport:
-        return FinalReport(
-            title="Assistant task report",
+    async def respond(self, context: dict[str, Any]) -> AssistantResponse:
+        return AssistantResponse(
+            response_type="report" if context.get("requested_format") == "report" else "answer",
+            title="Assistant response",
             summary="Task completed with the configured mock provider.",
             evidence=[f"events={len(context.get('events', []))}"],
             confidence="high",
         )
+
+    async def summarize(self, context: dict[str, Any]) -> AssistantResponse:
+        return await self.respond(context)
 
 
 class OllamaLLMProvider:
@@ -108,10 +130,12 @@ class OllamaLLMProvider:
         model: str,
         timeout: float | None = None,
         client: httpx.AsyncClient | None = None,
+        trace_sink: Callable[[dict[str, Any]], None] | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.client = client or httpx.AsyncClient(timeout=timeout)
+        self.trace_sink = trace_sink
 
     async def check_ready(self) -> bool:
         async with httpx.AsyncClient(timeout=None) as client:
@@ -127,8 +151,18 @@ class OllamaLLMProvider:
         prompt = {
             "role": role,
             "instructions": rendered_instructions,
-            "context": context,
         }
+        started = time.perf_counter()
+        self._trace(
+            {
+                "phase": "LLM_REQUEST_BUILT",
+                "role": role,
+                "prompt_chars": len(rendered_instructions),
+                "context_chars": len(json.dumps(context, default=str)),
+                "sections": [line for line in rendered_instructions.splitlines() if line and line.isupper()],
+                "prompt_preview": rendered_instructions[:4000],
+            }
+        )
         response = await self.client.post(
             f"{self.base_url}/api/generate",
             json={
@@ -141,7 +175,36 @@ class OllamaLLMProvider:
         response.raise_for_status()
         payload = response.json()
         raw = payload.get("response", payload)
-        return schema.model_validate(json.loads(raw) if isinstance(raw, str) else raw)
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            validated = schema.model_validate(parsed)
+        except (TypeError, ValueError) as error:
+            self._trace(
+                {
+                    "phase": "LLM_RESPONSE_INVALID",
+                    "role": role,
+                    "elapsed_seconds": round(time.perf_counter() - started, 2),
+                    "raw_chars": len(raw) if isinstance(raw, str) else len(json.dumps(raw, default=str)),
+                    "raw_preview": raw[:4000] if isinstance(raw, str) else raw,
+                    "error": str(error),
+                }
+            )
+            raise
+        self._trace(
+            {
+                "phase": "LLM_RESPONSE_PARSED",
+                "role": role,
+                "elapsed_seconds": round(time.perf_counter() - started, 2),
+                "raw_chars": len(raw) if isinstance(raw, str) else len(json.dumps(raw, default=str)),
+                "raw_preview": raw[:4000] if isinstance(raw, str) else raw,
+                "validated": validated.model_dump(mode="json"),
+            }
+        )
+        return validated
+
+    def _trace(self, payload: dict[str, Any]) -> None:
+        if self.trace_sink:
+            self.trace_sink(payload)
 
     async def decide(self, context: dict[str, Any]) -> NodeDecision:
         return await self._ask("NODE_RESOLVER", context, NodeDecision)
@@ -155,8 +218,11 @@ class OllamaLLMProvider:
     async def verify(self, context: dict[str, Any]) -> VerificationResult:
         return await self._ask("VERIFIER", context, VerificationResult)
 
-    async def summarize(self, context: dict[str, Any]) -> FinalReport:
-        return await self._ask("FINAL_REPORT", context, FinalReport)
+    async def respond(self, context: dict[str, Any]) -> AssistantResponse:
+        return await self._ask("FINAL_RESPONSE", context, AssistantResponse)
+
+    async def summarize(self, context: dict[str, Any]) -> AssistantResponse:
+        return await self.respond(context)
 
     async def close(self) -> None:
         await self.client.aclose()

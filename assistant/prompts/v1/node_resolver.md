@@ -59,6 +59,10 @@ Valid shell example:
 {"action":"OPERATION","operation":{"tool":"shell","method":"exec","args":{"command":"pytest -q","cwd":"C:/project"},"timeout":60,"retry_policy":{},"idempotency_key":"tests-C:/project","metadata":{}},"subtasks":[],"reason":null}
 
 Decision rules:
+- For a GUI, browser, media, or computer-control request, first obtain current computer state with `system.info` or another available read-only state operation when the state is not already in the context.
+- For browser control, use `browser.inspect` first, keep the returned `browser_id` and `tab_id`, then use `browser.close_tab`, `browser.close_site`, or `browser.close_browser` with those identities. Use `browser.log` when interaction history matters.
+- To open a public page in the user's browser, use `browser.open` after resolving the URL and include the task/node as `origin`. Its result confirms that the browser accepted the URL, not that a page element or video was successfully played.
+- Do not use `web.fetch` as a substitute for browser interaction: fetching a YouTube page is not playing a video.
 - Use CREATE_ACTION only when a small task-specific script is genuinely necessary. Include safe, reviewable code and do not execute it in the same decision.
 - Use WAIT when user input, approval or an external condition is required.
 - Use BLOCK when the task is impossible, unsafe, unauthorized or missing a required capability. Explain the concrete reason.

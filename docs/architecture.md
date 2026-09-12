@@ -8,7 +8,12 @@ There are three layers with different responsibilities:
 
 1. `startup` loads the application, checks readiness and recovers persisted work.
 2. `devices` exposes what the assistant can do on each device branch.
-3. `application` executes tasks through the stable `Tool` contract.
+3. `application` resolves projects and executes tasks through the stable `Tool` contract.
+
+Projects are domain resources, not devices. The project registry and task
+association belong to the domain/application and persistence layers; the
+computer branch only exposes the adapter (`project.analyze`) that operates on
+the already-resolved path.
 
 The task engine does not contain Windows, mobile, home or robot details. A device branch owns its adapters and actions; the registry only composes them.
 
@@ -54,7 +59,7 @@ load settings
     -> expose TaskService
 ```
 
-A missing LLM produces `DEGRADED`, not a fake `READY`: the process can inspect persisted state, but LLM-dependent work may fail. `StartupReport` is available to the CLI and `/health` endpoint. The runtime then processes queued, ready and running tasks; it does not create synthetic maintenance tasks.
+A missing LLM produces `DEGRADED`, not a fake `READY`: the process can inspect persisted state, but LLM-dependent work may fail. `StartupReport` is available to the CLI and `/health` endpoint. The runtime then processes queued, ready and running tasks. When there is no active work it performs an idle health pass without creating synthetic maintenance tasks, exposes its last pass and active-task count through `/health`, and applies bounded backoff if a complete runtime pass fails.
 
 The optional `ASSISTANT_USER_*` settings create one structured `user_profile` memory. It is explicitly supplied configuration, not an inference: name, birth date, profession, degrees and expertise are stored as JSON and updated by key. The planner always includes this profile alongside memories relevant to the task. Do not place secrets or broad personal data in `.env`; use an explicit memory action for anything else.
 
@@ -66,6 +71,8 @@ The optional `ASSISTANT_USER_*` settings create one structured `user_profile` me
 4. Add a focused test for success and invalid arguments.
 
 The planner will receive the definition automatically. Do not modify `application.py` for a normal device action.
+
+The final LLM phase is `FINAL_RESPONSE`, not a mandatory report. It chooses an appropriate response type (`answer`, `report`, `plan`, `clarification`, `blocked` or `action_proposal`) from the original request and execution evidence.
 
 ## Add a new device branch
 
@@ -88,3 +95,27 @@ Mobile, home and robot intentionally expose mock status tools today. They establ
 - `assistant.project_analysis`: bounded project inventory with Python symbols and import edges.
 
 SQLite stores tasks, nodes, edges, events, leases and idempotency results. Important transitions are events for audit and later UI/debugging work.
+
+## Project workflow
+
+Each project stores a stable name, absolute path, description, project type and
+default audit prompt. A task may reference `project_id`. Resolution is
+deterministic: explicit id, explicit name, one default, or the sole enabled
+project. Multiple projects without an explicit selection remain unresolved and
+should be clarified by the user. The default code-project workflow creates a
+normal task for each iteration:
+
+```text
+audit -> plan -> inspect/implement/test -> verify -> evidence report
+```
+
+This keeps repeated reviews independent and durable without making the project
+itself an endlessly running task.
+
+## Memory injection
+
+Memory is context, not control flow. The planner receives a bounded set of
+relevant records, plus explicit profile/system facts. Each record includes its
+kind, key, value, provenance and confidence and is labelled as data-only. A
+memory value never supplies a project path or overrides the registered project
+context; project identity is resolved structurally before prompting the LLM.

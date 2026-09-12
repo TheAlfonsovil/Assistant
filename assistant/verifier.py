@@ -1,4 +1,4 @@
-from .domain.models import OperationResult, VerificationDecision
+from .domain.models import ErrorType, OperationResult, VerificationDecision
 from .llm import VerificationResult
 
 
@@ -11,6 +11,11 @@ class DeterministicVerifier:
         if result.error_type and result.retryable:
             return VerificationResult(
                 decision=VerificationDecision.RETRY, reason=result.error or "retryable error"
+            )
+        if result.error_type in {ErrorType.DEPENDENCY_FAILURE, ErrorType.CONFLICT}:
+            return VerificationResult(
+                decision=VerificationDecision.REPLAN,
+                reason=result.error or "execution context requires replanning",
             )
         if result.error_type and result.error_type.value == "USER_REQUIRED":
             return VerificationResult(

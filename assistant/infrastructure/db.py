@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -33,6 +34,15 @@ class Database:
     async def create_all(self) -> None:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
+            await connection.run_sync(self._migrate_existing_schema)
+
+    @staticmethod
+    def _migrate_existing_schema(connection) -> None:
+        inspector = inspect(connection)
+        if "tasks" in inspector.get_table_names():
+            columns = {column["name"] for column in inspector.get_columns("tasks")}
+            if "project_id" not in columns:
+                connection.execute(text("ALTER TABLE tasks ADD COLUMN project_id VARCHAR(36)"))
 
     async def session(self) -> AsyncIterator[AsyncSession]:
         async with self.sessions() as session:

@@ -1,6 +1,6 @@
 # Auto-mejora de Assistant
 
-Assistant puede trabajar sobre su propio repositorio cuando `ASSISTANT_WORKSPACE_ROOT` apunta a la carpeta del proyecto. La auto-mejora no significa que el LLM pueda reescribirse y continuar sin control: significa ejecutar un flujo verificable de ingeniería.
+Assistant puede trabajar sobre su propio repositorio cuando `ASSISTANT_WORKSPACE_ROOT` apunta a la carpeta del proyecto. La auto-mejora no significa que el LLM pueda reescribirse y continuar sin control: significa ejecutar un flujo verificable de ingeniería. La salida final usa una respuesta genérica y solo adopta formato de informe cuando la tarea lo pide.
 
 ## Flujo obligatorio
 

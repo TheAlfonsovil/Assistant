@@ -5,6 +5,7 @@ import typer
 from httpx import HTTPError
 
 from .domain.models import TaskRequest
+from .llm import AssistantResponse
 from .observability import preview
 from .runtime import TaskRuntime
 from .startup.bootstrap import create_context
@@ -21,6 +22,24 @@ def task(
     ] = False,
 ):
     async def run():
+        def print_llm_trace(trace):
+            if not fullflow:
+                return
+            phase = trace.get("phase")
+            role = trace.get("role", "LLM")
+            if phase == "LLM_REQUEST_BUILT":
+                typer.echo(
+                    f"[Assistant] LLM envia ({role}): prompt={trace['prompt_chars']} chars, "
+                    f"contexto={trace['context_chars']} chars, secciones={trace['sections']}"
+                )
+                typer.echo(f"        prompt preview:\n{trace['prompt_preview']}")
+            elif phase == "LLM_RESPONSE_PARSED":
+                typer.echo(
+                    f"[Assistant] LLM responde ({role}): {trace['raw_chars']} chars en "
+                    f"{trace['elapsed_seconds']}s; transformado y validado como JSON"
+                )
+                typer.echo(f"        respuesta validada: {preview(trace['validated'], 3000)}")
+
         async def print_event(event):
             if not fullflow and event.event_type not in {"TASK_FAILED", "TASK_COMPLETED"}:
                 return
@@ -62,51 +81,40 @@ def task(
                 context = event.payload.get("context", {})
                 if isinstance(context, dict):
                     typer.echo(f"        contexto: {', '.join(context.keys())}")
+                    memories = context.get("long_term_memory", context.get("relevant_memory", []))
+                    typer.echo(
+                        f"        memoria: {len(memories) if isinstance(memories, list) else 0} registros; "
+                        f"dependencias: {len(context.get('dependency_results', []))}; "
+                        f"tarea={context.get('task', {}).get('id', '-')}")
                 else:
                     typer.echo("        contexto preparado")
             if fullflow and event.event_type == "LLM_RESPONSE":
                 typer.echo(f"        propuesta validada: {preview(event.payload)}")
 
-        context = await create_context(use_mock=mock, event_sink=print_event)
+        context = await create_context(use_mock=mock, event_sink=print_event, trace_sink=print_llm_trace)
         service, startup = context.service, context.startup
         if fullflow:
             typer.echo(
                 f"[Assistant] startup: status={startup.status} database={startup.database_ready} "
                 f"llm={startup.llm_ready} recovered_nodes={startup.recovered_nodes} "
-                f"unfinished_tasks={startup.unfinished_tasks}"
+                f"unfinished_tasks={startup.unfinished_tasks} memories={len(startup.loaded_memories)}"
             )
         created = await service.create_task(TaskRequest(goal=goal))
         result = None
         try:
             result = await service.run_task(created.id)
-            if result and result.status.value in {"SUCCEEDED", "FAILED", "BLOCKED", "WAITING"} and hasattr(service.llm, "summarize"):
-                events = await service.repository.list_events(created.id)
-                evidence = [
-                    {
-                        "event": event.event_type,
-                        "payload": event.payload,
-                    }
-                    for event in events
-                    if event.event_type in {"TOOL_RESULT", "NODE_COMPLETED", "TASK_FAILED", "ACTION_PROPOSED"}
-                ]
-                report = await service.llm.summarize(
-                    {
-                        "phase": "FINAL_REPORT",
-                        "user_prompt": goal,
-                        "task": result.model_dump(mode="json"),
-                        "assistant_state": {"status": result.status},
-                        "events": evidence,
-                        "long_term_memory": [],
-                    }
-                )
-                typer.echo(f"[Assistant] Informe final: {report.title}")
-                typer.echo(report.summary)
-                for finding in report.findings:
-                    typer.echo(f"  Hallazgo: {finding}")
-                for recommendation in report.recommendations:
-                    typer.echo(f"  Mejora: {recommendation}")
-                if report.limitations:
-                    typer.echo(f"  Limitaciones: {'; '.join(report.limitations)}")
+            if result and result.metadata.get("final_response"):
+                response = AssistantResponse.model_validate(result.metadata["final_response"])
+                typer.echo(f"[Assistant] Respuesta ({response.response_type}): {response.title}")
+                typer.echo(response.summary)
+                for section, items in response.sections.items():
+                    typer.echo(f"  {section}:")
+                    for item in items:
+                        typer.echo(f"    - {item}")
+                for action in response.next_actions:
+                    typer.echo(f"  Siguiente paso: {action}")
+                if response.limitations:
+                    typer.echo(f"  Limitaciones: {'; '.join(response.limitations)}")
         except (HTTPError, OSError, ValueError) as error:
             typer.echo(f"[TASK_FAILED] id={created.id} error={error}", err=True)
         finally:
@@ -137,9 +145,14 @@ def run(
         typer.echo(
             f"[Assistant] startup: status={startup.status} database={startup.database_ready} "
             f"llm={startup.llm_ready} recovered_nodes={startup.recovered_nodes} "
-            f"unfinished_tasks={startup.unfinished_tasks}"
+            f"unfinished_tasks={startup.unfinished_tasks} memories={len(startup.loaded_memories)}"
         )
-        runtime = TaskRuntime(service.repository, service.run_task, interval)
+        runtime = TaskRuntime(
+            service.repository,
+            lambda task_id: service.run_task(task_id, wait_for_retry=False),
+            interval,
+            is_ready=lambda: startup.llm_ready,
+        )
         try:
             if once:
                 count = await runtime.run_once()

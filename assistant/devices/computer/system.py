@@ -31,6 +31,8 @@ class SystemInfoTool(Tool):
                 "python_version": platform.python_version(),
                 "runtime": sys.implementation.name,
                 "cpu_count": os.cpu_count(),
+                "hostname": platform.node(),
+                "working_directory": os.getcwd(),
             },
         )
 

@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from .domain.models import ErrorType, OperationResult
-from .observability import compact
 
 
 class ProjectAnalyzer:
@@ -19,6 +18,8 @@ class ProjectAnalyzer:
         started_files = Path(root).resolve()
         try:
             files = await asyncio.to_thread(self._collect_files, started_files, max_files)
+            truncated = len(files) > max_files
+            files = files[:max_files]
             languages = Counter(path.suffix.lower() or "[no extension]" for path in files)
             symbols: list[dict[str, Any]] = []
             edges: list[dict[str, str]] = []
@@ -40,12 +41,12 @@ class ProjectAnalyzer:
                 "modules": modules[:2000],
                 "symbols": symbols[:2000],
                 "dependency_edges": edges[:4000],
-                "truncated": len(files) >= max_files,
+                "truncated": truncated,
             }
             finished_at = datetime.now(UTC)
             return OperationResult(
                 success=True,
-                output=compact(output),
+                output=output,
                 started_at=started_at,
                 finished_at=finished_at,
                 duration=(finished_at - started_at).total_seconds(),
@@ -63,9 +64,20 @@ class ProjectAnalyzer:
     def _collect_files(root: Path, max_files: int) -> list[Path]:
         if not root.exists() or not root.is_dir():
             raise FileNotFoundError(f"Project directory does not exist: {root}")
-        ignored = {".git", ".venv", "venv", "node_modules", "build", "dist", "__pycache__", ".gradle"}
+        ignored = {
+            ".git",
+            ".venv",
+            "venv",
+            "node_modules",
+            "build",
+            "dist",
+            "__pycache__",
+            ".gradle",
+            ".pytest_cache",
+            ".ruff_cache",
+        }
         files = [path for path in root.rglob("*") if path.is_file() and not ignored.intersection(path.parts)]
-        return sorted(files)[:max_files]
+        return sorted(files)[: max_files + 1]
 
     @staticmethod
     def _analyze_python(path: Path, root: Path, symbols: list[dict[str, Any]], edges: list[dict[str, str]]) -> None:

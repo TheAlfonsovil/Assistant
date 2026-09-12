@@ -84,6 +84,21 @@ class TaskBudget(BaseModel):
     max_tool_calls: int = 50
 
 
+class Project(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    name: str = Field(min_length=1, max_length=255)
+    path: str
+    description: str = ""
+    project_type: str = "code"
+    audit_prompt: str = "Audit the project, run relevant tests, and report findings with evidence"
+    enabled: bool = True
+    is_default: bool = False
+    created_at: datetime = Field(default_factory=utcnow)
+    updated_at: datetime = Field(default_factory=utcnow)
+    last_used_at: datetime | None = None
+    last_audited_at: datetime | None = None
+
+
 class Operation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -95,7 +110,7 @@ class Operation(BaseModel):
     )
     timeout: float = 60.0
     retry_policy: dict[str, Any] = Field(default_factory=dict)
-    idempotency_key: str = Field(default_factory=lambda: str(uuid4()))
+    idempotency_key: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -118,6 +133,7 @@ class Task(BaseModel):
     parent_task_id: str | None = None
     root_task_id: str | None = None
     source: str = "USER"
+    project_id: str | None = None
     goal: str
     description: str = ""
     status: TaskStatus = TaskStatus.CREATED
@@ -200,6 +216,29 @@ class TaskRequest(BaseModel):
     goal: str = Field(min_length=1, max_length=10000)
     description: str = ""
     source: str = "USER"
+    project_id: str | None = None
+    project_name: str | None = None
     priority: int = 0
     deadline: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskInputRequest(BaseModel):
+    node_id: str | None = None
+    input: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskRedefinitionRequest(BaseModel):
+    goal: str = Field(min_length=1, max_length=10000)
+    description: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    path: str
+    description: str = ""
+    project_type: str = "code"
+    audit_prompt: str = "Audit the project, run relevant tests, and report findings with evidence"
+    enabled: bool = True
+    is_default: bool = False

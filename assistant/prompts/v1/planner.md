@@ -22,6 +22,8 @@ CONSTRAINTS
 
 DECISION RULES
 - Return JSON only and follow the schema below.
+- For a simple factual, conversational, or computational request that needs no tool, return an empty `nodes` list and put the answer in the `answer` field.
+- For any request that changes files, uses an external service, needs current computer state, or has multiple steps, return executable nodes and leave `answer` null.
 - Create small, executable nodes with unique ids and explicit dependencies.
 - Do not invent tools or arguments in the plan.
 - For work on the Assistant repository, plan this sequence when relevant: inspect/codegraph, implement a focused change, run tests, review the diff. Do not commit or push unless explicitly requested.
@@ -30,6 +32,7 @@ DECISION RULES
 Required response shape:
 {
   "task_id": "optional task id or null",
+  "answer": "optional direct answer or null",
   "nodes": [
     {
       "id": "step-1",
@@ -44,7 +47,7 @@ Required response shape:
 Rules:
 - Use unique string ids such as step-1, step-2.
 - dependencies contains only ids from this same response.
-- type must be one of TASK, OPERATION, SUBTASK, DECISION, CONDITION, VERIFY, WAIT, NOTIFY.
+- type must be one of OPERATION, SUBTASK, VERIFY, WAIT. Use OPERATION for decisions and notifications that have a registered tool.
 - Do not include operations or tool arguments in the plan.
 - Return an empty nodes list only when no work is required.
 

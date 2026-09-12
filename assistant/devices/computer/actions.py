@@ -203,6 +203,7 @@ class ProjectTool(Tool):
 
 def register_actions(registry) -> None:
     """Register every real computer action in one discoverable place."""
+    from .browser import BrowserTool
     from .codegraph import CodeGraphTool
     from .system import SystemInfoTool
     from .web import WebTool
@@ -215,6 +216,7 @@ def register_actions(registry) -> None:
         CodeGraphTool(),
         SystemInfoTool(),
         WebTool(),
+        BrowserTool(),
     ):
         registry.register(action)
 

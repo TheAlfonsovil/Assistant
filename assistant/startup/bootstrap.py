@@ -31,7 +31,7 @@ class AssistantContext:
 
 
 async def create_context(
-    *, use_mock: bool = False, event_sink=None, settings: Settings | None = None
+    *, use_mock: bool = False, event_sink=None, trace_sink=None, settings: Settings | None = None
 ) -> AssistantContext:
     """Load dependencies, check the LLM, recover state, then expose the service."""
     resolved_settings = settings or get_settings()
@@ -43,6 +43,7 @@ async def create_context(
             resolved_settings.ollama_url,
             resolved_settings.ollama_model,
             resolved_settings.ollama_timeout,
+            trace_sink=trace_sink,
         )
     )
     startup = await StartupManager(database, resolved_settings, provider).initialize()
