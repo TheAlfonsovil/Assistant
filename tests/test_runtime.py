@@ -45,6 +45,7 @@ from assistant.llm import (
 )
 from assistant.project_analysis import ProjectAnalyzer
 from assistant.prompts.v1.template import render
+from assistant.planning import plan_coverage_warnings
 from assistant.recovery import RecoveryManager
 from assistant.runtime import TaskRuntime
 from assistant.startup.manager import StartupManager
@@ -283,6 +284,27 @@ def test_prompt_template_replaces_context_markers():
     assert "task-1" in rendered
 
 
+def test_prompt_template_replaces_completed_artifacts_marker():
+    rendered = render(
+        "{{completed_artifacts}}",
+        {"completed_artifacts": [{"node_id": "node-1", "artifacts": ["out.txt"]}]},
+        {"type": "object"},
+    )
+
+    assert "{{completed_artifacts}}" not in rendered
+    assert "out.txt" in rendered
+
+
+def test_plan_reports_missing_goal_coverage():
+    proposal = PlanProposal(
+        nodes=[PlanNodeProposal(id="step", description="inspect configuration")]
+    )
+
+    warnings = plan_coverage_warnings(proposal, "deploy database migration")
+
+    assert any("goal terms" in warning for warning in warnings)
+
+
 def test_final_response_template_receives_execution_evidence():
     template = (Path(__file__).parents[1] / "assistant" / "prompts" / "v1" / "final_response.md").read_text(
         encoding="utf-8"
@@ -387,6 +409,113 @@ async def test_condition_node_skips_false_branch(tmp_path):
         assert next(node for node in nodes if node.description == "continue branch").status is NodeStatus.SUCCEEDED
         assert any(
             event.event_type == "CONDITION_EVALUATED"
+            for event in await service.repository.list_events(task.id)
+        )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_condition_skip_preserves_valid_converging_branch(tmp_path):
+    class ConvergingProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[
+                    PlanNodeProposal(
+                        id="gate",
+                        description="evaluate gate",
+                        type="CONDITION",
+                        metadata={"value": True, "skip_on_true": ["optional"]},
+                    ),
+                    PlanNodeProposal(
+                        id="optional", description="optional branch", dependencies=["gate"]
+                    ),
+                    PlanNodeProposal(
+                        id="other", description="other branch", dependencies=["gate"]
+                    ),
+                    PlanNodeProposal(
+                        id="merge",
+                        description="merge results",
+                        dependencies=["optional", "other"],
+                    ),
+                ]
+            )
+
+        async def decide(self, context):
+            return NodeDecision(action="COMPLETE")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'converging.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, ConvergingProvider(), ToolRegistry())
+        task = await service.create_task(TaskRequest(goal="graph"))
+
+        result = await service.run_task(task.id)
+        nodes = {node.description: node for node in await service.repository.list_nodes(task.id)}
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert nodes["optional branch"].status is NodeStatus.CANCELLED
+        assert nodes["other branch"].status is NodeStatus.SUCCEEDED
+        assert nodes["merge results"].status is NodeStatus.SUCCEEDED
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_structural_verify_respects_failure_dependency(tmp_path):
+    class FailureVerifyProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[
+                    PlanNodeProposal(id="work", description="work"),
+                    PlanNodeProposal(
+                        id="verify",
+                        description="verify failure path",
+                        type="VERIFY",
+                        dependencies=["work"],
+                        dependency_types={"work": DependencyType.FAILURE},
+                    ),
+                ]
+            )
+
+        async def decide(self, context):
+            if context["node"]["description"] == "work":
+                return NodeDecision(action="OPERATION", operation=self.operation)
+            raise AssertionError("structural VERIFY must not call resolver")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'verify-failure.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            FailureVerifyProvider(Operation(tool="mock.always_fail", method="run")),
+            ToolRegistry([MockTool("always_fail")]),
+        )
+        task = await service.create_task(TaskRequest(goal="verify"))
+        task.budget.max_recovery_attempts = 0
+        await service.repository.save_task(task)
+
+        result = await service.run_task(task.id)
+        nodes = {node.description: node for node in await service.repository.list_nodes(task.id)}
+
+        assert result.status is TaskStatus.FAILED
+        assert nodes["verify failure path"].status is NodeStatus.SUCCEEDED
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_step_limit_blocks_pending_nodes_explicitly(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'step-limit.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, MockLLMProvider(), ToolRegistry())
+        task = await service.create_task(TaskRequest(goal="step limit"))
+
+        result = await service.run_task(task.id, max_steps=1)
+        nodes = await service.repository.list_nodes(task.id)
+
+        assert result.status is TaskStatus.BLOCKED
+        assert all(node.status is not NodeStatus.READY for node in nodes)
+        assert any(
+            event.event_type == "TASK_STEP_LIMIT_EXCEEDED"
             for event in await service.repository.list_events(task.id)
         )
     await database.close()
@@ -620,6 +749,39 @@ async def test_tool_execution_renews_lease_while_operation_is_running(tmp_path):
         assert result.success is True
         assert held is True
         assert renewals
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_cooperatively_discards_active_tool_result(tmp_path):
+    started = asyncio.Event()
+
+    class CancellableTool(Tool):
+        definition = ToolDefinition(name="cancellable", description="cancellable", methods=["run"])
+
+        async def execute(self, method, args, timeout):
+            started.set()
+            await asyncio.sleep(0.2)
+            return OperationResult(success=True, output={"status": "completed"})
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'cancel-active.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(Operation(tool="cancellable", method="run")),
+            ToolRegistry([CancellableTool()]),
+        )
+        task = await service.create_task(TaskRequest(goal="cancel active work"))
+        running = asyncio.create_task(service.run_task(task.id))
+        await started.wait()
+        await service.cancel_task(task.id)
+        result = await running
+        node = (await service.repository.list_nodes(task.id))[-1]
+
+        assert result.status is TaskStatus.CANCELLED
+        assert node.status is NodeStatus.CANCELLED
+        assert node.output_data["output"]["status"] == "completed"
     await database.close()
 
 

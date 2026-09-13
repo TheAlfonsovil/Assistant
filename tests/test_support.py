@@ -33,6 +33,23 @@ def test_deterministic_verifier_requires_declared_evidence():
     assert verifier.verify(result).decision is VerificationDecision.RETRY
 
 
+def test_deterministic_verifier_supports_typed_field_evidence():
+    verifier = DeterministicVerifier()
+    result = OperationResult(
+        success=True,
+        output={"status": "healthy", "payload": {"count": 3}},
+        metadata={
+            "expected": {
+                "fields": {"status": "healthy", "payload.count": 3},
+                "exists": ["payload.count"],
+                "not_exists": ["error"],
+            }
+        },
+    )
+
+    assert verifier.verify(result).decision is VerificationDecision.SUCCESS
+
+
 @pytest.mark.asyncio
 async def test_idle_cycle_uses_normal_task_creation_path():
     goals = []

@@ -1,4 +1,5 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -54,6 +55,120 @@ def service(request: Request) -> AssistantContext:
     return request.app.state.context
 
 
+def _dashboard_analytics(context, tasks, task_nodes, events):
+    model = getattr(context.service.llm, "model", "configured-provider")
+    status_counts = {}
+    tool_counts = {}
+    phase_counts = {}
+    estimated_prompt_tokens = 0
+    estimated_response_tokens = 0
+    llm_latency = []
+    tool_latency = []
+    retries = 0
+    for event in events:
+        payload = event.payload or {}
+        status_counts[event.event_type] = status_counts.get(event.event_type, 0) + 1
+        if event.event_type == "TOOL_RESULT":
+            tool = payload.get("tool", "unknown")
+            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            if isinstance(payload.get("duration"), (int, float)):
+                tool_latency.append(payload["duration"])
+        if event.event_type in {"LLM_REQUEST", "LLM_RESPONSE"}:
+            phase = payload.get("role", "unknown")
+            phase_counts[phase] = phase_counts.get(phase, 0) + 1
+        if event.event_type == "LLM_REQUEST":
+            chars = payload.get("context_chars", 0)
+            estimated_prompt_tokens += int(chars / 4) if isinstance(chars, (int, float)) else 0
+        if event.event_type == "LLM_RESPONSE":
+            chars = payload.get("response_chars", 0)
+            estimated_response_tokens += int(chars / 4) if isinstance(chars, (int, float)) else 0
+        if event.event_type == "LLM_RESPONSE_PARSED":
+            if isinstance(payload.get("elapsed_seconds"), (int, float)):
+                llm_latency.append(payload["elapsed_seconds"])
+        if event.event_type == "RETRY_SCHEDULED":
+            retries += 1
+
+    durations = []
+    task_usage = []
+    node_usage = {}
+    for task in tasks:
+        task_task_events = [event for event in events if event.task_id == task.id]
+        task_prompt = sum(
+            int((event.payload or {}).get("context_chars", 0) / 4)
+            for event in task_task_events
+            if event.event_type == "LLM_REQUEST"
+        )
+        task_response = sum(
+            int((event.payload or {}).get("response_chars", 0) / 4)
+            for event in task_task_events
+            if event.event_type == "LLM_RESPONSE"
+        )
+        for event in task_task_events:
+            if not event.node_id:
+                continue
+            usage = node_usage.setdefault(event.node_id, {"llm_calls": 0, "tool_calls": 0, "estimated_tokens": 0})
+            payload = event.payload or {}
+            if event.event_type == "LLM_REQUEST":
+                usage["llm_calls"] += 1
+                usage["estimated_tokens"] += int(payload.get("context_chars", 0) / 4)
+            elif event.event_type == "LLM_RESPONSE":
+                usage["estimated_tokens"] += int(payload.get("response_chars", 0) / 4)
+            elif event.event_type == "TOOL_CALLED":
+                usage["tool_calls"] += 1
+        task_usage.append({
+            "id": task.id,
+            "goal": task.goal,
+            "status": task.status.value,
+            "nodes": len(task_nodes.get(task.id, [])),
+            "llm_calls": sum(1 for event in task_task_events if event.event_type == "LLM_REQUEST"),
+            "tool_calls": sum(1 for event in task_task_events if event.event_type == "TOOL_CALLED"),
+            "estimated_tokens": task_prompt + task_response,
+            "duration_seconds": round(
+                max(0, (task.finished_at - task.started_at).total_seconds())
+                if task.started_at and task.finished_at else 0,
+                2,
+            ),
+        })
+        if task.started_at and task.finished_at:
+            durations.append(max(0, (task.finished_at - task.started_at).total_seconds()))
+    completed = sum(1 for task in tasks if task.status.value == "SUCCEEDED")
+    terminal = sum(
+        1 for task in tasks
+        if task.status.value in {"SUCCEEDED", "FAILED", "BLOCKED", "CANCELLED"}
+    )
+    return {
+        "model": model,
+        "event_counts": status_counts,
+        "tool_counts": tool_counts,
+        "phase_counts": phase_counts,
+        "estimated_tokens": {
+            "prompt": estimated_prompt_tokens,
+            "response": estimated_response_tokens,
+            "total": estimated_prompt_tokens + estimated_response_tokens,
+            "basis": "context/response characters divided by 4",
+        },
+        "latency": {
+            "average_task_seconds": round(sum(durations) / len(durations), 2) if durations else 0,
+            "average_llm_seconds": round(sum(llm_latency) / len(llm_latency), 2) if llm_latency else 0,
+            "average_tool_seconds": round(sum(tool_latency) / len(tool_latency), 2) if tool_latency else 0,
+        },
+        "throughput": {
+            "completed_tasks": completed,
+            "terminal_tasks": terminal,
+            "success_rate": round(completed / terminal * 100, 1) if terminal else 0,
+            "retries": retries,
+        },
+        "task_durations": [
+            {"id": task.id, "goal": task.goal, "seconds": round(duration, 2)}
+            for task, duration in zip(
+                [task for task in tasks if task.started_at and task.finished_at], durations
+            )
+        ][:20],
+        "task_usage": task_usage[:50],
+        "node_usage": node_usage,
+    }
+
+
 @app.get("/health")
 async def health(request: Request):
     startup = service(request).startup
@@ -98,6 +213,7 @@ async def dashboard_data(request: Request):
             node_status_counts[node.status.value] = node_status_counts.get(node.status.value, 0) + 1
         events.extend(task_events[task.id])
     events.sort(key=lambda event: event.created_at, reverse=True)
+    analytics = _dashboard_analytics(context, tasks, task_nodes, events)
     startup = context.startup
     runtime = request.app.state.runtime
     return {
@@ -130,6 +246,7 @@ async def dashboard_data(request: Request):
         "node_status_counts": node_status_counts,
         "projects": [project.model_dump(mode="json") for project in projects],
         "memories": [memory.model_dump(mode="json") for memory in memories],
+        "analytics": analytics,
     }
 
 

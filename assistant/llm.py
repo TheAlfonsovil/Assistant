@@ -47,6 +47,7 @@ class PlanProposal(BaseModel):
     nodes: list[PlanNodeProposal] = Field(default_factory=list)
     answer: str | None = None
     subtasks: list[str] = Field(default_factory=list)
+    coverage: list[str] = Field(default_factory=list)
 
 
 class VerificationResult(BaseModel):

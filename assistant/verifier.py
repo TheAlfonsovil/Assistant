@@ -44,6 +44,15 @@ class DeterministicVerifier:
             output = result.output if isinstance(result.output, dict) else {}
             if output.get("exit_code") != expected["exit_code"]:
                 return False
+        for path, value in expected.get("fields", {}).items():
+            if DeterministicVerifier._read_path(result.output, path) != value:
+                return False
+        for path in expected.get("exists", []):
+            if DeterministicVerifier._read_path(result.output, path) is None:
+                return False
+        for path in expected.get("not_exists", []):
+            if DeterministicVerifier._read_path(result.output, path) is not None:
+                return False
         required = expected.get("contains", expected.get("output_contains", []))
         if isinstance(required, str):
             required = [required]
@@ -52,3 +61,12 @@ class DeterministicVerifier:
             if any(str(value) not in rendered for value in required):
                 return False
         return True
+
+    @staticmethod
+    def _read_path(value, path: str):
+        current = value
+        for part in path.split("."):
+            if not isinstance(current, dict) or part not in current:
+                return None
+            current = current[part]
+        return current

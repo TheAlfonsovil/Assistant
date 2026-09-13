@@ -20,6 +20,9 @@ CURRENT NODE
 DEPENDENCY RESULTS
 {{dependencies}}
 
+COMPLETED ARTIFACTS
+{{completed_artifacts}}
+
 AVAILABLE ACTIONS
 {{available_actions}}
 

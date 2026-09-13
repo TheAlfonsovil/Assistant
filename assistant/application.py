@@ -36,7 +36,8 @@ from .infrastructure.orm import IdempotencyRow, LeaseRow
 from .infrastructure.repositories import TaskRepository
 from .llm import AssistantResponse, LLMProvider
 from .observability import compact
-from .planning import validate_plan_quality
+from .planning import plan_coverage_warnings, validate_plan_quality
+from .planning import plan_coverage_warnings, validate_plan_quality
 from .project_analysis import ProjectAnalyzer
 from .scheduler import NodeScheduler
 from .tools import ToolRegistry
@@ -63,6 +64,7 @@ class TaskService:
         self.scheduler = NodeScheduler()
         self.context_builder = ContextBuilder(self.repository, tools, workspace_root=workspace_root)
         self.owner = f"{socket.gethostname()}:{id(self)}"
+        self._cancellation_events: dict[str, asyncio.Event] = {}
 
     async def create_task(self, request: TaskRequest) -> Task:
         enabled_projects = await self.repository.list_projects(enabled_only=True)
@@ -199,6 +201,10 @@ class TaskService:
         return repaired
 
     async def cancel_task(self, task_id: str, reason: str = "cancelled by user") -> Task | None:
+        cancellation = self._cancellation_events.get(task_id)
+        if cancellation is not None:
+            cancellation.set()
+            return None
         task = await self.repository.get_task(task_id)
         if task is None:
             return None
@@ -260,6 +266,9 @@ class TaskService:
         task.metadata.pop("final_response", None)
         task.metadata.pop("llm_calls", None)
         task.metadata.pop("tool_calls", None)
+        cancellation = self._cancellation_events.pop(task_id, None)
+        if cancellation is not None:
+            cancellation.clear()
         if metadata:
             task.metadata.update(metadata)
         await self.repository.save_task(task)
@@ -471,6 +480,9 @@ class TaskService:
             stop_renewal.set()
             await renewal_task
         return result, not lease_lost
+
+    def _cancellation_event(self, task_id: str) -> asyncio.Event:
+        return self._cancellation_events.setdefault(task_id, asyncio.Event())
 
     async def _has_active_running_node(self, graph: TaskGraph) -> bool:
         running_ids = [
@@ -849,7 +861,24 @@ class TaskService:
         self, task: Task, node: TaskNode, graph: TaskGraph
     ) -> bool:
         if node.type in {NodeType.CONDITION, NodeType.DECISION}:
-            result = self._evaluate_condition(node, graph)
+            try:
+                result = self._evaluate_condition(node, graph)
+            except (TypeError, ValueError) as error:
+                node.status = NodeStatus.BLOCKED
+                node.error = f"invalid condition: {error}"
+                task.status = TaskStatus.BLOCKED
+                task.failure_reason = node.error
+                await self.repository.save_node(node)
+                await self.repository.save_task(task)
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task.id,
+                        node_id=node.id,
+                        event_type="NODE_BLOCKED",
+                        payload={"reason": node.error},
+                    )
+                )
+                return True
             node.output_data = {"decision" if node.type is NodeType.DECISION else "condition": result}
             node.status = NodeStatus.SUCCEEDED
             await self.repository.save_node(node)
@@ -863,7 +892,7 @@ class TaskService:
             )
             branch_key = "skip_on_true" if result else "skip_on_false"
             for target_id in node.metadata.get(branch_key, []):
-                await self._cancel_branch(task, graph, target_id)
+                await self._cancel_branch(task, graph, target_id, node.id)
             task.status = TaskStatus.READY
             await self.repository.save_task(task)
             return True
@@ -890,9 +919,7 @@ class TaskService:
                 for edge in graph.edges
                 if edge.to_node == node.id
             ]
-            if not dependencies or not all(
-                dependency.status is NodeStatus.SUCCEEDED for dependency in dependencies
-            ):
+            if not dependencies or not graph.dependencies_satisfied(node.id):
                 node.status = NodeStatus.BLOCKED
                 node.error = "verify node has no successful dependencies"
                 task.status = TaskStatus.BLOCKED
@@ -962,7 +989,9 @@ class TaskService:
             return left < right
         raise ValueError(f"unsupported condition operator: {operator}")
 
-    async def _cancel_branch(self, task: Task, graph: TaskGraph, target_id: str) -> None:
+    async def _cancel_branch(
+        self, task: Task, graph: TaskGraph, target_id: str, branch_source_id: str
+    ) -> None:
         pending = [target_id]
         visited = set()
         while pending:
@@ -971,9 +1000,20 @@ class TaskService:
                 continue
             visited.add(current_id)
             current = graph.nodes[current_id]
+            incoming = [
+                edge.from_node
+                for edge in graph.edges
+                if edge.to_node == current_id
+                and edge.from_node != branch_source_id
+                and edge.from_node not in visited
+                and graph.nodes[edge.from_node].status is not NodeStatus.CANCELLED
+            ]
+            if incoming:
+                continue
             if current.status in {NodeStatus.CREATED, NodeStatus.READY, NodeStatus.WAITING}:
                 current.status = NodeStatus.CANCELLED
                 current.error = "branch skipped by condition"
+                current.metadata["branch_skipped"] = True
                 await self.repository.save_node(current)
                 await self.repository.save_event(
                     TaskEvent(
@@ -1009,11 +1049,24 @@ class TaskService:
                     TaskEvent(
                         task_id=task_id,
                         event_type="LLM_REQUEST",
-                        payload={"role": "PLANNER", "context": compact(planner_context)},
+                        payload={
+                            "role": "PLANNER",
+                            "context": compact(planner_context),
+                            "context_chars": len(json.dumps(planner_context, default=str)),
+                        },
                     )
                 )
                 proposal = await self._call_llm(self.llm.plan(planner_context), time_remaining)
                 validate_plan_quality(proposal, task.budget.max_plan_nodes)
+                coverage_warnings = plan_coverage_warnings(proposal, task.goal)
+                for warning in coverage_warnings:
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            event_type="PLAN_COVERAGE_WARNING",
+                            payload={"warning": warning},
+                        )
+                    )
                 await self.repository.save_event(
                     TaskEvent(
                         task_id=task_id,
@@ -1247,6 +1300,9 @@ class TaskService:
         node = selected
         if node is None:
             return False
+        cancellation = self._cancellation_event(task_id)
+        if cancellation.is_set():
+            return False
         lease_seconds = max(300, int((time_remaining or 300) + 60))
         if not await self.acquire_lease(node.id, seconds=lease_seconds):
             return False
@@ -1276,6 +1332,7 @@ class TaskService:
                         "role": "NODE_RESOLVER",
                         "description": node.description,
                         "context": compact(context),
+                        "context_chars": len(json.dumps(context, default=str)),
                     },
                 )
             )
@@ -1289,6 +1346,10 @@ class TaskService:
                 await self._fail_node(task, node, reason)
                 await self._attempt_recovery(task, node, reason, graph, time_remaining)
                 return True
+            if cancellation.is_set():
+                node.status = NodeStatus.CANCELLED
+                await self.repository.save_node(node)
+                return True
             await self.repository.save_event(
                 TaskEvent(
                     task_id=task_id,
@@ -1301,6 +1362,7 @@ class TaskService:
                         "method": decision.operation.method if decision.operation else None,
                         "args": compact(decision.operation.args) if decision.operation else None,
                         "reason": decision.reason,
+                            "response_chars": len(json.dumps(decision.model_dump(mode="json"), default=str)),
                     },
                 )
             )
@@ -1461,6 +1523,16 @@ class TaskService:
                 if not lease_held:
                     await self._fail_node(task, node, "node lease lost during tool execution")
                     return True
+                if cancellation.is_set():
+                    node.status = NodeStatus.CANCELLED
+                    node.output_data = operation_result.model_dump(mode="json")
+                    task.status = TaskStatus.CANCELLED
+                    task.failure_reason = "cancelled by user"
+                    task.finished_at = datetime.now(UTC)
+                    await self.repository.save_node(node)
+                    await self.repository.save_task(task)
+                    await self._ensure_final_response(task)
+                    return True
                 result = operation_result.model_dump(mode="json")
                 if (
                     result.get("retryable")
@@ -1479,9 +1551,12 @@ class TaskService:
                         event_type="TOOL_RESULT",
                         payload={
                             "success": result.get("success"),
+                            "tool": operation.tool,
+                            "method": operation.method,
                             "error": result.get("error"),
                             "error_type": result.get("error_type"),
                             "output": compact(result.get("output")),
+                            "duration": result.get("duration"),
                             "side_effects": result.get("side_effects", []),
                         },
                     )
@@ -1778,12 +1853,41 @@ class TaskService:
             ):
                 if task is not None:
                     await self._ensure_final_response(task)
-                return task
+                    self._cancellation_events.pop(task.id, None)
+                    return task
         task = await self.repository.get_task(task_id)
         if task:
+            graph = await self.graph(task_id)
+            if await self._has_active_running_node(graph):
+                task.status = TaskStatus.RUNNING
+                task.failure_reason = None
+                task.finished_at = None
+                await self.repository.save_task(task)
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task.id,
+                        event_type="TASK_STEP_LIMIT_DEFERRED",
+                        payload={"max_steps": max_steps},
+                    )
+                )
+                return task
+            for node in graph.nodes.values():
+                if node.status in {NodeStatus.CREATED, NodeStatus.READY, NodeStatus.WAITING}:
+                    node.status = NodeStatus.BLOCKED
+                    node.error = "execution step limit reached"
+                    node.finished_at = datetime.now(UTC)
+                    await self.repository.save_node(node)
             task.status = TaskStatus.BLOCKED
-            task.failure_reason = "execution budget exhausted"
+            task.failure_reason = "maximum execution steps reached"
             task.finished_at = datetime.now(UTC)
             await self.repository.save_task(task)
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="TASK_STEP_LIMIT_EXCEEDED",
+                    payload={"max_steps": max_steps},
+                )
+            )
             await self._ensure_final_response(task)
+            self._cancellation_events.pop(task.id, None)
         return task

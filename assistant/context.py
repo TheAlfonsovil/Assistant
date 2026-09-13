@@ -83,6 +83,17 @@ class ContextBuilder:
             and candidate.status.value == "SUCCEEDED"
             and candidate.output_data
         ][-12:]
+        completed_artifacts = [
+            {
+                "node_id": candidate.id,
+                "description": candidate.description,
+                "artifacts": candidate.output_data.get("artifacts", []),
+            }
+            for candidate in graph.nodes.values()
+            if candidate.id != node.id
+            and candidate.status.value == "SUCCEEDED"
+            and candidate.output_data.get("artifacts")
+        ]
         return {
             "phase": "NODE_RESOLVER",
             "user_prompt": task.goal,
@@ -111,6 +122,7 @@ class ContextBuilder:
             },
             "dependency_results": dependency_results,
             "completed_results": completed_results,
+            "completed_artifacts": completed_artifacts[-20:],
             "available_tools": [definition.model_dump() for definition in self.tools.definitions()],
             "available_actions": [definition.model_dump() for definition in self.tools.definitions()],
             "constraints": {

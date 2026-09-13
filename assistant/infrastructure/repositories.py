@@ -5,7 +5,17 @@ import json
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from assistant.domain.models import GraphEdge, MemoryRecord, Project, Task, TaskEvent, TaskNode
+from assistant.domain.models import (
+    GraphEdge,
+    MemoryRecord,
+    NodeStatus,
+    Project,
+    Task,
+    TaskEvent,
+    TaskNode,
+    TaskStatus,
+)
+from assistant.domain.state import validate_node_transition, validate_task_transition
 
 from .orm import (
     EdgeRow,
@@ -99,6 +109,8 @@ class TaskRepository:
 
     async def save_task(self, task: Task) -> None:
         row = await self.session.get(TaskRow, task.id)
+        if row is not None:
+            validate_task_transition(TaskStatus(row.status), task.status)
         values = task_to_row(task).__dict__
         values.pop("_sa_instance_state", None)
         if row is None:
@@ -332,6 +344,8 @@ class TaskRepository:
 
     async def save_node(self, node: TaskNode) -> None:
         row = await self.session.get(NodeRow, node.id)
+        if row is not None:
+            validate_node_transition(NodeStatus(row.status), node.status)
         values = node_to_row(node).__dict__
         values.pop("_sa_instance_state", None)
         if row is None:

@@ -99,7 +99,8 @@ la tarea queda en `WAITING` y expone una aclaración `project_selection`. El
 cliente debe enviar `project_id` o `project_name` mediante el endpoint de input.
 Tras esa selección la tarea vuelve a `QUEUED` y siempre atraviesa el Planner
 antes de ejecutar nodos. Los nodos del planner pueden declarar
-evidencia de aceptación, por ejemplo `{"exit_code": 0}` o
+evidencia de aceptación, por ejemplo `{"exit_code": 0}`,
+`{"fields": {"status": "healthy"}}`, `{"exists": ["artifact.path"]}` o
 `{"contains": ["tests passed"]}`; esa evidencia se conserva en el grafo y se
 comprueba antes de marcar la operación como correcta.
 

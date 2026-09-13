@@ -50,6 +50,7 @@ function render() {
   ].map(([label, value, note]) => `<div class="stat"><span>${label}</span><strong>${value}</strong><small class="muted">${note}</small></div>`).join("");
 
   renderTasks(tasks);
+  renderAnalytics(data.analytics || {});
   renderChart(data.status_counts);
   renderMetrics(metrics, health.runtime);
   renderEvents(data.events);
@@ -63,8 +64,40 @@ function render() {
   if (state.selectedTask) renderDetail(state.selectedTask);
 }
 
+function renderAnalytics(analytics) {
+  const tokens = analytics.estimated_tokens || {};
+  const latency = analytics.latency || {};
+  const throughput = analytics.throughput || {};
+  const model = analytics.model || "configured-provider";
+  $("#analytics-note").textContent = `${model} · tokens estimados`;
+  $("#analytics-kpis").innerHTML = [
+    ["TOKENS TOTALES", formatNumber(tokens.total), "prompt + respuesta"],
+    ["ÉXITO", `${throughput.success_rate ?? 0}%`, `${throughput.completed_tasks ?? 0} completadas`],
+    ["DURACIÓN MEDIA", formatSeconds(latency.average_task_seconds), "por tarea terminada"],
+    ["REINTENTOS", throughput.retries ?? 0, "recuperaciones programadas"],
+  ].map(([label, value, note]) => `<div class="analytics-kpi"><span>${label}</span><strong>${value}</strong><small>${note}</small></div>`).join("");
+
+  const phases = analytics.phase_counts || {};
+  $("#llm-analysis").innerHTML = Object.entries(phases).map(([phase, count]) => {
+    const ratio = Math.min(100, count / Math.max(1, Object.values(phases).reduce((a, b) => a + b, 0)) * 100);
+    return `<div class="analysis-row"><div><b>${esc(phase)}</b><small>${count} llamadas</small></div><div class="analysis-bar"><i style="width:${ratio}%"></i></div></div>`;
+  }).join("") || `<div class="empty">Aún no hay llamadas LLM registradas.</div>`;
+  $("#llm-analysis").insertAdjacentHTML("beforeend", `<div class="token-split"><span>Entrada <b>${formatNumber(tokens.prompt)}</b></span><span>Salida <b>${formatNumber(tokens.response)}</b></span></div>`);
+
+  const tools = analytics.tool_counts || {};
+  $("#tool-analysis").innerHTML = Object.entries(tools).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([tool, count]) => `<div class="analysis-row compact"><div><b>${esc(tool)}</b><small>${count} ejecuciones</small></div><strong>${formatSeconds(latency.average_tool_seconds)}</strong></div>`).join("") || `<div class="empty">Aún no hay herramientas ejecutadas.</div>`;
+  const durations = analytics.task_durations || [];
+  const maxDuration = Math.max(1, ...durations.map((item) => item.seconds));
+  $("#speed-analysis").innerHTML = durations.slice(0, 8).map((item) => `<div class="speed-row"><div><b>${esc(item.goal)}</b><small>${formatSeconds(item.seconds)}</small></div><div class="analysis-bar"><i style="width:${Math.max(4, item.seconds / maxDuration * 100)}%"></i></div></div>`).join("") || `<div class="empty">Completa una tarea para ver velocidad.</div>`;
+}
+
+function formatNumber(value) { return new Intl.NumberFormat("es-ES").format(value || 0); }
+function formatSeconds(value) { const seconds = Number(value || 0); return seconds < 60 ? `${seconds.toFixed(1)}s` : `${(seconds / 60).toFixed(1)}m`; }
+
 function renderTasks(tasks) {
   const list = $("#task-list");
+  const filter = ($("#task-filter")?.value || "").toLowerCase().trim();
+  tasks = tasks.filter((task) => !filter || `${task.goal} ${task.status} ${task.id}`.toLowerCase().includes(filter));
   if (!tasks.length) {
     list.innerHTML = `<div class="empty">No hay tareas persistidas. Lanza una orden para empezar.</div>`;
     return;
@@ -110,13 +143,16 @@ function renderDetail(taskId) {
   const nodes = state.data.task_nodes[taskId] || [];
   const edges = state.data.task_edges[taskId] || [];
   const events = state.data.events.filter((event) => event.task_id === taskId).slice(0, 40);
+  const usage = (state.data.analytics?.task_usage || []).find((item) => item.id === taskId);
+  const nodeUsage = state.data.analytics?.node_usage || {};
   $("#detail-panel").classList.remove("hidden");
   $("#detail-title").textContent = task.goal;
   const controls = ["WAITING"].includes(task.status) ? `<button class="button primary" data-action="input">Aportar input</button>` : "";
   const resume = task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : "";
   const cancel = ["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? "" : `<button class="button" data-action="cancel">Cancelar</button>`;
   const nodeNames = Object.fromEntries(nodes.map((node) => [node.id, node.description]));
-  $("#detail-content").innerHTML = `<div class="detail-actions">${controls}${resume}${cancel}<span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div><div class="detail-grid"><div><p class="eyebrow">GRAPH NODES · ${nodes.length}</p><div class="node-list">${nodes.map((node) => `<div class="node-item status-${esc(node.status)}"><strong>${esc(node.description)}</strong><small>${esc(node.type)} · ${esc(node.status)} · retries ${node.retry_count}</small>${node.error ? `<small>${esc(node.error)}</small>` : ""}</div>`).join("") || "<div class=empty>El grafo todavía no se ha generado.</div>"}</div><p class="eyebrow graph-label">DEPENDENCIES · ${edges.length}</p><div class="node-list">${edges.map((edge) => `<div class="node-item"><small>${esc(nodeNames[edge.from_node] || shortId(edge.from_node))} → ${esc(nodeNames[edge.to_node] || shortId(edge.to_node))} · ${esc(edge.dependency_type)}</small></div>`).join("") || "<div class=empty>Sin dependencias.</div>"}</div></div><div><p class="eyebrow">TASK EVENTS</p><div class="detail-events">${events.map((event) => `<div class="event"><i></i><div><b>${esc(event.event_type)}</b><span>${esc(event.payload?.reason || event.payload?.role || "evento persistido")}</span></div><time>${date(event.created_at)}</time></div>`).join("") || "<div class=empty>Sin eventos.</div>"}</div></div></div>`;
+  const usageBlock = usage ? `<div class="usage-strip"><span>LLM <b>${usage.llm_calls}</b></span><span>TOOLS <b>${usage.tool_calls}</b></span><span>NODOS <b>${usage.nodes}</b></span><span>TOKENS <b>${formatNumber(usage.estimated_tokens)}</b></span><span>TIEMPO <b>${formatSeconds(usage.duration_seconds)}</b></span></div>` : "";
+  $("#detail-content").innerHTML = `<div class="detail-actions">${controls}${resume}${cancel}<span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div>${usageBlock}<div class="detail-grid"><div><p class="eyebrow">GRAPH NODES · ${nodes.length}</p><div class="node-list">${nodes.map((node) => { const item = nodeUsage[node.id] || {}; return `<div class="node-item status-${esc(node.status)}"><strong>${esc(node.description)}</strong><small>${esc(node.type)} · ${esc(node.status)} · retries ${node.retry_count}</small><small>${item.llm_calls || 0} LLM · ${item.tool_calls || 0} tools · ${formatNumber(item.estimated_tokens)} tokens est.</small>${node.error ? `<small>${esc(node.error)}</small>` : ""}</div>`; }).join("") || "<div class=empty>El grafo todavía no se ha generado.</div>"}</div><p class="eyebrow graph-label">DEPENDENCIES · ${edges.length}</p><div class="node-list">${edges.map((edge) => `<div class="node-item"><small>${esc(nodeNames[edge.from_node] || shortId(edge.from_node))} → ${esc(nodeNames[edge.to_node] || shortId(edge.to_node))} · ${esc(edge.dependency_type)}</small></div>`).join("") || "<div class=empty>Sin dependencias.</div>"}</div></div><div><p class="eyebrow">TASK EVENTS</p><div class="detail-events">${events.map((event) => `<div class="event"><i></i><div><b>${esc(event.event_type)}</b><span>${esc(event.payload?.reason || event.payload?.role || "evento persistido")}</span></div><time>${date(event.created_at)}</time></div>`).join("") || "<div class=empty>Sin eventos.</div>"}</div></div></div>`;
   $("#detail-content").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => taskAction(button.dataset.action, task)));
 }
 
@@ -135,6 +171,7 @@ async function taskAction(action, task) {
 }
 
 $("#refresh").addEventListener("click", load);
+$("#task-filter").addEventListener("input", () => state.data && renderTasks(state.data.tasks));
 $("#new-task").addEventListener("click", () => $("#modal").classList.remove("hidden"));
 $("#close-modal").addEventListener("click", () => $("#modal").classList.add("hidden"));
 $("#close-detail").addEventListener("click", () => { state.selectedTask = null; $("#detail-panel").classList.add("hidden"); });

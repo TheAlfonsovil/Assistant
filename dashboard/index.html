@@ -16,8 +16,9 @@
     <main>
       <section class="hero"><div><p class="eyebrow">LOCAL OPERATIONS / 24·7</p><h1>Todo lo que está pasando,<br><em>en una sola mirada.</em></h1><p class="hero-copy">Tareas persistentes, decisiones del grafo, salud del runtime y memoria operativa.</p></div><div id="hero-health" class="health-orb"><span></span><div><b>Runtime</b><strong id="hero-status">--</strong></div></div></section>
       <section class="stats-grid" id="stats"></section>
+      <section class="panel analytics-panel"><div class="panel-heading"><div><p class="eyebrow">OBSERVABILITY</p><h2>Cómo trabaja el Assistant</h2></div><span id="analytics-note" class="muted">telemetría estimada</span></div><div id="analytics-kpis" class="analytics-kpis"></div><div class="analytics-grid"><div><p class="eyebrow">LLM / TOKENS / FASES</p><div id="llm-analysis" class="analysis-list"></div></div><div><p class="eyebrow">HERRAMIENTAS Y LATENCIA</p><div id="tool-analysis" class="analysis-list"></div></div><div><p class="eyebrow">VELOCIDAD POR TAREA</p><div id="speed-analysis" class="speed-list"></div></div></div></section>
       <section class="workspace-grid">
-        <article class="panel task-panel"><div class="panel-heading"><div><p class="eyebrow">WORK QUEUE</p><h2>Tareas actuales</h2></div><button id="new-task" class="button primary">+ Nueva orden</button></div><div id="task-list" class="task-list"></div></article>
+        <article class="panel task-panel"><div class="panel-heading"><div><p class="eyebrow">WORK QUEUE</p><h2>Tareas actuales</h2></div><div class="heading-actions"><input id="task-filter" class="compact-input" placeholder="Filtrar tareas" aria-label="Filtrar tareas"><button id="new-task" class="button primary">+ Nueva orden</button></div></div><div id="task-list" class="task-list"></div></article>
         <aside class="panel pulse-panel"><div class="panel-heading"><div><p class="eyebrow">SIGNAL</p><h2>Distribución</h2></div><span class="live-dot">LIVE</span></div><div id="status-chart" class="status-chart"></div><div id="runtime-metrics" class="metrics-list"></div></aside>
       </section>
       <section class="lower-grid">

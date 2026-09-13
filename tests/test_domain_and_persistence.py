@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from assistant.domain.errors import GraphCycleError
+from assistant.domain.state import InvalidStateTransition
 from assistant.domain.graph import TaskGraph
 from assistant.domain.models import (
     DependencyType,
@@ -12,6 +13,7 @@ from assistant.domain.models import (
     NodeType,
     Task,
     TaskNode,
+    TaskStatus,
 )
 from assistant.infrastructure.db import Database
 from assistant.infrastructure.repositories import TaskRepository
@@ -56,6 +58,21 @@ async def test_sqlite_persists_task_nodes_edges_and_events(tmp_path):
         ) if False else None
         assert (await repository.get_task(task.id)).goal == "persist me"
         assert (await repository.get_node(node.id)).description == "root"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_persistence_rejects_illegal_terminal_transition(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'state.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        task = Task(goal="state", status=TaskStatus.SUCCEEDED)
+        await repository.save_task(task)
+        task.status = TaskStatus.READY
+
+        with pytest.raises(InvalidStateTransition):
+            await repository.save_task(task)
     await database.close()
 
 

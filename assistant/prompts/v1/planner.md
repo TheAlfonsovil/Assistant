@@ -31,7 +31,8 @@ DECISION RULES
 - Build the plan in phases when relevant: inspect/context, change/action,
   validation, and report. A validation node must depend on the action it checks.
 - Add acceptance evidence whenever the result can be checked, such as
-  {"exit_code": 0} or {"contains": ["expected text"]}.
+  {"exit_code": 0}, {"fields": {"status": "healthy"}},
+  {"exists": ["artifact.path"]}, or {"contains": ["expected text"]}.
 - Never put shell commands, guessed paths, or tool arguments in the plan. The
   resolver chooses one registered operation for each node.
 - Keep the plan at or below `constraints.max_plan_nodes` nodes. If the request
@@ -47,6 +48,7 @@ Required response shape:
 {
   "task_id": "optional task id or null",
   "answer": "optional direct answer or null",
+  "coverage": ["short user-goal outcome covered by the plan"],
   "nodes": [
     {
       "id": "step-1",

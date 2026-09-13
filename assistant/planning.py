@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from .llm import PlanProposal
 
 
@@ -17,6 +19,30 @@ _ALLOWED_CONDITION_OPERATORS = {
 
 class PlanQualityError(ValueError):
     """Raised when a syntactically valid plan is not executable enough."""
+
+
+_COVERAGE_STOPWORDS = {
+    "para", "como", "este", "esta", "that", "this", "with", "from", "into",
+    "the", "and", "que", "una", "uno", "los", "las", "del", "por", "con",
+}
+
+
+def plan_coverage_warnings(proposal: PlanProposal, goal: str) -> list[str]:
+    if proposal.answer is not None or not proposal.nodes:
+        return []
+    declared = {item.strip().lower() for item in proposal.coverage if item.strip()}
+    descriptions = " ".join(item.description.lower() for item in proposal.nodes)
+    terms = {
+        term for term in re.findall(r"[a-zA-Z0-9_]{4,}", goal.lower())
+        if term not in _COVERAGE_STOPWORDS
+    }
+    missing = sorted(term for term in terms if term not in descriptions)
+    warnings = []
+    if missing and len(missing) >= max(2, len(terms) // 2):
+        warnings.append(f"plan does not mention goal terms: {', '.join(missing[:8])}")
+    if terms and not declared:
+        warnings.append("planner did not declare coverage items")
+    return warnings
 
 
 def validate_plan_quality(proposal: PlanProposal, max_nodes: int) -> None:
@@ -69,6 +95,18 @@ def validate_plan_quality(proposal: PlanProposal, max_nodes: int) -> None:
             )
         if not isinstance(item.acceptance, dict):
             raise PlanQualityError(f"node {item.id} has invalid acceptance evidence")
+        acceptance = item.acceptance
+        if "fields" in acceptance and not isinstance(acceptance["fields"], dict):
+            raise PlanQualityError(f"node {item.id} has invalid field evidence")
+        for key in ("exists", "not_exists"):
+            if key in acceptance and (
+                not isinstance(acceptance[key], list)
+                or any(not isinstance(path, str) or not path for path in acceptance[key])
+            ):
+                raise PlanQualityError(f"node {item.id} has invalid {key} evidence")
+        for key in ("contains", "output_contains"):
+            if key in acceptance and not isinstance(acceptance[key], (str, list)):
+                raise PlanQualityError(f"node {item.id} has invalid {key} evidence")
         if item.type in {"CONDITION", "DECISION"}:
             operator = item.metadata.get("operator", "truthy")
             if operator not in _ALLOWED_CONDITION_OPERATORS:
