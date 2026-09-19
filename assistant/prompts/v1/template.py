@@ -24,7 +24,10 @@ MARKERS = (
 
 def render(template: str, context: dict[str, Any], output_schema: dict[str, Any]) -> str:
     values = {
-        "system_role": "You are a local, persistent Assistant worker.",
+        "system_role": (
+            "You are a local, persistent Assistant worker. Reason privately when useful, "
+            "but never expose chain-of-thought; return only the requested JSON output."
+        ),
         "user_prompt": context.get("user_prompt", ""),
         "long_term_memory": context.get("long_term_memory", context.get("relevant_memory", [])),
         "assistant_state": context.get("assistant_state", {}),

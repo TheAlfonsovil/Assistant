@@ -20,6 +20,7 @@ from assistant.domain.state import validate_node_transition, validate_task_trans
 from .orm import (
     EdgeRow,
     EventRow,
+    IdempotencyRow,
     LeaseRow,
     MemoryRow,
     NodeRow,
@@ -313,6 +314,30 @@ class TaskRepository:
         result = await self.session.execute(delete(MemoryRow).where(MemoryRow.id == memory_id))
         await self.session.commit()
         return bool(result.rowcount)
+
+    async def reset_state(self) -> dict[str, int]:
+        tables = (
+            (LeaseRow, "leases"),
+            (EventRow, "events"),
+            (EdgeRow, "edges"),
+            (NodeRow, "nodes"),
+            (IdempotencyRow, "operation_results"),
+            (TaskRow, "tasks"),
+            (MemoryRow, "memories"),
+            (WorkerHeartbeatRow, "worker_heartbeat"),
+        )
+        deleted = {}
+        for model, name in tables:
+            result = await self.session.execute(delete(model))
+            deleted[name] = int(result.rowcount or 0)
+        await self.session.commit()
+        return deleted
+
+    async def reset_memory(self) -> int:
+        """Backward-compatible memory-only reset for internal callers."""
+        result = await self.session.execute(delete(MemoryRow))
+        await self.session.commit()
+        return int(result.rowcount or 0)
 
     async def redact_memory(self, memory_id: str) -> MemoryRecord | None:
         row = await self.session.get(MemoryRow, memory_id)

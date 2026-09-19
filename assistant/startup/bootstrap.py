@@ -22,6 +22,7 @@ class AssistantContext:
     session: Any
     service: TaskService
     startup: StartupReport
+    settings: Settings
 
     async def close(self) -> None:
         await self.session.close()
@@ -45,6 +46,10 @@ async def create_context(
             resolved_settings.ollama_timeout,
             temperature=resolved_settings.ollama_temperature,
             num_ctx=resolved_settings.ollama_num_ctx,
+            thinking=resolved_settings.ollama_thinking,
+            reasoning_effort=resolved_settings.ollama_reasoning_effort,
+            reasoning_policy=resolved_settings.ollama_reasoning_policy,
+            context_reserve_tokens=resolved_settings.ollama_context_reserve_tokens,
             trace_sink=trace_sink,
             failure_threshold=resolved_settings.ollama_failure_threshold,
             recovery_timeout=resolved_settings.ollama_recovery_timeout,
@@ -60,5 +65,7 @@ async def create_context(
         build_tool_registry(),
         event_sink=event_sink,
         workspace_root=resolved_settings.workspace_root,
+        default_execution_time=resolved_settings.task_max_execution_time,
+        max_steps=resolved_settings.task_max_steps,
     )
-    return AssistantContext(database, session, service, startup)
+    return AssistantContext(database, session, service, startup, resolved_settings)

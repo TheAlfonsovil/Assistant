@@ -11,21 +11,27 @@ class IdleCycle:
         on_idle: Callable[[], Awaitable[object]] | None = None,
         supervise: Callable[[bool], Awaitable[object]] | None = None,
         supervision_interval: float | None = None,
+        enabled: bool = True,
     ):
         self.create_task = create_task
         self.interval = interval
         self.on_idle = on_idle
         self.supervise = supervise
         self.supervision_interval = supervision_interval if supervision_interval is not None else interval
+        self.enabled = enabled
         self.stop_requested = False
         self._last_idle_at: float | None = None
         self._last_supervision_at: float | None = None
         self._idle_running = False
         self.last_supervision_result: object | None = None
+        self.reentrant_skips = 0
 
     async def run_once(self, has_work: bool = False) -> object | None:
         now = monotonic()
-        if self.stop_requested or self._idle_running:
+        if self.stop_requested or not self.enabled:
+            return None
+        if self._idle_running:
+            self.reentrant_skips += 1
             return None
         self._idle_running = True
         try:
@@ -64,3 +70,6 @@ class IdleCycle:
 
     def stop(self) -> None:
         self.stop_requested = True
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.enabled = enabled

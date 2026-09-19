@@ -24,14 +24,20 @@ class MockDeviceTool(Tool):
     async def execute(self, method: str, args: dict[str, Any], timeout: float) -> OperationResult:
         return OperationResult(
             success=True,
-            output={"device": self.device.name, "status": "MOCK", "message": "adapter not connected"},
-            metadata={"mock": True},
+            output={
+                "device": self.device.name,
+                "platform": self.device.platform,
+                "transport": self.device.transport,
+                "status": "MOCK",
+                "message": "adapter not connected",
+            },
+            metadata={"mock": True, "platform": self.device.platform},
         )
 
 
 DEVICE_BRANCHES = (
-    DeviceBranch("computer", "ACTIVE", "Local computer and its capabilities"),
-    DeviceBranch("mobile", "MOCK", "Mobile device adapter"),
+    DeviceBranch("computer", "ACTIVE", "Windows computer and local capabilities", "windows", "local"),
+    DeviceBranch("mobile", "MOCK", "Android mobile device adapter", "android", "adb"),
     DeviceBranch("home", "MOCK", "Home automation adapter"),
     DeviceBranch("robot", "MOCK", "Robotics adapter"),
 )

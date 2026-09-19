@@ -47,6 +47,7 @@ from assistant.project_analysis import ProjectAnalyzer
 from assistant.prompts.v1.template import render
 from assistant.planning import plan_coverage_warnings
 from assistant.recovery import RecoveryManager
+from assistant.idle import IdleCycle
 from assistant.runtime import TaskRuntime
 from assistant.startup.manager import StartupManager
 from assistant.tools import MockTool, NotificationTool, Tool, ToolDefinition, ToolRegistry
@@ -54,6 +55,10 @@ from assistant.tools import MockTool, NotificationTool, Tool, ToolDefinition, To
 
 def test_device_registry_exposes_four_branches_and_computer_actions():
     assert [branch.name for branch in DEVICE_BRANCHES] == ["computer", "mobile", "home", "robot"]
+    assert DEVICE_BRANCHES[0].platform == "windows"
+    assert DEVICE_BRANCHES[0].transport == "local"
+    assert DEVICE_BRANCHES[1].platform == "android"
+    assert DEVICE_BRANCHES[1].transport == "adb"
     definitions = {definition.name for definition in build_tool_registry().definitions()}
     assert {"filesystem", "shell", "git", "deployment", "project", "codegraph", "system", "web", "browser"} <= definitions
     assert {"device.mobile", "device.home", "device.robot"} <= definitions
@@ -637,6 +642,43 @@ async def test_startup_persists_user_profile_from_environment(tmp_path):
     await database.close()
 
 
+@pytest.mark.asyncio
+async def test_startup_registers_assistant_and_computer_projects_idempotently(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'builtin-projects.db'}")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'builtin-projects.db'}",
+        persist_system_facts=False,
+        persist_user_profile=False,
+    )
+
+    await StartupManager(database, settings, MockLLMProvider()).initialize()
+    await StartupManager(database, settings, MockLLMProvider()).initialize()
+
+    async with database.sessions() as session:
+        projects = await TaskRepository(session).list_projects()
+        assert {project.name for project in projects} == {"Assistant"}
+        assert sum(project.is_default for project in projects) == 1
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_reset_state_deletes_runtime_state_but_keeps_projects(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'reset-memory.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        await repository.upsert_memory(kind="test", key="one", value={"value": 1})
+        await repository.upsert_memory(kind="test", key="two", value={"value": 2})
+        project = Project(name="keep", path=str(tmp_path))
+        await repository.create_project(project)
+
+        deleted = await repository.reset_state()
+        assert deleted["memories"] == 2
+        assert await repository.list_memory() == []
+        assert len(await repository.list_projects()) == 1
+    await database.close()
+
+
 def test_ollama_planner_contract_accepts_graph_response():
     proposal = PlanProposal.model_validate(
         {
@@ -672,7 +714,58 @@ async def test_ollama_provider_sends_versioned_prompt_and_json_schema():
     prompt = payload["prompt"]
     assert payload["format"]["type"] == "object"
     assert payload["options"] == {"temperature": 0.1, "num_ctx": 32768}
+    assert payload["think"] is False
     assert "Valid example:" in prompt
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_ollama_provider_uses_explicit_reasoning_and_context_budget():
+    requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"response": '{"task_id": null, "nodes": []}'})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OllamaLLMProvider(
+        "http://ollama.test",
+        "test-model",
+        client=client,
+        num_ctx=8192,
+        thinking=True,
+        reasoning_effort="medium",
+        context_reserve_tokens=1024,
+        max_prompt_chars=200_000,
+    )
+    await provider.plan({"task": {"goal": "run tests"}})
+    payload = json.loads(requests[0].content)
+
+    assert payload["think"] == "medium"
+    assert provider.effective_prompt_chars == (8192 - 1024) * 4
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_ollama_provider_applies_reasoning_policy_per_phase():
+    requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"response": '{"decision": "SUCCESS", "reason": "ok"}'})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OllamaLLMProvider(
+        "http://ollama.test",
+        "test-model",
+        client=client,
+        thinking=True,
+        reasoning_policy="PLANNER:medium,NODE_RESOLVER:low,VERIFIER:off",
+    )
+    await provider.verify({"result": {"success": True}})
+
+    assert requests[0]["think"] is False
+    assert provider.reasoning_policy["PLANNER"] == "medium"
     await provider.close()
 
 
@@ -830,6 +923,7 @@ async def test_runtime_processes_only_active_tasks_once():
         "tasks_dispatched": 0,
         "task_errors": 0,
         "idle_passes": 1,
+        "idle_skipped": 0,
         "not_ready_passes": 0,
         "runtime_errors": 0,
     }
@@ -852,6 +946,32 @@ async def test_runtime_does_not_consume_tasks_when_llm_is_not_ready():
     assert called == []
     assert runtime.last_active_count == 0
     assert runtime.metrics_snapshot()["not_ready_passes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_can_disable_idle_without_stopping_task_dispatch():
+    task = Task(goal="work", status=TaskStatus.QUEUED)
+    called = []
+    idle_calls = []
+
+    async def on_idle():
+        idle_calls.append(True)
+
+    class Repository:
+        async def list_tasks(self):
+            return [task]
+
+    runtime = TaskRuntime(
+        Repository(),
+        lambda task_id: _record_task(called, task_id),
+        idle_cycle=IdleCycle(on_idle=on_idle),
+    )
+    runtime.set_idle_enabled(False)
+
+    assert await runtime.run_once() == 1
+    assert called == [task.id]
+    assert idle_calls == []
+    assert runtime.metrics_snapshot()["idle_skipped"] == 1
 
 
 async def _record_task(called, task_id):
@@ -1154,6 +1274,10 @@ async def test_recovery_requeues_parent_task_and_running_node(tmp_path):
         assert (await repository.get_task(task.id)).status is TaskStatus.READY
         assert (await repository.get_node(node.id)).status is NodeStatus.READY
         assert (await repository.get_node(node.id)).error == "recovered after process restart"
+        assert any(
+            event.event_type == "NODE_RECOVERED"
+            for event in await repository.list_events(task.id)
+        )
     await database.close()
 
 

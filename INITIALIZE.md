@@ -53,6 +53,13 @@ Ejecuta desde la raíz del repositorio:
 .\.venv\Scripts\python.exe -m uvicorn assistant.api:app --reload
 ```
 
+Alternativamente, el comando del proyecto puede levantar API, runtime y
+dashboard juntos:
+
+```powershell
+assistant run --dashboard
+```
+
 El proceso hace todo lo siguiente durante el startup:
 
 1. Crea o abre la base SQLite.
@@ -165,4 +172,21 @@ Las métricas acumuladas incluyen pasadas del worker, tareas despachadas, errore
 
 Pulsa `Ctrl+C` en la terminal de Uvicorn. La base queda intacta. Al volver a ejecutar el comando de arranque, el startup recuperará el trabajo pendiente y el dashboard volverá a leer el estado existente.
 
-El dashboard está separado visualmente en `dashboard/`, pero se sirve desde la misma API local para conservar una sola fuente de verdad y evitar sincronizaciones frágiles.
+El dashboard está separado visualmente en `dashboard/`, pero se sirve desde la misma API local para conservar una sola fuente de verdad y evitar sincronizaciones frágiles. La vista inicial es `Resumen`; `Tareas`, `Actividad`, `Recursos` y `Chat` son módulos independientes.
+
+## 8. Limpiar el estado sin borrar la base
+
+Detén primero el runtime y ejecuta desde la raíz del repositorio. Este comando
+conserva el archivo SQLite, el esquema y los proyectos registrados, pero elimina
+tareas, grafos, eventos, leases, resultados y memorias:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sqlite3; c=sqlite3.connect('data/assistant.db'); c.execute('PRAGMA foreign_keys=ON'); c.executescript('BEGIN; DELETE FROM node_leases; DELETE FROM task_events; DELETE FROM graph_edges; DELETE FROM task_nodes; DELETE FROM operation_results; DELETE FROM tasks; DELETE FROM memories; DELETE FROM worker_heartbeat; COMMIT;'); c.close(); print('Estado limpiado; base conservada')"
+```
+
+Al arrancar de nuevo, `ASSISTANT_COLLECT_SYSTEM_FACTS=true` y
+`ASSISTANT_PERSIST_USER_PROFILE=true` volverán a crear las memorias de sistema y
+el perfil definido por `ASSISTANT_USER_*`. Para mantener la memoria vacía,
+desactiva temporalmente esas dos opciones en `.env`. El botón `Restablecer estado`
+ejecuta el mismo reset completo desde el dashboard; también está disponible como
+`POST /runtime/reset` y conserva `POST /memory/reset` por compatibilidad.

@@ -130,6 +130,14 @@ class MockLLMProvider:
 
 
 class OllamaLLMProvider:
+    DEFAULT_REASONING_POLICY = {
+        "PLANNER": "medium",
+        "NODE_RESOLVER": "low",
+        "REPLANNER": "high",
+        "VERIFIER": "off",
+        "FINAL_RESPONSE": "low",
+    }
+
     def __init__(
         self,
         base_url: str,
@@ -138,6 +146,10 @@ class OllamaLLMProvider:
         client: httpx.AsyncClient | None = None,
         temperature: float = 0.1,
         num_ctx: int = 32768,
+        thinking: bool = False,
+        reasoning_effort: str = "low",
+        reasoning_policy: str = "",
+        context_reserve_tokens: int = 4096,
         trace_sink: Callable[[dict[str, Any]], None] | None = None,
         failure_threshold: int = 3,
         recovery_timeout: float = 30.0,
@@ -148,15 +160,24 @@ class OllamaLLMProvider:
         self.model = model
         self.client = client or httpx.AsyncClient(timeout=timeout)
         self.temperature = temperature
-        self.num_ctx = num_ctx
+        self.num_ctx = max(1024, num_ctx)
+        self.thinking = thinking
+        self.reasoning_effort = reasoning_effort if reasoning_effort in {"low", "medium", "high", "xhigh"} else "low"
+        self.reasoning_policy = self._parse_reasoning_policy(reasoning_policy)
+        self.context_reserve_tokens = max(256, min(context_reserve_tokens, self.num_ctx - 256))
         self.trace_sink = trace_sink
         self.request_timeout = timeout if timeout is not None else 300.0
         self.failure_threshold = max(1, failure_threshold)
         self.recovery_timeout = max(0.1, recovery_timeout)
         self.max_prompt_chars = max(1, max_prompt_chars)
+        self.effective_prompt_chars = min(
+            self.max_prompt_chars,
+            (self.num_ctx - self.context_reserve_tokens) * 4,
+        )
         self.max_response_chars = max(1, max_response_chars)
         self._consecutive_failures = 0
         self._circuit_opened_at: float | None = None
+        self.last_usage: dict[str, int] = {}
 
     @property
     def circuit_state(self) -> str:
@@ -169,6 +190,21 @@ class OllamaLLMProvider:
     def _ensure_circuit_available(self) -> None:
         if self.circuit_state == "OPEN":
             raise RuntimeError("LLM circuit breaker is open")
+
+    @classmethod
+    def _parse_reasoning_policy(cls, value: str) -> dict[str, str]:
+        policy = cls.DEFAULT_REASONING_POLICY.copy()
+        for item in value.split(","):
+            role, separator, effort = item.partition(":")
+            if separator and role.strip() and effort.strip() in {"off", "low", "medium", "high", "xhigh"}:
+                policy[role.strip().upper()] = effort.strip()
+        return policy
+
+    def _thinking_for_role(self, role: str) -> str | bool:
+        if not self.thinking:
+            return False
+        effort = self.reasoning_policy.get(role, self.reasoning_effort)
+        return False if effort == "off" else effort
 
     def _record_success(self) -> None:
         self._consecutive_failures = 0
@@ -193,9 +229,9 @@ class OllamaLLMProvider:
         prompt_path = Path(__file__).parent / "prompts" / "v1" / f"{role.lower()}.md"
         instructions = prompt_path.read_text(encoding="utf-8")
         rendered_instructions = render(instructions, context, schema.model_json_schema())
-        if len(rendered_instructions) > self.max_prompt_chars:
+        if len(rendered_instructions) > self.effective_prompt_chars:
             raise ValueError(
-                f"LLM prompt exceeds limit of {self.max_prompt_chars} characters"
+                f"LLM prompt exceeds effective context budget of {self.effective_prompt_chars} characters"
             )
         prompt = {
             "role": role,
@@ -208,6 +244,7 @@ class OllamaLLMProvider:
                 "role": role,
                 "prompt_chars": len(rendered_instructions),
                 "context_chars": len(json.dumps(context, default=str)),
+                "thinking": self._thinking_for_role(role),
                 "sections": [line for line in rendered_instructions.splitlines() if line and line.isupper()],
                 "prompt_preview": rendered_instructions[:4000],
             }
@@ -225,6 +262,7 @@ class OllamaLLMProvider:
                             "temperature": self.temperature,
                             "num_ctx": self.num_ctx,
                         },
+                        "think": self._thinking_for_role(role),
                     },
                 ),
                 timeout=self.request_timeout,
@@ -232,6 +270,11 @@ class OllamaLLMProvider:
             response.raise_for_status()
             payload = response.json()
             raw = payload.get("response", payload)
+            self.last_usage = {
+                key: int(payload[key])
+                for key in ("prompt_eval_count", "eval_count")
+                if isinstance(payload.get(key), (int, float))
+            }
             raw_chars = len(raw) if isinstance(raw, str) else len(json.dumps(raw, default=str))
             if raw_chars > self.max_response_chars:
                 raise ValueError(
@@ -251,6 +294,7 @@ class OllamaLLMProvider:
                     "role": role,
                     "elapsed_seconds": round(time.perf_counter() - started, 2),
                     "raw_chars": len(raw) if isinstance(raw, str) else len(json.dumps(raw, default=str)),
+                    "usage": self.last_usage,
                     "raw_preview": raw[:4000] if isinstance(raw, str) else raw,
                     "error": str(error),
                 }
@@ -263,6 +307,7 @@ class OllamaLLMProvider:
                 "role": role,
                 "elapsed_seconds": round(time.perf_counter() - started, 2),
                 "raw_chars": len(raw) if isinstance(raw, str) else len(json.dumps(raw, default=str)),
+                "usage": self.last_usage,
                 "raw_preview": raw[:4000] if isinstance(raw, str) else raw,
                 "validated": validated.model_dump(mode="json"),
             }

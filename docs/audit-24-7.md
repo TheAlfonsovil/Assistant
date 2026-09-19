@@ -70,6 +70,16 @@ startup -> readiness -> recover -> load memory/profile -> scheduler
 
 La arquitectura ya permite crecer por dispositivos y acciones sin tocar el motor. La distancia entre este prototipo sólido y un trabajador autónomo fiable no está en añadir más herramientas, sino en control operativo: permisos, aprobaciones, recuperación, supervisión, seguridad y memoria gobernable.
 
+## Mejoras operativas para el despliegue local
+
+- El runtime permite pausar `idle` sin detener la cola secuencial. `ASSISTANT_IDLE_ENABLED=false` lo deja pausado desde el arranque y el dashboard permite cambiarlo durante la sesión.
+- La API expone el estado de idle, incluido el número de intentos omitidos por reentrada, para distinguir una pausa intencionada de saturación del ciclo de mantenimiento.
+- Las respuestas de Ollama conservan `prompt_eval_count` y `eval_count` cuando el proveedor los devuelve. El dashboard muestra esos tokens medidos aparte de la estimación `caracteres / 4`.
+- La recuperación de nodos interrumpidos y tareas que estaban planificando deja eventos `NODE_RECOVERED` y `TASK_RECOVERED_FROM_PLANNING`, haciendo visible el coste de un reinicio.
+- El presupuesto temporal de tarea y el circuit breaker del LLM siguen siendo los límites principales para un modelo local lento. El procesamiento continúa secuencial para evitar saturar la máquina de prueba.
+
+Estas medidas no convierten la API en un servicio seguro ni sustituyen un supervisor del sistema operativo. La API debe seguir enlazada a localhost; shell libre, dispositivos reales, auth, policy engine y concurrencia paralela quedan deliberadamente fuera de este despliegue de prueba.
+
 ## Mejoras funcionales aplicadas
 
 - El ciclo `idle` aplica cooldown y evita reentradas, para no crear mantenimientos duplicados en pasadas consecutivas sin trabajo.
@@ -86,4 +96,6 @@ La arquitectura ya permite crecer por dispositivos y acciones sin tocar el motor
 - La ejecución del grafo permanece secuencial por decisión de diseño actual.
 - Las herramientas largas mantienen el lease mediante renovaciones periódicas; si se pierde, el resultado no entra en verificación.
 - Ollama tiene timeout de cliente, límites de prompt/respuesta y circuit breaker configurable.
+- Ollama aplica thinking por fase: Planner medio, Resolver bajo, Replanner alto,
+  Verifier apagado y respuesta final baja; el razonamiento no se incluye en el JSON.
 - La memoria tiene expiración, purga en idle, exportación, borrado y redacción explícita.

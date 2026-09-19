@@ -41,6 +41,7 @@ class TaskRuntime:
             "tasks_dispatched": 0,
             "task_errors": 0,
             "idle_passes": 0,
+            "idle_skipped": 0,
             "not_ready_passes": 0,
             "runtime_errors": 0,
         }
@@ -49,6 +50,25 @@ class TaskRuntime:
 
     def metrics_snapshot(self) -> dict[str, int]:
         return dict(self.metrics)
+
+    def idle_snapshot(self) -> dict[str, object]:
+        return {
+            "enabled": self.idle_cycle.enabled,
+            "interval_seconds": self.idle_cycle.interval,
+            "supervision_interval_seconds": self.idle_cycle.supervision_interval,
+            "last_supervision_result": self.idle_cycle.last_supervision_result,
+            "reentrant_skips": self.idle_cycle.reentrant_skips,
+        }
+
+    def set_idle_enabled(self, enabled: bool) -> None:
+        self.idle_cycle.set_enabled(enabled)
+
+    async def _run_idle(self, has_work: bool) -> None:
+        if not self.idle_cycle.enabled:
+            self.metrics["idle_skipped"] += 1
+            return
+        await self.idle_cycle.run_once(has_work=has_work)
+        self.metrics["idle_passes"] += 1
 
     async def _persist_heartbeat(self) -> None:
         save = getattr(self.repository, "save_worker_heartbeat", None)
@@ -70,8 +90,7 @@ class TaskRuntime:
         await self._persist_heartbeat()
         if not self.is_ready():
             self.metrics["not_ready_passes"] += 1
-            await self.idle_cycle.run_once(has_work=False)
-            self.metrics["idle_passes"] += 1
+            await self._run_idle(has_work=False)
             self.last_active_count = 0
             self.last_completed_at = datetime.now(UTC)
             await self._persist_heartbeat()
@@ -89,8 +108,7 @@ class TaskRuntime:
                 self.metrics["task_errors"] += 1
                 logger.exception("Task worker iteration failed for %s", task.id)
                 continue
-        await self.idle_cycle.run_once(has_work=bool(active))
-        self.metrics["idle_passes"] += 1
+        await self._run_idle(has_work=bool(active))
         self.last_active_count = len(active)
         self.last_completed_at = datetime.now(UTC)
         await self._persist_heartbeat()

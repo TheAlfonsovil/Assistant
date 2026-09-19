@@ -27,6 +27,7 @@ from .domain.models import (
     OperationResult,
     Project,
     Task,
+    TaskBudget,
     TaskEvent,
     TaskNode,
     TaskRequest,
@@ -55,6 +56,8 @@ class TaskService:
         verifier=None,
         event_sink=None,
         workspace_root: str = ".",
+        default_execution_time: float | None = None,
+        max_steps: int = 1000,
     ):
         self.repository = TaskRepository(session, event_sink=event_sink)
         self.session = session
@@ -63,6 +66,8 @@ class TaskService:
         self.verifier = verifier or DeterministicVerifier()
         self.scheduler = NodeScheduler()
         self.context_builder = ContextBuilder(self.repository, tools, workspace_root=workspace_root)
+        self.default_execution_time = default_execution_time
+        self.max_steps = max(1, max_steps)
         self.owner = f"{socket.gethostname()}:{id(self)}"
         self._cancellation_events: dict[str, asyncio.Event] = {}
 
@@ -81,6 +86,8 @@ class TaskService:
         task_data = request.model_dump(exclude={"project_name"})
         task_data["project_id"] = project.id if project else None
         task = Task.model_validate(task_data)
+        if self.default_execution_time is not None:
+            task.budget.max_execution_time = max(1.0, self.default_execution_time)
         if requires_project_selection:
             task.metadata["clarification"] = {
                 "kind": "project_selection",
@@ -1082,6 +1089,8 @@ class TaskService:
                                 }
                                 for item in proposal.nodes
                             ],
+                            "response_chars": len(json.dumps(proposal.model_dump(mode="json"), default=str)),
+                            "usage": getattr(self.llm, "last_usage", {}),
                         },
                     )
                 )
@@ -1363,6 +1372,7 @@ class TaskService:
                         "args": compact(decision.operation.args) if decision.operation else None,
                         "reason": decision.reason,
                             "response_chars": len(json.dumps(decision.model_dump(mode="json"), default=str)),
+                            "usage": getattr(self.llm, "last_usage", {}),
                     },
                 )
             )
@@ -1770,11 +1780,12 @@ class TaskService:
         return True
 
     async def run_task(
-        self, task_id: str, max_steps: int = 100, wait_for_retry: bool = True
+        self, task_id: str, max_steps: int | None = None, wait_for_retry: bool = True
     ) -> Task | None:
         started = monotonic()
         steps = 0
-        while steps < max_steps:
+        step_limit = max(1, max_steps if max_steps is not None else self.max_steps)
+        while steps < step_limit:
             current = await self.repository.get_task(task_id)
             deadline = current.deadline if current else None
             if deadline and deadline.tzinfo is None:

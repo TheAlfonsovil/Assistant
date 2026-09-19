@@ -12,8 +12,9 @@ Requires-Dist: sqlalchemy<3.0,>=2.0
 Requires-Dist: aiosqlite<1.0,>=0.20
 Requires-Dist: typer<1.0,>=0.15
 Requires-Dist: python-dotenv<2.0,>=1.0
+Requires-Dist: uvicorn[standard]<1.0,>=0.30
 Provides-Extra: dev
 Requires-Dist: pytest<9.0,>=8.3; extra == "dev"
-Requires-Dist: pytest-asyncio<1.0,>=0.24; extra == "dev"
+Requires-Dist: pytest-asyncio<2.0,>=1.2; extra == "dev"
 Requires-Dist: ruff<1.0,>=0.8; extra == "dev"
 Dynamic: license-file

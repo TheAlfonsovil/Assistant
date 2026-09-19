@@ -3,12 +3,13 @@ from __future__ import annotations
 import platform
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 
 from httpx import HTTPError
 from sqlalchemy.exc import SQLAlchemyError
 
 from assistant import __version__
-from assistant.domain.models import TaskStatus, UserProfile
+from assistant.domain.models import Project, TaskStatus, UserProfile
 from assistant.infrastructure.repositories import TaskRepository
 from assistant.recovery import RecoveryManager
 from assistant.startup.models import ReadinessStatus, StartupReport
@@ -46,11 +47,19 @@ class StartupManager:
         async with self.database.sessions() as session:
             report.recovered_nodes = await RecoveryManager(session).recover()
             repository = TaskRepository(session)
+            await self._ensure_builtin_projects(repository)
             existing_memory = await repository.list_memory()
             report.first_initialization = not existing_memory
             report.loaded_memories = existing_memory
             report.user_profile = self._user_profile()
             unfinished = await repository.list_tasks()
+            legacy_budget = 3600.0
+            configured_budget = max(1.0, float(getattr(self.settings, "task_max_execution_time", 86400.0)))
+            for task in unfinished:
+                if task.budget.max_execution_time == legacy_budget:
+                    task.budget.max_execution_time = configured_budget
+                    await repository.save_task(task)
+                    report.checks.append(f"Execution budget migrated for task {task.id[:8]}")
             report.unfinished_tasks = sum(
                 task.status in {
                     TaskStatus.QUEUED,
@@ -89,6 +98,38 @@ class StartupManager:
         report.status = ReadinessStatus.READY if report.llm_ready else ReadinessStatus.DEGRADED
         report.finished_at = datetime.now(UTC)
         return report
+
+    async def _ensure_builtin_projects(self, repository: TaskRepository) -> None:
+        assistant_path = Path(__file__).resolve().parents[2]
+        definition = Project(
+            name="Assistant",
+            path=str(assistant_path),
+            description="Repositorio y código fuente del Assistant.",
+            project_type="code",
+            audit_prompt="Audita el repositorio Assistant, ejecuta sus tests y reporta hallazgos con evidencia.",
+            enabled=True,
+        )
+        projects = await repository.list_projects()
+        existing_paths = {str(Path(project.path).expanduser().resolve()): project for project in projects}
+        if str(assistant_path.resolve()) not in existing_paths:
+            await repository.create_project(definition)
+        for project in projects:
+            if (
+                project.name == "Ordenador"
+                and project.project_type == "computer"
+                and project.description == "Entorno local del usuario y sus recursos de ordenador."
+                and Path(project.path).resolve() == Path.home().resolve()
+            ):
+                await repository.delete_project(project.id)
+        projects = await repository.list_projects()
+        if not any(project.is_default and project.enabled for project in projects):
+            assistant = next(
+                (project for project in projects if Path(project.path).resolve() == assistant_path.resolve()),
+                None,
+            )
+            if assistant is not None:
+                assistant.is_default = True
+                await repository.update_project(assistant)
 
     @staticmethod
     def _system_facts() -> dict[str, str]:

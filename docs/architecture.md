@@ -7,15 +7,15 @@ Assistant Core is a persistent local task engine. The database is the source of 
 There are three layers with different responsibilities:
 
 1. `startup` loads the application, checks readiness and recovers persisted work.
-2. `devices` exposes what the assistant can do on each device branch.
-3. `application` resolves projects and executes tasks through the stable `Tool` contract.
+2. `devices` exposes what the assistant can do on each platform-specific device branch.
+3. `application` resolves code projects and executes tasks through the stable `Tool` contract.
 
 Projects are domain resources, not devices. The project registry and task
 association belong to the domain/application and persistence layers; the
 computer branch only exposes the adapter (`project.analyze`) that operates on
 the already-resolved path.
 
-The task engine does not contain Windows, mobile, home or robot details. A device branch owns its adapters and actions; the registry only composes them.
+The task engine does not contain Windows, Android, home or robot details. A device branch owns its platform adapters, transport and actions; the registry only composes them.
 
 ## Folder map
 

@@ -6,8 +6,9 @@ sqlalchemy<3.0,>=2.0
 aiosqlite<1.0,>=0.20
 typer<1.0,>=0.15
 python-dotenv<2.0,>=1.0
+uvicorn[standard]<1.0,>=0.30
 
 [dev]
 pytest<9.0,>=8.3
-pytest-asyncio<1.0,>=0.24
+pytest-asyncio<2.0,>=1.2
 ruff<1.0,>=0.8

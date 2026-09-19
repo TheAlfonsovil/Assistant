@@ -8,12 +8,15 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .domain.models import (
+    ChatRequest,
+    IdleConfigurationRequest,
     Project,
     ProjectRequest,
     TaskInputRequest,
     TaskRedefinitionRequest,
     TaskRequest,
 )
+from .devices.registry import DEVICE_BRANCHES
 from .idle import IdleCycle
 from .runtime import TaskRuntime
 from .startup.bootstrap import AssistantContext, create_context
@@ -29,6 +32,7 @@ async def lifespan(app: FastAPI):
         idle_cycle=IdleCycle(
             on_idle=context.service.reconcile_idle,
             supervise=lambda has_work: context.service.reconcile_idle(),
+            enabled=context.settings.idle_enabled,
         ),
         is_ready=lambda: context.startup.llm_ready,
     )
@@ -62,9 +66,16 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
     phase_counts = {}
     estimated_prompt_tokens = 0
     estimated_response_tokens = 0
+    actual_prompt_tokens = 0
+    actual_response_tokens = 0
     llm_latency = []
     tool_latency = []
     retries = 0
+    llm_requests = {
+        (event.task_id, event.node_id, (event.payload or {}).get("role", "unknown")): event.created_at
+        for event in events
+        if event.event_type == "LLM_REQUEST"
+    }
     for event in events:
         payload = event.payload or {}
         status_counts[event.event_type] = status_counts.get(event.event_type, 0) + 1
@@ -82,12 +93,18 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         if event.event_type == "LLM_RESPONSE":
             chars = payload.get("response_chars", 0)
             estimated_response_tokens += int(chars / 4) if isinstance(chars, (int, float)) else 0
-        if event.event_type == "LLM_RESPONSE_PARSED":
+            usage = payload.get("usage", {})
+            actual_prompt_tokens += int(usage.get("prompt_eval_count", 0) or 0)
+            actual_response_tokens += int(usage.get("eval_count", 0) or 0)
+            request_key = (event.task_id, event.node_id, payload.get("role", "unknown"))
+            requested_at = llm_requests.get(request_key)
+            if requested_at is not None:
+                llm_latency.append(max(0, (event.created_at - requested_at).total_seconds()))
+        if event.event_type in {"LLM_RESPONSE", "LLM_RESPONSE_PARSED"}:
             if isinstance(payload.get("elapsed_seconds"), (int, float)):
                 llm_latency.append(payload["elapsed_seconds"])
         if event.event_type == "RETRY_SCHEDULED":
             retries += 1
-
     durations = []
     task_usage = []
     node_usage = {}
@@ -147,6 +164,13 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             "total": estimated_prompt_tokens + estimated_response_tokens,
             "basis": "context/response characters divided by 4",
         },
+        "actual_tokens": {
+            "prompt": actual_prompt_tokens,
+            "response": actual_response_tokens,
+            "total": actual_prompt_tokens + actual_response_tokens,
+            "available": bool(actual_prompt_tokens or actual_response_tokens),
+            "basis": "Ollama prompt_eval_count/eval_count when provided",
+        },
         "latency": {
             "average_task_seconds": round(sum(durations) / len(durations), 2) if durations else 0,
             "average_llm_seconds": round(sum(llm_latency) / len(llm_latency), 2) if llm_latency else 0,
@@ -169,6 +193,32 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
     }
 
 
+def _dashboard_devices(context) -> list[dict[str, object]]:
+    definitions = context.service.tools.definitions()
+    device_tools = {"device.mobile", "device.home", "device.robot"}
+    computer_capabilities = sorted(
+        definition.name for definition in definitions if definition.name not in device_tools
+    )
+    devices = []
+    for branch in DEVICE_BRANCHES:
+        capabilities = (
+            computer_capabilities
+            if branch.name == "computer"
+            else [f"device.{branch.name}"] if f"device.{branch.name}" in device_tools else []
+        )
+        devices.append(
+            {
+                "name": branch.name,
+                "status": branch.status,
+                "description": branch.description,
+                "platform": branch.platform,
+                "transport": branch.transport,
+                "capabilities": capabilities,
+            }
+        )
+    return devices
+
+
 @app.get("/health")
 async def health(request: Request):
     startup = service(request).startup
@@ -185,6 +235,7 @@ async def health(request: Request):
             "last_completed_at": runtime.last_completed_at,
             "last_error": runtime.last_error,
             "metrics": runtime.metrics_snapshot(),
+            "idle": runtime.idle_snapshot(),
         },
     }
 
@@ -230,6 +281,7 @@ async def dashboard_data(request: Request):
                 "last_completed_at": runtime.last_completed_at,
                 "last_error": runtime.last_error,
                 "metrics": runtime.metrics_snapshot(),
+                "idle": runtime.idle_snapshot(),
             },
         },
         "tasks": [task.model_dump(mode="json") for task in tasks],
@@ -246,6 +298,7 @@ async def dashboard_data(request: Request):
         "node_status_counts": node_status_counts,
         "projects": [project.model_dump(mode="json") for project in projects],
         "memories": [memory.model_dump(mode="json") for memory in memories],
+        "devices": _dashboard_devices(context),
         "analytics": analytics,
     }
 
@@ -290,6 +343,38 @@ async def delete_memory(request: Request, memory_id: str):
 async def purge_expired_memory(request: Request):
     count = await service(request).service.repository.purge_expired_memory()
     return {"purged": count}
+
+
+@app.post("/memory/reset")
+@app.post("/runtime/reset")
+async def reset_memory(request: Request):
+    deleted = await service(request).service.repository.reset_state()
+    return {"reset": True, "deleted": deleted, "total": sum(deleted.values())}
+
+
+@app.get("/runtime/idle")
+async def runtime_idle(request: Request):
+    return request.app.state.runtime.idle_snapshot()
+
+
+@app.put("/runtime/idle")
+async def configure_runtime_idle(request: Request, configuration: IdleConfigurationRequest):
+    runtime = request.app.state.runtime
+    runtime.set_idle_enabled(configuration.enabled)
+    return runtime.idle_snapshot()
+
+
+@app.post("/chat")
+async def create_chat_message(request: Request, chat_request: ChatRequest):
+    task = await service(request).service.create_task(
+        TaskRequest(
+            goal=chat_request.message,
+            source="DASHBOARD_CHAT",
+            project_id=chat_request.project_id,
+            metadata={"interaction": "chat", "requested_format": "answer"},
+        )
+    )
+    return task.model_dump(mode="json")
 
 
 @app.post("/tasks")

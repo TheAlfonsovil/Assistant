@@ -136,8 +136,16 @@ def run(
     once: Annotated[bool, typer.Option("--once", help="Process queued tasks once and exit.")] = False,
     interval: Annotated[float, typer.Option(help="Seconds between background scheduler passes.")] = 5.0,
     mock: Annotated[bool, typer.Option(help="Use the deterministic mock provider.")] = False,
+    dashboard: Annotated[bool, typer.Option("--dashboard", help="Start the API and dashboard instead of the CLI worker.")] = False,
 ):
     async def loop():
+        if dashboard:
+            import uvicorn
+
+            config = uvicorn.Config("assistant.api:app", host="127.0.0.1", port=8000, reload=False)
+            await uvicorn.Server(config).serve()
+            return
+
         async def print_event(event):
             typer.echo(f"[Assistant] {event.event_type} node={event.node_id or '-'} {preview(event.payload)}")
 
@@ -155,6 +163,7 @@ def run(
             idle_cycle=IdleCycle(
                 on_idle=service.reconcile_idle,
                 supervise=lambda has_work: service.reconcile_idle(),
+                enabled=context.settings.idle_enabled,
             ),
             is_ready=lambda: startup.llm_ready,
         )

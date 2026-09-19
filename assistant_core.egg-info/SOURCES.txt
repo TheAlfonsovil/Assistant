@@ -11,6 +11,7 @@ assistant/context.py
 assistant/idle.py
 assistant/llm.py
 assistant/observability.py
+assistant/planning.py
 assistant/project_analysis.py
 assistant/recovery.py
 assistant/runtime.py
@@ -28,6 +29,7 @@ assistant/devices/base.py
 assistant/devices/registry.py
 assistant/devices/computer/__init__.py
 assistant/devices/computer/actions.py
+assistant/devices/computer/browser.py
 assistant/devices/computer/codegraph.py
 assistant/devices/computer/registry.py
 assistant/devices/computer/system.py
@@ -39,6 +41,7 @@ assistant/domain/__init__.py
 assistant/domain/errors.py
 assistant/domain/graph.py
 assistant/domain/models.py
+assistant/domain/state.py
 assistant/infrastructure/__init__.py
 assistant/infrastructure/db.py
 assistant/infrastructure/orm.py

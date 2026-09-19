@@ -10,3 +10,5 @@ class DeviceBranch:
     name: str
     status: str
     description: str
+    platform: str = "generic"
+    transport: str = "local"

@@ -81,7 +81,7 @@ class TaskBudget(BaseModel):
     max_llm_calls: int = 20
     max_retries: int = 3
     max_recovery_attempts: int = 2
-    max_execution_time: float = 3600.0
+    max_execution_time: float = 86400.0
     max_tool_calls: int = 50
     max_plan_nodes: int = 100
 
@@ -227,6 +227,15 @@ class TaskRequest(BaseModel):
     priority: int = 0
     deadline: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=10000)
+    project_id: str | None = None
+
+
+class IdleConfigurationRequest(BaseModel):
+    enabled: bool
 
 
 class TaskInputRequest(BaseModel):

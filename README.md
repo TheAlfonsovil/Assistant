@@ -26,7 +26,7 @@ and persisted as one structured `user_profile` memory. The planner receives
 that profile together with task-relevant memories. The included
 `.env.example` shows the profile fields and ISO date format.
 
-Projects are durable resources, separate from the process working directory.
+Projects are durable code resources, separate from devices and from the process working directory.
 Register one with `POST /projects` using its name, absolute path, description
 and audit prompt. Tasks resolve a project by explicit id or name, the default
 project, or automatically when exactly one enabled project exists. A code
@@ -34,6 +34,11 @@ project can start the repeatable workflow with `POST /projects/{id}/audit`:
 audit, plan, execute and test, then report evidence. Each audit is a normal
 task, so the same project can be reviewed again without creating a permanent
 task.
+
+Devices are a separate capability layer. The active computer branch represents
+Windows and uses local tools; the mobile branch represents Android and reserves
+an ADB transport. Their tools, interaction model and permissions can evolve
+independently from code projects.
 
 With `--fullflow`, the CLI also shows the prompt sections, prompt/context
 sizes, memory and dependency counts, the validated LLM response, and elapsed
@@ -46,6 +51,7 @@ the terminal uses previews so a large project cannot flood the console.
 python -m pip install -e ".[dev]"
 assistant status
 assistant run
+assistant run --dashboard
 assistant task "revisa el proyecto y ejecuta los tests"
 assistant task --fullflow "revisa el proyecto y ejecuta los tests"
 uvicorn assistant.api:app --reload
@@ -87,6 +93,19 @@ ejecución y continúa con las tareas pendientes desde SQLite. Usa
 `assistant run --once` para una pasada única.
 `/health` también expone contadores acumulados del runtime: pasadas, tareas
 despachadas, errores por tarea, pasadas idle y pasadas sin LLM disponible.
+
+El ciclo idle solo reconcilia estado persistido y purga memoria expirada; no crea
+tareas sintéticas en la configuración de producción local. Se puede pausar y
+reactivar desde el dashboard, sin detener la cola de tareas. Para arrancarlo
+pausado configura `ASSISTANT_IDLE_ENABLED=false`; el cambio realizado desde el
+dashboard se mantiene hasta el siguiente reinicio del proceso.
+Para arrancar API, runtime y dashboard en un único proceso usa
+`assistant run --dashboard`; el panel queda disponible en
+`http://127.0.0.1:8000/dashboard`.
+
+Para limpiar tareas, eventos y memoria sin borrar el archivo ni el esquema de
+SQLite, detén primero el runtime y sigue la sección de limpieza de
+[INITIALIZE.md](INITIALIZE.md).
 
 Cuando una tarea queda en `WAITING`, el cliente puede aportar la respuesta sin
 reiniciar el flujo usando `POST /tasks/{id}/input` con `node_id` e `input`.
@@ -162,8 +181,14 @@ por el LLM.
 The default provider is Ollama at `http://localhost:11434` using
 `smtek/Qwen3.8-27B:Q3_K_M`. The local integration uses low temperature (`0.1`) and a
 `32768` token context by default because Planner and Resolver responses are
-schema-constrained decisions, not creative text. Set values in `.env` using
-`.env.example` as a template. Tests use mock providers and tools, so Ollama is
-not required for the test suite.
+schema-constrained decisions, not creative text. The included configuration uses
+phase-specific thinking: Planner `medium`, Resolver `low`, Replanner `high`,
+Verifier `off` and final response `low`. Change the comma-separated
+`ASSISTANT_OLLAMA_REASONING_POLICY` value, or disable the feature globally with
+`ASSISTANT_OLLAMA_THINKING=false`. The prompt budget reserves output tokens, so it
+cannot exceed the configured context window even when
+`ASSISTANT_OLLAMA_MAX_PROMPT_CHARS` is larger.
+Set values in `.env` using `.env.example` as a template. Tests use mock providers
+and tools, so Ollama is not required for the test suite.
 
 See [docs/architecture.md](docs/architecture.md) and [docs/task-lifecycle.md](docs/task-lifecycle.md) for the design.
