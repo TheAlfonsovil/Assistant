@@ -877,7 +877,10 @@ class TaskService:
             )
             task.metadata["final_response"] = response.model_dump(mode="json")
             task.metadata.pop("final_response_pending", None)
-            task.result_summary = response.summary
+            if task.result_summary:
+                task.metadata["final_response"]["summary"] = task.result_summary
+            else:
+                task.result_summary = response.summary
             await self.repository.save_task(task)
             await self.repository.save_event(
                 TaskEvent(
@@ -1178,7 +1181,21 @@ class TaskService:
                         },
                     )
                 )
-                proposal = await self._call_llm(self.llm.plan(planner_context), time_remaining)
+                try:
+                    proposal = await self._call_llm(self.llm.plan(planner_context), time_remaining)
+                except TimeoutError as error:
+                    task.status = TaskStatus.BLOCKED
+                    task.failure_reason = str(error) or "execution time budget exhausted"
+                    task.finished_at = datetime.now(UTC)
+                    await self.repository.save_task(task)
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            event_type="TASK_BUDGET_EXHAUSTED",
+                            payload={"reason": task.failure_reason, "phase": "planning"},
+                        )
+                    )
+                    return True
                 if cancellation.is_set():
                     await self._persist_cancellation(task)
                     return False
