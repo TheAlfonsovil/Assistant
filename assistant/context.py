@@ -17,6 +17,8 @@ class ContextBuilder:
 
     async def for_planner(self, task: Task) -> dict[str, Any]:
         memories = await self._memory_context(task.goal)
+        get_project = getattr(self.repository, "get_project", None)
+        project = await get_project(task.project_id) if task.project_id and get_project else None
         return {
             "phase": "PLANNER",
             "user_prompt": task.goal,
@@ -34,6 +36,16 @@ class ContextBuilder:
                 "deadline": task.deadline,
                 "metadata": task.metadata,
             },
+            "project": {
+                "id": project.id,
+                "name": project.name,
+                "path": project.path,
+                "description": project.description,
+                "project_type": project.project_type,
+                "audit_prompt": project.audit_prompt,
+                "codegraph_version": project.codegraph_version,
+                "codegraph_available": project.codegraph is not None,
+            } if project else None,
             "constraints": {
                 "max_retries": task.budget.max_retries,
                 "max_execution_time": task.budget.max_execution_time,

@@ -86,6 +86,62 @@ async def test_computer_filesystem_info_and_search(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_project_audit_reads_safe_manifests_and_runs_tests_without_reading_env(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("API_TOKEN=do-not-read\n", encoding="utf-8")
+    (tmp_path / "test_audit.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(tool="project", method="audit", args={"root": str(tmp_path), "max_files": 50})
+    )
+
+    assert result.success is True
+    audit = result.output["audit"]
+    assert "pyproject.toml" in audit["configuration"]
+    assert audit["sensitive_files"] == [".env"]
+    assert audit["sensitive_file_contents_read"] is False
+    assert audit["test_result"]["exit_code"] == 0
+    assert "do-not-read" not in json.dumps(audit)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_create_is_non_overwriting_and_delete_removes_file(tmp_path):
+    registry = build_tool_registry()
+    path = tmp_path / "created.txt"
+    created = await registry.execute(
+        Operation(tool="filesystem", method="create", args={"path": str(path), "content": "one"})
+    )
+    duplicate = await registry.execute(
+        Operation(tool="filesystem", method="create", args={"path": str(path), "content": "two"})
+    )
+    contents = path.read_text(encoding="utf-8")
+    deleted = await registry.execute(
+        Operation(tool="filesystem", method="delete", args={"path": str(path)})
+    )
+
+    assert created.success is True
+    assert duplicate.success is False
+    assert contents == "one"
+    assert deleted.success is True
+    assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_project_create_creates_direct_child_and_rejects_path_escape(tmp_path):
+    registry = build_tool_registry()
+    created = await registry.execute(
+        Operation(tool="project", method="create", args={"root": str(tmp_path), "name": "new-app"})
+    )
+    escaped = await registry.execute(
+        Operation(tool="project", method="create", args={"root": str(tmp_path), "name": "../outside"})
+    )
+
+    assert created.success is True
+    assert (tmp_path / "new-app").is_dir()
+    assert escaped.success is False
+
+
+@pytest.mark.asyncio
 async def test_tool_registry_rejects_arguments_with_wrong_declared_type():
     result = await build_tool_registry().execute(
         Operation(tool="project", method="analyze", args={"root": 123})
@@ -298,6 +354,25 @@ def test_prompt_template_replaces_completed_artifacts_marker():
 
     assert "{{completed_artifacts}}" not in rendered
     assert "out.txt" in rendered
+
+
+@pytest.mark.asyncio
+async def test_planner_context_includes_resolved_project_and_workflow_guidance(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'planner-context.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, MockLLMProvider(), ToolRegistry(), workspace_root=str(tmp_path))
+        project = await service.create_project(Project(name="demo", path=str(tmp_path)))
+        task = await service.create_task(TaskRequest(goal="audit the project", project_id=project.id))
+        context = await service.context_builder.for_planner(task)
+
+        assert context["project"]["name"] == "demo"
+        assert context["project"]["path"] == str(tmp_path.resolve())
+        project_action = next(
+            action for action in context["available_actions"] if action["name"] == "project"
+        )
+        assert "audit" in project_action["methods"]
+    await database.close()
 
 
 def test_plan_reports_missing_goal_coverage():
@@ -963,7 +1038,7 @@ async def test_all_llm_contexts_match_their_role_templates_and_stay_bounded():
         assert "{{" not in rendered
         assert len(rendered) < 15000
 
-    assert "project" not in contexts["planner"]
+    assert contexts["planner"]["project"] is None
     assert "system_graph" not in contexts["node_resolver"]
     assert "graph" not in contexts["replanner"]
     assert "failed_node" in contexts["replanner"]["failure_context"]

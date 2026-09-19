@@ -729,13 +729,13 @@ class TaskService:
     def _fallback_plan(task: Task) -> PlanProposal:
         return PlanProposal(
             task_id=task.id,
-            coverage=["inspect the project and collect evidence"],
+            coverage=["audit the project and collect executable evidence"],
             nodes=[
                 PlanNodeProposal(
                     id="fallback-project-inspection",
                     description=(
-                        "Inspect the project structure, symbols, dependencies, and relevant tests "
-                        "to produce concrete evidence for the requested review"
+                        "Audit the project structure, configuration, dependencies, tests, and safe "
+                        "runtime evidence for the requested review"
                     ),
                     type="OPERATION",
                 )

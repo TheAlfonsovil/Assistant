@@ -13,6 +13,7 @@ from .domain.models import (
     IdleConfigurationRequest,
     Project,
     ProjectRequest,
+    Operation,
     TaskInputRequest,
     TaskRedefinitionRequest,
     TaskRequest,
@@ -58,7 +59,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.1.6", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
 
 
@@ -339,6 +340,7 @@ async def dashboard_data(request: Request):
     analytics = _dashboard_analytics(context, tasks, task_nodes, events)
     startup = context.startup
     runtime = request.app.state.runtime
+    system_result = await context.service.tools.execute(Operation(tool="system", method="info"))
     return {
         "health": {
             "status": startup.status,
@@ -382,8 +384,10 @@ async def dashboard_data(request: Request):
         "status_counts": status_counts,
         "node_status_counts": node_status_counts,
         "projects": [project.model_dump(mode="json") for project in projects],
+        "tools": [definition.model_dump(mode="json") for definition in context.service.tools.definitions()],
         "memories": [memory.model_dump(mode="json") for memory in memories],
         "devices": _dashboard_devices(context),
+        "system": system_result.output if system_result.success else {"error": system_result.error},
         "analytics": analytics,
     }
 

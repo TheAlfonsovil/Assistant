@@ -7,6 +7,7 @@ engine only sees the stable Tool contract and does not know about OS details.
 from __future__ import annotations
 
 import asyncio
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,13 @@ class FilesystemTool(Tool):
     definition = ToolDefinition(
         name="filesystem",
         description="Local filesystem operations",
-        methods=["read", "write", "list", "exists", "info", "search"],
+        methods=["read", "write", "create", "delete", "list", "exists", "info", "search"],
+        argument_schema={
+            "path": {"type": "string", "required": True},
+            "content": {"type": "string"},
+            "pattern": {"type": "string"},
+            "limit": {"type": "integer"},
+        },
         permissions=["filesystem"],
     )
 
@@ -60,6 +67,20 @@ class FilesystemTool(Tool):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 await asyncio.to_thread(path.write_text, content, encoding="utf-8")
                 output = {"path": str(path), "bytes": len(content.encode("utf-8"))}
+            elif method == "create":
+                content = args.get("content", "")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                def create_file() -> None:
+                    with path.open("x", encoding="utf-8") as stream:
+                        stream.write(content)
+                await asyncio.to_thread(create_file)
+                output = {"path": str(path), "created": True, "bytes": len(content.encode("utf-8"))}
+            elif method == "delete":
+                if path.is_dir():
+                    await asyncio.to_thread(shutil.rmtree, path)
+                else:
+                    await asyncio.to_thread(path.unlink)
+                output = {"path": str(path), "deleted": True}
             elif method == "list":
                 output = [entry.name for entry in path.iterdir()]
             else:
@@ -68,7 +89,7 @@ class FilesystemTool(Tool):
                 success=True,
                 output=output,
                 started_at=started,
-                side_effects=[method] if method == "write" else [],
+                side_effects=[method] if method in {"write", "create", "delete"} else [],
             )
         except FileNotFoundError as error:
             return OperationResult(
@@ -187,20 +208,46 @@ class GitTool(ShellTool):
 class ProjectTool(Tool):
     definition = ToolDefinition(
         name="project",
-        description="Inspect project structure, symbols and dependency relationships",
-        methods=["analyze"],
-        argument_schema={"root": {"type": "string"}, "max_files": {"type": "integer"}},
+        description="Inspect or audit a local project with bounded, redacted evidence",
+        methods=["analyze", "audit", "create"],
+        argument_schema={
+            "root": {"type": "string"},
+            "max_files": {"type": "integer"},
+            "name": {"type": "string"},
+            "template": {"type": "string"},
+        },
         permissions=["filesystem.read", "project.analysis"],
     )
 
     async def execute(self, method: str, args: dict[str, Any], timeout: float) -> OperationResult:
-        if method != "analyze" or not isinstance(args.get("root"), str):
+        if method not in self.definition.methods:
             return OperationResult(
                 success=False,
-                error="project.analyze requires a root directory",
+                error="project requires a supported method",
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
-        return await ProjectAnalyzer().analyze(args["root"], int(args.get("max_files", 500)))
+        if method == "create":
+            root = args.get("root")
+            name = args.get("name")
+            if not isinstance(root, str) or not isinstance(name, str) or not name.strip():
+                return OperationResult(success=False, error="project.create requires root and name", error_type=ErrorType.INVALID_ARGUMENT)
+            project_root = Path(root).resolve()
+            project_path = (project_root / name.strip()).resolve()
+            if project_path.parent != project_root:
+                return OperationResult(success=False, error="project name must create a direct child of root", error_type=ErrorType.INVALID_ARGUMENT)
+            try:
+                project_path.mkdir(parents=True, exist_ok=False)
+                return OperationResult(success=True, output={"path": str(project_path), "name": name.strip(), "template": args.get("template", "empty")}, side_effects=["project.created"])
+            except FileExistsError:
+                return OperationResult(success=False, error=f"project already exists: {project_path}", error_type=ErrorType.CONFLICT)
+            except OSError as error:
+                return OperationResult(success=False, error=str(error), error_type=ErrorType.TOOL_FAILURE)
+        if not isinstance(args.get("root"), str):
+            return OperationResult(success=False, error="project requires a root directory", error_type=ErrorType.INVALID_ARGUMENT)
+        analyzer = ProjectAnalyzer()
+        if method == "audit":
+            return await analyzer.audit(args["root"], int(args.get("max_files", 500)), timeout)
+        return await analyzer.analyze(args["root"], int(args.get("max_files", 500)))
 
 
 class DeploymentTool(ShellTool):

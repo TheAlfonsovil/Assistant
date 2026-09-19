@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
+import re
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,6 +62,111 @@ class ProjectAnalyzer:
                 started_at=started_at,
             )
 
+    async def audit(self, root: str, max_files: int = 500, timeout: float = 60.0) -> OperationResult:
+        """Collect safe project evidence and run an automatically detected test command."""
+        structural = await self.analyze(root, max_files)
+        if not structural.success:
+            return structural
+        project_root = Path(root).resolve()
+        files = [Path(project_root / relative) for relative in structural.output["files_analyzed"]]
+        manifests = {
+            "pyproject.toml",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "package.json",
+            "package-lock.json",
+            "poetry.lock",
+            "Pipfile",
+            "Pipfile.lock",
+            ".gitignore",
+            ".env.example",
+        }
+        configuration: dict[str, str] = {}
+        redaction = re.compile(r"(?i)(token|secret|password|passwd|api[_-]?key|private[_-]?key)")
+        for path in files:
+            if path.name not in manifests or path.stat().st_size > 128 * 1024:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            lines = []
+            for line in text.splitlines():
+                key = line.split("=", 1)[0].strip() if "=" in line else ""
+                lines.append(f"{key}=<redacted>" if key and redaction.search(key) else line)
+            configuration[path.relative_to(project_root).as_posix()] = "\n".join(lines)
+
+        test_files = [
+            path.relative_to(project_root).as_posix()
+            for path in files
+            if path.name.startswith("test_")
+            or path.name.endswith("_test.py")
+            or path.parts[-2:-1] == ("tests",)
+        ]
+        sensitive_files = [
+            path.relative_to(project_root).as_posix()
+            for path in files
+            if path.name in {".env", ".env.local", ".env.production"}
+        ]
+        test_command = self._test_command(project_root, configuration, test_files)
+        test_result = await self._run_test_command(test_command, project_root, timeout) if test_command else {
+            "available": False,
+            "reason": "No supported test command or test files detected",
+        }
+        structural.output.update({
+            "audit": {
+                "configuration": configuration,
+                "dependency_manifests": [name for name in configuration if Path(name).name not in {".gitignore", ".env.example"}],
+                "test_files": test_files[:500],
+                "test_command": test_command,
+                "test_result": test_result,
+                "sensitive_files": sensitive_files,
+                "sensitive_file_contents_read": False,
+                "limitations": [
+                    "Secret-bearing environment files are detected but never read.",
+                    "Sonar analysis is not run automatically; availability must be checked separately.",
+                ],
+            }
+        })
+        return structural
+
+    @staticmethod
+    def _test_command(root: Path, configuration: dict[str, str], test_files: list[str]) -> str | None:
+        if "pyproject.toml" in configuration and test_files:
+            return "python -m pytest -q"
+        if "requirements.txt" in configuration and test_files:
+            return "python -m pytest -q"
+        if "package.json" in configuration:
+            try:
+                scripts = json.loads(configuration["package.json"]).get("scripts", {})
+            except json.JSONDecodeError:
+                scripts = {}
+            if "test" in scripts:
+                return "npm test -- --if-present"
+        return None
+
+    @staticmethod
+    async def _run_test_command(command: str, cwd: Path, timeout: float) -> dict[str, object]:
+        try:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=max(1.0, timeout))
+            return {
+                "available": True,
+                "command": command,
+                "exit_code": process.returncode,
+                "stdout": stdout.decode(errors="replace")[-12000:],
+                "stderr": stderr.decode(errors="replace")[-12000:],
+            }
+        except asyncio.TimeoutError:
+            process.kill()
+            return {"available": True, "command": command, "timed_out": True}
+        except OSError as error:
+            return {"available": True, "command": command, "error": str(error)}
     @staticmethod
     def _collect_files(root: Path, max_files: int) -> list[Path]:
         if not root.exists() or not root.is_dir():

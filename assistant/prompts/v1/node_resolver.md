@@ -73,6 +73,9 @@ Rules:
 - When the node asks to inspect, review or understand a project, prefer `project.analyze`.
   Do not use `filesystem.exists` as a substitute for analysis. Use `filesystem.read` only
   for a specific file selected by the analysis result.
+- When the node asks to audit a project or report findings with evidence, prefer
+  `project.audit`; it reads bounded configuration safely, detects tests, and runs only
+  a supported test command when one is discoverable.
 - `project.analyze` example: {"tool":"project","method":"analyze","args":{"root":"C:/project","max_files":500}}
 - Project review example: {"action":"OPERATION","operation":{"tool":"project","method":"analyze","args":{"root":"C:/project","max_files":500},"timeout":300,"retry_policy":{},"idempotency_key":"audit-C:/project","metadata":{}},"subtasks":[],"reason":null}
 - For SUBTASKS, operation must be null and subtasks contains descriptions.

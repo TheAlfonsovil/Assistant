@@ -73,9 +73,27 @@ function renderEvents(events) {
   $("#event-stream").innerHTML = events.slice(0, 80).map((event) => `<div class="event"><i></i><div><strong>${esc(event.event_type)}</strong><small>${shortId(event.task_id)}${event.node_id ? ` · nodo ${shortId(event.node_id)}` : ""}</small></div><time>${date(event.created_at)}</time></div>`).join("") || `<div class="empty">Sin eventos.</div>`;
 }
 function renderResources(data) {
-  const devices = (data.devices || []).map((device) => `<div class="resource"><strong>${esc(device.name)} / ${esc(device.platform || "generic")}</strong><small>${esc(device.status)} · ${esc(device.transport || "local")}</small><p>${(device.capabilities || []).map(esc).join(" · ") || "Sin adaptador"}</p></div>`).join("");
-  const projects = (data.projects || []).map((project) => `<div class="resource-line"><span>${esc(project.name)}</span><small>${project.project_type} · ${project.enabled ? "activo" : "pausado"}</small></div>`).join("");
-  $("#resource-summary").innerHTML = `<div class="resource-group"><p class="kicker">DISPOSITIVOS</p>${devices || "<div class=empty>Sin dispositivos.</div>"}</div><div class="resource-group"><p class="kicker">PROYECTOS DE CÓDIGO</p>${projects || "<div class=empty>Sin proyectos.</div>"}</div><div class="resource-group"><p class="kicker">MEMORIA</p><strong>${data.memories.length} registros persistidos</strong></div>`;
+  const devices = (data.devices || []).map((device) => `<button class="resource resource-select" data-resource="device:${esc(device.name)}"><strong>${esc(device.name)} / ${esc(device.platform || "generic")}</strong><small>${esc(device.status)} · ${esc(device.transport || "local")}</small><p>${(device.capabilities || []).map(esc).join(" · ") || "Sin adaptador"}</p></button>`).join("");
+  const projects = (data.projects || []).map((project) => `<button class="resource resource-select" data-resource="project:${esc(project.id)}"><strong>${esc(project.name)} / ${esc(project.project_type || "code")}</strong><small>${project.enabled ? "ACTIVO" : "PAUSADO"} · ${project.is_default ? "default" : "registrado"}</small><p>${esc(project.description || project.path)}</p></button>`).join("");
+  const memories = (data.memories || []).map((memory) => `<button class="resource resource-select" data-resource="memory:${esc(memory.id)}"><strong>${esc(memory.key)}</strong><small>${esc(memory.kind)} · ${esc(memory.source || "USER")}</small><p>${esc(memoryPreview(memory.value))}</p></button>`).join("");
+  $("#resource-summary").innerHTML = `<div class="resource-group"><p class="kicker">DISPOSITIVOS</p>${devices || "<div class=empty>Sin dispositivos.</div>"}</div><div class="resource-group"><p class="kicker">PROYECTOS DE CÓDIGO</p>${projects || "<div class=empty>Sin proyectos.</div>"}</div><div class="resource-group"><p class="kicker">MEMORIA</p><div class="resource-count">${data.memories.length} registros persistidos</div>${memories || "<div class=empty>Sin memoria persistida.</div>"}</div>`;
+  $("#resource-summary").querySelectorAll("[data-resource]").forEach((item) => item.addEventListener("click", () => renderResourceDetail(item.dataset.resource, data)));
+}
+function memoryPreview(value) { const text = typeof value === "string" ? value : JSON.stringify(value); return text.length > 160 ? `${text.slice(0, 157)}...` : text; }
+function renderResourceDetail(resourceId, data) {
+  const [kind, id] = resourceId.split(":");
+  const resource = kind === "device" ? (data.devices || []).find((item) => item.name === id) : kind === "project" ? (data.projects || []).find((item) => item.id === id) : (data.memories || []).find((item) => item.id === id);
+  if (!resource) return;
+  if (kind === "memory") {
+    $("#resource-detail").className = "resource-detail";
+    $("#resource-detail").innerHTML = `<div class="resource-detail-head"><p class="kicker">MEMORIA PERSISTIDA</p><h3>${esc(resource.key)}</h3><small>${esc(resource.kind)} · ${esc(resource.source || "USER")} · confianza ${esc(resource.confidence)}</small></div><pre class="memory-value">${esc(json(resource.value))}</pre><div class="resource-facts"><span><small>USOS</small><b>${esc(resource.usage_count || 0)}</b></span><span><small>ACTUALIZADA</small><b>${esc(date(resource.updated_at))}</b></span><span><small>EXPIRA</small><b>${esc(date(resource.expires_at))}</b></span></div>`;
+    return;
+  }
+  const toolNames = kind === "device" ? resource.capabilities || [] : (data.tools || []).filter((tool) => tool.permissions.some((permission) => permission.startsWith("project") || permission.startsWith("filesystem") || permission.startsWith("deployment"))).map((tool) => tool.name);
+  const tools = (data.tools || []).filter((tool) => toolNames.includes(tool.name));
+  $("#resource-detail").className = "resource-detail";
+  const facts = kind === "device" ? data.system || {} : { path: resource.path, type: resource.project_type, codegraph: resource.codegraph_version ? `v${resource.codegraph_version}` : "no actualizado", last_audit: date(resource.last_audited_at) };
+  $("#resource-detail").innerHTML = `<div class="resource-detail-head"><p class="kicker">${kind === "device" ? "DISPOSITIVO" : "PROYECTO"}</p><h3>${esc(resource.name)}</h3><small>${esc(resource.description || resource.path || "")}</small></div><div class="resource-facts">${Object.entries(facts).map(([key, value]) => `<span><small>${esc(key)}</small><b>${esc(value)}</b></span>`).join("")}</div><div class="resource-tools"><strong>HERRAMIENTAS DISPONIBLES</strong>${tools.map((tool) => `<div><b>${esc(tool.name)}</b><span>${esc(tool.description)}</span><small>${tool.methods.map(esc).join(" · ")}</small></div>`).join("") || "<span>Sin herramientas registradas.</span>"}</div>`;
 }
 function renderChat(tasks) {
   const chats = tasks.filter((task) => task.source === "DASHBOARD_CHAT" || task.metadata?.interaction === "chat").slice(0, 20).reverse();

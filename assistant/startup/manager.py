@@ -140,6 +140,9 @@ class StartupManager:
             "architecture": platform.machine(),
             "python_version": platform.python_version(),
             "assistant_runtime": sys.implementation.name,
+            "hostname": platform.node(),
+            "cpu_count": str(__import__("os").cpu_count() or 0),
+            "working_directory": str(Path.cwd()),
         }
 
     def _user_profile(self) -> UserProfile | None:
