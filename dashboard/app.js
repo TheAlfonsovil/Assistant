@@ -36,13 +36,18 @@ function render(data) {
   $("#runtime-label").textContent = health.llm_ready ? "READY" : "DEGRADED";
   $("#health-dot").className = health.llm_ready ? "ready" : "warning";
   $("#runtime-dot").className = health.llm_ready ? "ready" : "warning";
-  $("#stats").innerHTML = [["ACTIVAS", active.length], ["COMPLETADAS", tasks.filter((task) => task.status === "SUCCEEDED").length], ["INCIDENTES", failed.length], ["LLM CALLS", data.analytics?.estimated_tokens?.total ? formatNumber(data.analytics.estimated_tokens.total) : 0]].map(([label, value]) => `<div class="stat"><small>${label}</small><strong>${value}</strong></div>`).join("");
+  const displayTokens = data.analytics?.display_tokens || data.analytics?.estimated_tokens || {};
+  const tokenLabel = displayTokens.source === "ollama" ? "TOKENS REALES" : displayTokens.source === "ollama_partial" ? "TOKENS REALES*" : "TOKENS EST.";
+  $("#stats").innerHTML = [["ACTIVAS", active.length], ["COMPLETADAS", tasks.filter((task) => task.status === "SUCCEEDED").length], ["INCIDENTES", failed.length], [tokenLabel, displayTokens.total ? formatNumber(displayTokens.total) : 0]].map(([label, value]) => `<div class="stat"><small>${label}</small><strong>${value}</strong></div>`).join("");
   renderMetrics(metrics); renderChart(data.status_counts || {}); renderAnalytics(data.analytics || {}); renderTasks(tasks); renderEvents(data.events || []); renderResources(data); renderChat(tasks); fillProjects(data.projects || []); renderIdle(runtime.idle || {});
   if (state.selectedTask) { renderInspector(state.selectedTask); renderTrace(state.selectedTask); }
 }
 function renderMetrics(metrics) {
   const values = [["Pasadas", metrics.passes], ["Despachos", metrics.tasks_dispatched], ["Errores", metrics.task_errors], ["Pasadas idle", metrics.idle_passes], ["Sin LLM", metrics.not_ready_passes], ["Errores runtime", metrics.runtime_errors]];
   $("#runtime-metrics").innerHTML = values.map(([label, value]) => `<div class="metric"><small>${label}</small><b>${value ?? 0}</b></div>`).join("");
+  $("#runtime-passes").textContent = formatNumber(metrics.passes);
+  $("#runtime-dispatches").textContent = formatNumber(metrics.tasks_dispatched);
+  $("#runtime-errors").textContent = formatNumber(metrics.task_errors + metrics.runtime_errors);
 }
 function renderChart(counts) {
   const total = Math.max(1, Object.values(counts).reduce((sum, value) => sum + value, 0));
@@ -50,9 +55,10 @@ function renderChart(counts) {
   $("#status-chart").innerHTML = order.filter((key) => counts[key]).map((key) => `<div class="bar-line"><span>${key}</span><i><b style="width:${Math.max(5, counts[key] / total * 100)}%"></b></i><strong>${counts[key]}</strong></div>`).join("") || `<div class="empty">Sin tareas persistidas.</div>`;
 }
 function renderAnalytics(analytics) {
-  const tokens = analytics.estimated_tokens || {}, throughput = analytics.throughput || {}, latency = analytics.latency || {};
+  const tokens = analytics.display_tokens || analytics.estimated_tokens || {}, throughput = analytics.throughput || {}, latency = analytics.latency || {};
   $("#analytics-note").textContent = analytics.model || "modelo configurado";
-  $("#analytics-kpis").innerHTML = [["TOKENS EST.", formatNumber(tokens.total)], ["ÉXITO", `${throughput.success_rate ?? 0}%`], ["PREFILL", formatSeconds(latency.prefill_seconds)], ["GENERACIÓN", formatSeconds(latency.generation_seconds)], ["TOKENS/S", formatNumber(latency.generation_tokens_per_second)], ["REINTENTOS", throughput.retries ?? 0]].map(([label, value]) => `<div><small>${label}</small><b>${value}</b></div>`).join("");
+  const tokenLabel = tokens.source === "ollama" ? "TOKENS REALES" : tokens.source === "ollama_partial" ? "TOKENS REALES*" : "TOKENS EST.";
+  $("#analytics-kpis").innerHTML = [[tokenLabel, formatNumber(tokens.total)], ["ÉXITO", `${throughput.success_rate ?? 0}%`], ["PREFILL", formatSeconds(latency.prefill_seconds)], ["GENERACIÓN", formatSeconds(latency.generation_seconds)], ["TOKENS/S", formatNumber(latency.generation_tokens_per_second)], ["REINTENTOS", throughput.retries ?? 0]].map(([label, value]) => `<div><small>${label}</small><b>${value}</b></div>`).join("");
   const phases = analytics.phase_counts || {};
   const phaseRows = Object.entries(phases).map(([phase, count]) => `<div class="analysis-row"><span>${esc(phase)}</span><b>${count} intercambios</b></div>`).join("");
   $("#llm-analysis").innerHTML = `<div class="timing-split"><div><small>PREFILL / entrada</small><i><b style="width:${timingRatio(latency.prefill_seconds, latency.prefill_seconds + latency.generation_seconds)}%"></b></i></div><div><small>GENERACIÓN / salida</small><i><b class="generation-bar" style="width:${timingRatio(latency.generation_seconds, latency.prefill_seconds + latency.generation_seconds)}%"></b></i></div></div>${phaseRows || `<div class="empty">Aún no hay actividad LLM.</div>`}`;
@@ -80,24 +86,60 @@ function fillProjects(projects) {
   const trace = $("#trace-task"), current = trace.value; trace.innerHTML = `<option value="">Selecciona una tarea</option>` + (state.data?.tasks || []).map((task) => `<option value="${task.id}">${esc(task.goal)} · ${esc(task.status)}</option>`).join(""); trace.value = current || state.selectedTask || "";
 }
 function taskEvents(taskId) { return state.data?.task_events?.[taskId] || (state.data?.events || []).filter((event) => event.task_id === taskId); }
-function llmEvents(taskId) { return taskEvents(taskId).filter((event) => ["LLM_REQUEST", "LLM_RESPONSE"].includes(event.event_type)); }
+function llmEvents(taskId) { return taskEvents(taskId).filter((event) => ["LLM_REQUEST", "LLM_RESPONSE", "LLM_ERROR", "LLM_SKIPPED"].includes(event.event_type)); }
+function taskActivity(taskId) {
+  const events = taskEvents(taskId);
+  const event = events[events.length - 1];
+  if (!event) return { label: "Esperando actividad", detail: "La tarea aún no ha emitido eventos." };
+  const labels = {
+    TASK_CREATED: "Tarea creada",
+    TASK_PLANNED: "Planner preparando el grafo",
+    LLM_REQUEST: `${event.payload?.role || "LLM"} preparando contexto`,
+    LLM_RESPONSE: `${event.payload?.role || "LLM"} respondió`,
+    NODE_STARTED: "Ejecutando nodo",
+    TOOL_CALLED: `Ejecutando ${event.payload?.tool || "herramienta"}.${event.payload?.method || ""}`,
+    TOOL_RESULT: "Resultado de herramienta recibido",
+    NODE_VERIFIED: `Nodo verificado: ${event.payload?.decision || "resultado"}`,
+    NODE_COMPLETED: "Nodo completado",
+    LLM_ERROR: `Error LLM (${event.payload?.role || "modelo"})`,
+    LLM_SKIPPED: `Llamada LLM omitida: ${event.payload?.reason || "sin motivo"}`,
+    FINAL_RESPONSE_READY: "Informe final generado",
+    FINAL_RESPONSE_STARTED: "Generando informe final",
+    FINAL_RESPONSE_FAILED: "Falló la generación del informe final",
+    FINAL_RESPONSE_FALLBACK: `Informe alternativo: ${event.payload?.reason || "sin motivo"}`,
+    TASK_COMPLETED: "Tarea completada",
+    TASK_FAILED: "Tarea fallida",
+  };
+  return { label: labels[event.event_type] || event.event_type, detail: date(event.created_at) };
+}
 function renderTrace(taskId) {
   if (!taskId || !state.data) return;
   const events = llmEvents(taskId);
   $("#trace-workspace").innerHTML = events.map((event, index) => {
-    const payload = event.payload || {}, isRequest = event.event_type === "LLM_REQUEST";
+    const payload = event.payload || {}, isRequest = event.event_type === "LLM_REQUEST", isError = ["LLM_ERROR", "LLM_SKIPPED"].includes(event.event_type);
     const request = isRequest ? payload.context : null;
     const response = isRequest ? null : (payload.response || payload);
-    const renderedPrompt = !isRequest && payload.request ? payload.request.rendered_instructions : null;
-    const body = isRequest ? `<div class="trace-block"><label>CONTEXTO ESTRUCTURADO</label><pre>${esc(json(request))}</pre></div>` : `<div class="trace-block"><label>RESPUESTA VALIDADA</label><pre>${esc(json(response))}</pre></div>${renderedPrompt ? `<details class="trace-prompt"><summary>PROMPT RENDERIZADO REAL · ${payload.request.prompt_chars} caracteres</summary><pre>${esc(renderedPrompt)}</pre></details>` : ""}`;
-    return `<article class="llm-card"><header><span class="trace-number">${String(index + 1).padStart(2, "0")}</span><div><strong>${isRequest ? "REQUEST / contexto enviado" : "RESPONSE / respuesta recibida"}</strong><small>${esc(payload.role || "LLM")} · ${date(event.created_at)} · ${payload.context_chars || payload.response_chars || 0} caracteres</small></div><em>${isRequest ? "OUT" : "IN"}</em></header><div class="trace-meta"><span>${isRequest ? "Contexto al proveedor" : "Decisión + prompt real"}</span><span>${payload.usage ? `${payload.usage.prompt_eval_count || 0} prompt · ${payload.usage.eval_count || 0} response tokens` : "telemetría no disponible"}</span></div>${body}</article>`;
+    const renderedPrompt = payload.request ? payload.request.rendered_instructions : null;
+    const body = isRequest ? `<div class="trace-block"><label>CONTEXTO ESTRUCTURADO</label><pre>${esc(json(request))}</pre></div>` : isError ? `<div class="trace-block trace-error"><label>${event.event_type === "LLM_SKIPPED" ? "LLAMADA OMITIDA" : "ERROR REAL DEL PROVEEDOR"}</label><pre>${esc(json({ type: payload.error_type, error: payload.error || payload.reason }))}</pre></div>` : `<div class="trace-block"><label>RESPUESTA VALIDADA</label><pre>${esc(json(response))}</pre></div>`;
+    const prompt = renderedPrompt ? `<details class="trace-prompt"><summary>PROMPT RENDERIZADO REAL · ${payload.request.prompt_chars} caracteres</summary><pre>${esc(renderedPrompt)}</pre></details>` : "";
+    const title = isRequest ? "REQUEST / contexto enviado" : isError ? "ERROR / llamada fallida" : "RESPONSE / respuesta recibida";
+    return `<article class="llm-card ${isError ? "llm-error" : ""}"><header><span class="trace-number">${String(index + 1).padStart(2, "0")}</span><div><strong>${title}</strong><small>${esc(payload.role || "LLM")} · ${date(event.created_at)} · ${payload.context_chars || payload.response_chars || 0} caracteres</small></div><em>${isRequest ? "OUT" : isError ? "ERR" : "IN"}</em></header><div class="trace-meta"><span>${isRequest ? "Contexto al proveedor" : isError ? esc(payload.error_type || "error") : "Decisión + prompt real"}</span><span>${payload.usage ? `${payload.usage.prompt_eval_count || 0} prompt · ${payload.usage.eval_count || 0} response tokens` : "telemetría no disponible"}</span></div>${body}${prompt}</article>`;
   }).join("") || `<div class="empty">Esta tarea aún no tiene intercambios LLM persistidos.</div>`;
 }
 function renderInspector(taskId) {
   const task = state.data?.tasks.find((item) => item.id === taskId); if (!task) return;
-  const nodes = state.data.task_nodes[taskId] || [], usage = (state.data.analytics?.task_usage || []).find((item) => item.id === taskId);
+  const nodes = state.data.task_nodes[taskId] || [], edges = state.data.task_edges[taskId] || [], events = taskEvents(taskId), usage = (state.data.analytics?.task_usage || []).find((item) => item.id === taskId), finalResponse = task.final_response || task.metadata?.final_response || (task.result_summary ? { response_type: "execution_summary", title: "Resumen de ejecución", summary: task.result_summary, evidence: [], limitations: ["Esta tarea no conserva un informe LLM final."] } : null);
+  const activity = taskActivity(taskId);
+  const tokenValue = usage?.actual_tokens_available ? formatNumber(usage.actual_tokens) : `~${formatNumber(usage?.estimated_tokens || 0)}`;
+  const tokenLabel = usage?.actual_tokens_available ? "TOKENS" : "TOKENS EST.";
+  const graphRows = nodes.map((node, index) => {
+    const incoming = edges.filter((edge) => edge.to_node === node.id).map((edge) => `${shortId(edge.from_node)} → ${edge.dependency_type}`).join(" · ");
+    return `<div class="node-row graph-node"><span class="node-order">${String(index + 1).padStart(2, "0")}</span><i class="status-mark status-${esc(node.status)}"></i><div><strong>${esc(node.description)}</strong><small>${esc(node.type)} · ${esc(node.status)}${incoming ? ` · depende de ${esc(incoming)}` : " · nodo inicial"}${node.error ? ` · ${esc(node.error)}` : ""}</small></div></div>`;
+  }).join("");
+  const eventRows = events.slice(-12).reverse().map((event) => `<div class="inspector-event"><span>${date(event.created_at)}</span><strong>${esc(event.event_type)}</strong><small>${event.node_id ? `nodo ${shortId(event.node_id)}` : "tarea"}</small></div>`).join("");
   $("#task-inspector").className = "panel inspector";
-  $("#task-inspector").innerHTML = `<div class="inspector-head"><div><p class="kicker">TASK INSPECTOR</p><h3>${esc(task.goal)}</h3><small>${shortId(task.id)} · ${esc(task.status)}</small></div><span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div><div class="inspector-actions">${["WAITING", "BLOCKED"].includes(task.status) ? `<button class="button primary" data-action="input">Resolver</button>` : ""}${task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : ""}${!["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? `<button class="button ghost" data-action="cancel">Cancelar</button>` : ""}<button class="button ghost" data-action="trace">Ver LLM trace</button></div><div class="usage-strip"><span>LLM <b>${usage?.llm_calls || 0}</b></span><span>TOOLS <b>${usage?.tool_calls || 0}</b></span><span>NODOS <b>${nodes.length}</b></span><span>TOKENS <b>${formatNumber(usage?.estimated_tokens || 0)}</b></span></div><p class="kicker">NODOS DEL GRAFO</p><div class="node-list">${nodes.map((node) => `<div class="node-row"><i class="status-mark status-${esc(node.status)}"></i><div><strong>${esc(node.description)}</strong><small>${esc(node.type)} · ${esc(node.status)}${node.error ? ` · ${esc(node.error)}` : ""}</small></div></div>`).join("") || "<div class=empty>Sin nodos.</div>"}</div>`;
+  const report = finalResponse ? `<section class="final-report"><div class="final-report-head"><p class="kicker">RESPUESTA FINAL</p><span class="badge status-${esc(task.status)}">${esc(finalResponse.response_type || "report")}</span></div><h4>${esc(finalResponse.title || "Resultado de la tarea")}</h4><p>${esc(finalResponse.summary || "")}</p>${Object.entries(finalResponse.sections || {}).map(([title, items]) => `<div class="final-report-section"><strong>${esc(title)}</strong><ul>${(items || []).map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>`).join("")} ${(finalResponse.evidence || []).length ? `<div class="final-report-section"><strong>Evidencia</strong><ul>${finalResponse.evidence.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}${(finalResponse.limitations || []).length ? `<div class="final-report-section report-limitations"><strong>Limitaciones</strong><ul>${finalResponse.limitations.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</section>` : "";
+  $("#task-inspector").innerHTML = `<div class="inspector-head"><div><p class="kicker">TASK INSPECTOR</p><h3>${esc(task.goal)}</h3><small>${shortId(task.id)} · ${esc(task.status)}</small></div><span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div><div class="inspector-activity"><span class="activity-pulse"></span><div><strong>${esc(activity.label)}</strong><small>${esc(activity.detail)}</small></div></div>${report}<div class="inspector-actions">${["WAITING", "BLOCKED"].includes(task.status) ? `<button class="button primary" data-action="input">Resolver</button>` : ""}${task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : ""}${!["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? `<button class="button ghost" data-action="cancel">Cancelar</button>` : ""}<button class="button ghost" data-action="trace">Ver LLM trace</button></div><div class="usage-strip"><span>LLM <b>${usage?.llm_calls || 0}</b></span><span>TOOLS <b>${usage?.tool_calls || 0}</b></span><span>NODOS <b>${nodes.length}</b></span><span>${tokenLabel} <b>${tokenValue}</b></span></div><p class="kicker">RECORRIDO DEL GRAFO · ${edges.length} DEPENDENCIAS</p><div class="node-list">${graphRows || "<div class=empty>Sin nodos planificados.</div>"}</div><p class="kicker inspector-events-title">TRANSICIONES RECIENTES</p><div class="inspector-events">${eventRows || "<div class=empty>Sin eventos.</div>"}</div>`;
   $("#task-inspector").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => taskAction(button.dataset.action, task)));
 }
 function selectTask(taskId) { state.selectedTask = taskId; renderTasks(state.data.tasks); renderInspector(taskId); renderTrace(taskId); }
@@ -116,4 +158,4 @@ $("#trace-task").addEventListener("change", (event) => { state.selectedTask = ev
 $("#new-task").addEventListener("click", () => $("#modal").classList.remove("hidden")); $("#close-modal").addEventListener("click", () => $("#modal").classList.add("hidden"));
 $("#task-form").addEventListener("submit", async (event) => { event.preventDefault(); try { const body = { goal: $("#goal").value, priority: Number($("#priority").value || 0) }; if ($("#project").value) body.project_id = $("#project").value; const task = await api("/tasks", { method: "POST", body: JSON.stringify(body) }); $("#modal").classList.add("hidden"); $("#goal").value = ""; await load(); selectTask(task.id); setView("tasks"); } catch (error) { toast(error.message, true); } });
 $("#chat-form").addEventListener("submit", async (event) => { event.preventDefault(); try { await api("/chat", { method: "POST", body: JSON.stringify({ message: $("#chat-message").value, project_id: $("#chat-project").value || null }) }); $("#chat-message").value = ""; toast("Consulta enviada a la cola"); await load(); } catch (error) { toast(error.message, true); } });
-setView("overview"); load(); window.setInterval(load, 5000);
+setView("overview"); load(); window.setInterval(load, 60000);

@@ -14,9 +14,6 @@ ASSISTANT STATE
 EXECUTION EVIDENCE
 {{execution_evidence}}
 
-LONG-TERM MEMORY
-{{long_term_memory}}
-
 RESPONSE RULES
 - Return JSON only and follow the output schema.
 - Choose response_type: answer, report, plan, clarification, blocked, or action_proposal.
@@ -25,6 +22,17 @@ RESPONSE RULES
 - Summarize only evidence present in execution events and tool outputs.
 - Do not claim that the whole project was read unless a project/codegraph operation succeeded and its file_count is present.
 - Keep the response concise and human-readable. Put details in named sections, not one huge paragraph.
+
+RESPONSE CONTRACT
+- Return every required field in the JSON schema. Use [] for unused lists and
+	{} for unused sections rather than omitting fields.
+- Separate facts supported by evidence from interpretation. Mention missing or
+	partial evidence in limitations and lower confidence when appropriate.
+- For an audit, prefer sections such as "Resumen", "Hallazgos", "Evidencia",
+	"Riesgos" and "Siguientes pasos". Do not fabricate file names, test results,
+	token counts, tool output, or completed actions.
+- Example shape:
+	{"response_type":"report","title":"Auditoría del proyecto","summary":"...","sections":{"Hallazgos":["..."]},"next_actions":["..."],"findings":["..."],"recommendations":["..."],"evidence":["..."],"limitations":["..."],"confidence":"medium"}
 
 OUTPUT SCHEMA
 {{output_schema}}

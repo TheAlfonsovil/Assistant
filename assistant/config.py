@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     tool_timeout: float = 60.0
     lease_seconds: int = 300
-    ollama_timeout: float = 1800.0
+    ollama_timeout: float = 36000.0
     ollama_temperature: float = 0.1
     ollama_num_ctx: int = 32768
     ollama_thinking: bool = False
@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     ollama_max_prompt_chars: int = 200000
     ollama_max_response_chars: int = 1000000
     task_max_execution_time: float = 86400.0
+    final_response_timeout: float = 36000.0
     task_max_steps: int = 1000
     idle_enabled: bool = True
     collect_system_facts: bool = True

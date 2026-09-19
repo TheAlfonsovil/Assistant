@@ -3,35 +3,61 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Assistant / Operations</title>
+  <title>Assistant / Control room</title>
   <link rel="stylesheet" href="/dashboard/style.css">
 </head>
 <body>
-  <div class="shell">
+  <div class="app-shell">
     <aside class="sidebar">
-      <div class="identity"><span class="mark">A</span><div><strong>Assistant</strong><small>operations console</small></div></div>
-      <div class="sidebar-label">WORKSPACE</div>
+      <div class="brand"><span class="brand-mark">A</span><span><strong>Assistant</strong><small>CONTROL ROOM</small></span></div>
+      <div class="nav-group-label">OPERACIÓN</div>
       <nav class="nav" aria-label="Navegación principal">
-        <button class="nav-item active" data-view="overview"><span>01</span>Resumen</button>
-        <button class="nav-item" data-view="tasks"><span>02</span>Tareas</button>
-        <button class="nav-item" data-view="trace"><span>03</span>LLM trace</button>
-        <button class="nav-item" data-view="activity"><span>04</span>Actividad</button>
-        <button class="nav-item" data-view="resources"><span>05</span>Recursos</button>
-        <button class="nav-item" data-view="chat"><span>06</span>Chat</button>
+        <button class="nav-item active" data-view="overview"><span class="nav-icon">◈</span><span>Resumen</span><kbd>01</kbd></button>
+        <button class="nav-item" data-view="tasks"><span class="nav-icon">≡</span><span>Cola de trabajo</span><kbd>02</kbd></button>
+        <button class="nav-item" data-view="trace"><span class="nav-icon">⌁</span><span>Observabilidad LLM</span><kbd>03</kbd></button>
       </nav>
-      <div class="sidebar-footer"><div class="runtime-state"><i id="runtime-dot"></i><div><small>RUNTIME</small><b id="runtime-label">Conectando</b></div></div><button id="idle-toggle" class="idle-button" type="button" aria-pressed="false"><i></i><span>Idle</span><b id="idle-status">--</b></button></div>
+      <div class="nav-group-label">SISTEMA</div>
+      <nav class="nav" aria-label="Navegación del sistema">
+        <button class="nav-item" data-view="activity"><span class="nav-icon">·</span><span>Actividad</span><kbd>04</kbd></button>
+        <button class="nav-item" data-view="resources"><span class="nav-icon">◇</span><span>Recursos</span><kbd>05</kbd></button>
+        <button class="nav-item" data-view="chat"><span class="nav-icon">↗</span><span>Conversación</span><kbd>06</kbd></button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="runtime-card"><span class="status-dot" id="runtime-dot"></span><div><small>RUNTIME</small><strong id="runtime-label">Conectando</strong></div><span class="runtime-pulse"></span></div>
+        <button id="idle-toggle" class="idle-button" type="button" aria-pressed="false"><span class="idle-switch"><i></i></span><span>Modo idle</span><b id="idle-status">--</b></button>
+        <span class="build-label">LOCAL INSTANCE · 24/7</span>
+      </div>
     </aside>
+
     <main class="main">
-      <header class="topbar"><div><p class="kicker">LOCAL CONTROL PLANE</p><h1 id="view-title">Resumen operativo</h1></div><div class="top-actions"><span id="last-refresh">Conectando...</span><button id="refresh" class="icon-button" title="Actualizar">↻</button><button id="reset-memory" class="button danger">Restablecer estado</button><a href="/docs" class="button ghost">API</a></div></header>
-      <section class="view active" data-view-panel="overview"><div class="hero-line"><div><p class="kicker">OBSERVABILITY / 24·7</p><h2>El sistema, sin niebla.</h2><p>Cola persistente, salud del runtime y conversaciones completas con el modelo.</p></div><div class="health"><i id="health-dot"></i><div><small>ESTADO</small><strong id="hero-status">--</strong></div></div></div><div id="stats" class="stats"></div><div class="overview-grid"><section class="panel"><div class="panel-head"><div><p class="kicker">THROUGHPUT</p><h3>Actividad del runtime</h3></div><span class="live">LIVE</span></div><div id="runtime-metrics" class="metric-grid"></div><div id="status-chart" class="status-chart"></div></section><section class="panel"><div class="panel-head"><div><p class="kicker">LLM TELEMETRY</p><h3>Uso del modelo</h3></div><span id="analytics-note" class="muted">--</span></div><div id="analytics-kpis" class="analytics-kpis"></div><div id="llm-analysis" class="analysis-list"></div></section></div></section>
-      <section class="view" data-view-panel="tasks"><div class="section-head"><div><p class="kicker">WORK QUEUE</p><h2>Tareas persistentes</h2></div><div class="section-actions"><input id="task-filter" class="input" placeholder="Filtrar por texto"><button id="new-task" class="button primary">+ Nueva tarea</button></div></div><div class="task-layout"><section class="panel task-panel"><div id="task-list" class="task-list"></div></section><section id="task-inspector" class="panel inspector empty-inspector"><div class="empty">Selecciona una tarea para inspeccionarla.</div></section></div></section>
-      <section class="view" data-view-panel="trace"><div class="section-head"><div><p class="kicker">MODEL OBSERVABILITY</p><h2>Conversaciones LLM</h2><p class="section-copy">Contexto exacto enviado, respuesta validada y decisiones que produjo.</p></div><select id="trace-task" class="input"><option value="">Selecciona una tarea</option></select></div><section id="trace-workspace" class="panel trace-workspace"><div class="empty">Selecciona una tarea para ver sus intercambios con el LLM.</div></section></section>
-      <section class="view" data-view-panel="activity"><div class="section-head"><div><p class="kicker">EVENT STREAM</p><h2>Actividad reciente</h2></div></div><section class="panel"><div id="event-stream" class="event-stream"></div></section></section>
-      <section class="view" data-view-panel="resources"><div class="section-head"><div><p class="kicker">ENVIRONMENT</p><h2>Recursos conectados</h2></div></div><section class="panel"><div id="resource-summary" class="resource-summary"></div></section></section>
-      <section class="view" data-view-panel="chat"><div class="section-head"><div><p class="kicker">CONVERSATION</p><h2>Chat persistente</h2></div></div><section class="panel chat-panel"><div id="chat-history" class="chat-history"></div><form id="chat-form" class="chat-form"><textarea id="chat-message" required placeholder="Escribe una consulta o una orden..."></textarea><select id="chat-project" class="input"><option value="">Sin proyecto</option></select><button class="button primary">Enviar</button></form></section></section>
+      <header class="topbar">
+        <div class="breadcrumb"><span>ASSISTANT</span><i>/</i><strong id="view-title">Resumen operativo</strong></div>
+        <div class="top-actions"><span id="last-refresh">Conectando...</span><button id="refresh" class="icon-button" title="Actualizar datos" aria-label="Actualizar datos">↻</button><a href="/docs" class="text-button">API docs <span>↗</span></a><button id="reset-memory" class="button danger">Limpiar estado</button></div>
+      </header>
+
+      <section class="view active" data-view-panel="overview">
+        <div class="page-intro overview-intro"><div><p class="eyebrow">CONTROL ROOM <span class="eyebrow-live">● LIVE</span></p><h1>Buenos días, <em>Assistant.</em></h1><p class="intro-copy">Una lectura rápida de lo que está ocurriendo ahora mismo.</p></div><div class="health-card"><span id="health-dot" class="status-dot"></span><div><small>ESTADO DEL SISTEMA</small><strong id="hero-status">--</strong></div><span class="health-arrow">↗</span></div></div>
+        <div id="stats" class="stats"></div>
+        <div class="overview-grid">
+          <section class="panel queue-panel"><div class="panel-head"><div><p class="eyebrow">WORKLOAD</p><h2>Flujo de trabajo</h2></div><button class="link-button" data-view="tasks">Ver cola <span>→</span></button></div><div id="status-chart" class="status-chart"></div><div class="runtime-strip"><div><small>PASADAS</small><strong id="runtime-passes">--</strong></div><div><small>DESPACHOS</small><strong id="runtime-dispatches">--</strong></div><div><small>ERRORES</small><strong id="runtime-errors">--</strong></div></div></section>
+          <section class="panel model-panel"><div class="panel-head"><div><p class="eyebrow">MODEL HEALTH</p><h2>Rendimiento LLM</h2></div><span id="analytics-note" class="model-name">--</span></div><div id="analytics-kpis" class="analytics-kpis"></div><div id="llm-analysis" class="analysis-list"></div></section>
+        </div>
+        <div class="overview-lower"><section class="panel metrics-panel"><div class="panel-head"><div><p class="eyebrow">RUNTIME</p><h2>Salud del proceso</h2></div><span class="panel-caption">Actualización automática</span></div><div id="runtime-metrics" class="metric-grid"></div></section><section class="panel focus-panel"><div class="panel-head"><div><p class="eyebrow">NEXT ACTION</p><h2>Trabaja con intención</h2></div></div><p>Consulta la cola para continuar una tarea, o abre una conversación para crear trabajo nuevo.</p><div class="focus-actions"><button class="button primary" data-view="tasks">Abrir tareas <span>→</span></button><button class="button secondary" data-view="chat">Nueva conversación <span>↗</span></button></div></section></div>
+      </section>
+
+      <section class="view" data-view-panel="tasks"><div class="page-intro"><div><p class="eyebrow">WORK QUEUE</p><h1>Cola de trabajo</h1><p class="intro-copy">Cada tarea tiene un estado, una evidencia y un siguiente paso.</p></div><button id="new-task" class="button primary">+ Nueva tarea</button></div><div class="toolbar"><div class="toolbar-title"><span class="toolbar-dot"></span><strong>Tareas persistentes</strong><span class="toolbar-count">actualizadas en vivo</span></div><input id="task-filter" class="input" placeholder="Buscar tareas..." aria-label="Buscar tareas"></div><div class="task-layout"><section class="panel task-panel"><div id="task-list" class="task-list"></div></section><section id="task-inspector" class="panel inspector empty-inspector"><div class="empty"><span class="empty-icon">↗</span><strong>Selecciona una tarea</strong><span>Su estado, nodos y acciones aparecerán aquí.</span></div></section></div></section>
+
+      <section class="view" data-view-panel="trace"><div class="page-intro trace-intro"><div><p class="eyebrow">MODEL OBSERVABILITY</p><h1>Observabilidad LLM</h1><p class="intro-copy">El contexto enviado, la respuesta validada y la decisión resultante.</p></div><select id="trace-task" class="input"><option value="">Selecciona una tarea</option></select></div><section id="trace-workspace" class="trace-workspace"><div class="empty panel"><span class="empty-icon">⌁</span><strong>Selecciona una tarea para inspeccionar el modelo</strong><span>Las conversaciones aparecerán aquí.</span></div></section></section>
+
+      <section class="view" data-view-panel="activity"><div class="page-intro"><div><p class="eyebrow">EVENT STREAM</p><h1>Actividad</h1><p class="intro-copy">La secuencia de eventos que mantiene el sistema en movimiento.</p></div></div><section class="panel activity-panel"><div class="activity-head"><span>EVENTO</span><span>TAREA</span><span>MOMENTO</span></div><div id="event-stream" class="event-stream"></div></section></section>
+
+      <section class="view" data-view-panel="resources"><div class="page-intro"><div><p class="eyebrow">ENVIRONMENT</p><h1>Recursos</h1><p class="intro-copy">Dispositivos, proyectos y memoria disponibles para el runtime.</p></div></div><section class="panel resource-panel"><div id="resource-summary" class="resource-summary"></div></section></section>
+
+      <section class="view" data-view-panel="chat"><div class="page-intro"><div><p class="eyebrow">CONVERSATION</p><h1>Conversación</h1><p class="intro-copy">Da una orden o pide al Assistant que se ocupe de algo.</p></div></div><section class="panel chat-panel"><div class="chat-header"><span class="status-dot ready"></span><div><strong>Assistant</strong><small>Listo para trabajar</small></div></div><div id="chat-history" class="chat-history"></div><form id="chat-form" class="chat-form"><textarea id="chat-message" required placeholder="¿Qué necesitas que haga?" aria-label="Mensaje"></textarea><div class="chat-controls"><select id="chat-project" class="input"><option value="">Sin proyecto</option></select><button class="button primary">Enviar <span>↗</span></button></div></form></section></section>
     </main>
   </div>
-  <div id="modal" class="modal hidden"><div class="modal-card"><div class="panel-head"><div><p class="kicker">NEW TASK</p><h3>Lanzar tarea</h3></div><button id="close-modal" class="icon-button">×</button></div><form id="task-form"><label>Objetivo<textarea id="goal" required placeholder="Ej.: revisa el proyecto y ejecuta los tests"></textarea></label><label>Proyecto<select id="project" class="input"><option value="">Resolver automáticamente</option></select></label><label>Prioridad<input id="priority" class="input" type="number" value="0"></label><button class="button primary">Enviar al runtime</button></form></div></div>
+
+  <div id="modal" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><p class="eyebrow">NEW TASK</p><h2>Lanzar tarea</h2></div><button id="close-modal" class="icon-button" aria-label="Cerrar">×</button></div><form id="task-form"><label>Objetivo<textarea id="goal" required placeholder="Ej.: revisa el proyecto y ejecuta los tests"></textarea></label><label>Proyecto<select id="project" class="input"><option value="">Resolver automáticamente</option></select></label><label>Prioridad<input id="priority" class="input" type="number" value="0"></label><button class="button primary">Enviar al runtime <span>→</span></button></form></div></div>
   <div id="toast" class="toast"></div>
   <script src="/dashboard/app.js"></script>
 </body>

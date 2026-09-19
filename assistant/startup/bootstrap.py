@@ -66,6 +66,7 @@ async def create_context(
         event_sink=event_sink,
         workspace_root=resolved_settings.workspace_root,
         default_execution_time=resolved_settings.task_max_execution_time,
+        final_response_timeout=resolved_settings.final_response_timeout,
         max_steps=resolved_settings.task_max_steps,
     )
     return AssistantContext(database, session, service, startup, resolved_settings)

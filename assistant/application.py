@@ -35,7 +35,7 @@ from .domain.models import (
 )
 from .infrastructure.orm import IdempotencyRow, LeaseRow
 from .infrastructure.repositories import TaskRepository
-from .llm import AssistantResponse, LLMProvider
+from .llm import AssistantResponse, LLMProvider, PlanNodeProposal, PlanProposal
 from .observability import compact
 from .planning import plan_coverage_warnings, validate_plan_quality
 from .planning import plan_coverage_warnings, validate_plan_quality
@@ -57,6 +57,7 @@ class TaskService:
         event_sink=None,
         workspace_root: str = ".",
         default_execution_time: float | None = None,
+        final_response_timeout: float = 36000.0,
         max_steps: int = 1000,
     ):
         self.repository = TaskRepository(session, event_sink=event_sink)
@@ -67,6 +68,7 @@ class TaskService:
         self.scheduler = NodeScheduler()
         self.context_builder = ContextBuilder(self.repository, tools, workspace_root=workspace_root)
         self.default_execution_time = default_execution_time
+        self.final_response_timeout = max(1.0, final_response_timeout)
         self.max_steps = max(1, max_steps)
         self.owner = f"{socket.gethostname()}:{id(self)}"
         self._cancellation_events: dict[str, asyncio.Event] = {}
@@ -211,10 +213,16 @@ class TaskService:
         cancellation = self._cancellation_events.get(task_id)
         if cancellation is not None:
             cancellation.set()
-            return None
         task = await self.repository.get_task(task_id)
         if task is None:
             return None
+        if task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+            return task
+        if cancellation is not None:
+            task.status = TaskStatus.CANCELLED
+            task.failure_reason = reason
+            task.finished_at = datetime.now(UTC)
+            return task
         task.status = TaskStatus.CANCELLED
         task.failure_reason = reason
         task.finished_at = datetime.now(UTC)
@@ -226,8 +234,22 @@ class TaskService:
         await self.repository.save_event(
             TaskEvent(task_id=task_id, event_type="TASK_CANCELLED", payload={"reason": reason})
         )
-        await self._ensure_final_response(task)
+        if cancellation is None:
+            await self._ensure_final_response(task)
         return task
+
+    async def _persist_cancellation(self, task: Task, reason: str = "cancelled by user") -> None:
+        task.status = TaskStatus.CANCELLED
+        task.failure_reason = reason
+        task.finished_at = datetime.now(UTC)
+        await self.repository.save_task(task)
+        for node in await self.repository.list_nodes(task.id):
+            if node.status in {NodeStatus.CREATED, NodeStatus.READY, NodeStatus.WAITING}:
+                node.status = NodeStatus.CANCELLED
+                await self.repository.save_node(node)
+        await self.repository.save_event(
+            TaskEvent(task_id=task.id, event_type="TASK_CANCELLED", payload={"reason": reason})
+        )
 
     async def delete_task(self, task_id: str) -> bool:
         task = await self.repository.get_task(task_id)
@@ -703,6 +725,23 @@ class TaskService:
                 task.id, GraphEdge(from_node=parent.id, to_node=child.id)
             )
 
+    @staticmethod
+    def _fallback_plan(task: Task) -> PlanProposal:
+        return PlanProposal(
+            task_id=task.id,
+            coverage=["inspect the project and collect evidence"],
+            nodes=[
+                PlanNodeProposal(
+                    id="fallback-project-inspection",
+                    description=(
+                        "Inspect the project structure, symbols, dependencies, and relevant tests "
+                        "to produce concrete evidence for the requested review"
+                    ),
+                    type="OPERATION",
+                )
+            ],
+        )
+
     async def _complete_direct_answer(self, task: Task, root_node: TaskNode, answer: str) -> None:
         task.status = TaskStatus.SUCCEEDED
         task.result_summary = answer
@@ -747,7 +786,10 @@ class TaskService:
             TaskStatus.FAILED,
             TaskStatus.BLOCKED,
             TaskStatus.CANCELLED,
-        } or task.metadata.get("final_response") is not None:
+        } or (
+            task.metadata.get("final_response") is not None
+            and not task.metadata.get("final_response_pending")
+        ):
             return
         respond = getattr(self.llm, "respond", None)
         if respond is None:
@@ -755,10 +797,38 @@ class TaskService:
             return
         used_llm_calls = int(task.metadata.get("llm_calls", 0))
         if used_llm_calls >= task.budget.max_llm_calls:
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="LLM_SKIPPED",
+                    payload={"role": "FINAL_RESPONSE", "reason": "llm_calls budget exhausted"},
+                )
+            )
             await self._save_fallback_response(task, "final response budget exhausted")
             return
         task.metadata["llm_calls"] = used_llm_calls + 1
+        nodes = await self.repository.list_nodes(task.id)
+        task.metadata["final_response"] = AssistantResponse(
+            response_type="report",
+            title="Resultado de la tarea",
+            summary=task.result_summary or task.failure_reason or "La tarea terminó; el informe LLM está en curso.",
+            evidence=[
+                f"{node.description}: {node.status.value}"
+                for node in nodes
+                if node.status in {NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.BLOCKED}
+            ][:20],
+            limitations=["El informe final del LLM todavía está generándose."],
+            confidence="low",
+        ).model_dump(mode="json")
+        task.metadata["final_response_pending"] = True
         await self.repository.save_task(task)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="FINAL_RESPONSE_STARTED",
+                payload={"status": "pending"},
+            )
+        )
         try:
             events = await self.repository.list_events(task.id)
             response_context = await self.context_builder.for_final_response(
@@ -778,15 +848,50 @@ class TaskService:
                         "RECOVERY_TARGET_REQUEUED",
                         "TASK_RECOVERY_RESTARTED",
                         "RETRY_SCHEDULED",
+                        "NODE_VERIFIED",
+                        "NODE_BLOCKED",
+                        "OPERATION_REJECTED",
+                        "LLM_ERROR",
+                        "PLAN_REPAIRED",
+                        "BUDGET_EXHAUSTED",
                     }
                 ],
             )
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="LLM_REQUEST",
+                    payload={
+                        "role": "FINAL_RESPONSE",
+                        "context": json.loads(json.dumps(response_context, default=str)),
+                        "context_chars": len(json.dumps(response_context, default=str)),
+                    },
+                )
+            )
             response = await asyncio.wait_for(
                 respond(response_context),
-                timeout=min(60.0, max(1.0, task.budget.max_execution_time)),
+                timeout=min(
+                    self.final_response_timeout,
+                    max(1.0, task.budget.max_execution_time),
+                ),
             )
             task.metadata["final_response"] = response.model_dump(mode="json")
+            task.metadata.pop("final_response_pending", None)
+            task.result_summary = response.summary
             await self.repository.save_task(task)
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="LLM_RESPONSE",
+                    payload={
+                        "role": "FINAL_RESPONSE",
+                        "response": response.model_dump(mode="json"),
+                        "request": getattr(self.llm, "last_request", {}),
+                        "response_chars": len(json.dumps(response.model_dump(mode="json"), default=str)),
+                        "usage": getattr(self.llm, "last_usage", {}),
+                    },
+                )
+            )
             await self.repository.save_event(
                 TaskEvent(task_id=task.id, event_type="FINAL_RESPONSE_READY")
             )
@@ -796,14 +901,20 @@ class TaskService:
                 TaskEvent(
                     task_id=task.id,
                     event_type="FINAL_RESPONSE_FAILED",
-                    payload={"error": str(error)},
+                    payload={
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "request": getattr(self.llm, "last_request", {}),
+                        "usage": getattr(self.llm, "last_usage", {}),
+                    },
                 )
             )
             await self._save_fallback_response(task, "final response generation failed")
 
     async def _save_fallback_response(self, task: Task, reason: str) -> None:
-        if task.metadata.get("final_response") is not None:
+        if task.metadata.get("final_response") is not None and not task.metadata.get("final_response_pending"):
             return
+        task.metadata.pop("final_response_pending", None)
         nodes = await self.repository.list_nodes(task.id)
         evidence = [
             f"{node.description}: {node.status.value}"
@@ -821,7 +932,11 @@ class TaskService:
         ).model_dump(mode="json")
         await self.repository.save_task(task)
         await self.repository.save_event(
-            TaskEvent(task_id=task.id, event_type="FINAL_RESPONSE_FALLBACK")
+            TaskEvent(
+                task_id=task.id,
+                event_type="FINAL_RESPONSE_FALLBACK",
+                payload={"reason": reason},
+            )
         )
 
     async def _finish_task(
@@ -1039,6 +1154,9 @@ class TaskService:
             TaskStatus.FAILED,
         }:
             return False
+        cancellation = self._cancellation_event(task_id)
+        if cancellation.is_set():
+            return False
         if task.status is TaskStatus.QUEUED:
             task.status = TaskStatus.PLANNING
             await self.repository.save_task(task)
@@ -1061,16 +1179,9 @@ class TaskService:
                     )
                 )
                 proposal = await self._call_llm(self.llm.plan(planner_context), time_remaining)
-                validate_plan_quality(proposal, task.budget.max_plan_nodes)
-                coverage_warnings = plan_coverage_warnings(proposal, task.goal)
-                for warning in coverage_warnings:
-                    await self.repository.save_event(
-                        TaskEvent(
-                            task_id=task_id,
-                            event_type="PLAN_COVERAGE_WARNING",
-                            payload={"warning": warning},
-                        )
-                    )
+                if cancellation.is_set():
+                    await self._persist_cancellation(task)
+                    return False
                 await self.repository.save_event(
                     TaskEvent(
                         task_id=task_id,
@@ -1093,6 +1204,37 @@ class TaskService:
                         },
                     )
                 )
+                try:
+                    validate_plan_quality(proposal, task.budget.max_plan_nodes)
+                except ValueError as error:
+                    if (
+                        proposal.answer is None
+                        and not proposal.nodes
+                        and not proposal.subtasks
+                    ):
+                        proposal = self._fallback_plan(task)
+                        await self.repository.save_event(
+                            TaskEvent(
+                                task_id=task_id,
+                                event_type="PLAN_REPAIRED",
+                                payload={
+                                    "reason": str(error),
+                                    "strategy": "deterministic_project_inspection",
+                                    "nodes": [item.id for item in proposal.nodes],
+                                },
+                            )
+                        )
+                    else:
+                        raise
+                coverage_warnings = plan_coverage_warnings(proposal, task.goal)
+                for warning in coverage_warnings:
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            event_type="PLAN_COVERAGE_WARNING",
+                            payload={"warning": warning},
+                        )
+                    )
                 planned_nodes = await self.repository.list_nodes(task.id)
                 root_node = next((item for item in planned_nodes if item.type is NodeType.TASK), None)
                 if proposal.answer is not None and not proposal.nodes:
@@ -1207,7 +1349,20 @@ class TaskService:
                     await self.repository.save_node(root_node)
                 task.status = TaskStatus.READY
                 await self.repository.save_task(task)
-            except (HTTPError, ValidationError, ValueError, KeyError, TypeError) as error:
+            except (HTTPError, ValidationError, ValueError, KeyError, TypeError, TimeoutError, RuntimeError) as error:
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task_id,
+                        event_type="LLM_ERROR",
+                        payload={
+                            "role": "PLANNER",
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                            "request": getattr(self.llm, "last_request", {}),
+                            "usage": getattr(self.llm, "last_usage", {}),
+                        },
+                    )
+                )
                 task.status = TaskStatus.FAILED
                 task.failure_reason = f"planning failed: {error}"
                 await self.repository.save_task(task)
@@ -1308,7 +1463,6 @@ class TaskService:
         node = selected
         if node is None:
             return False
-        cancellation = self._cancellation_event(task_id)
         if cancellation.is_set():
             return False
         lease_seconds = max(300, int((time_remaining or 300) + 60))
@@ -1349,14 +1503,29 @@ class TaskService:
                     await self._block_node_for_budget(task, node, "llm_calls")
                     return True
                 decision = await self._call_llm(self.llm.decide(context), time_remaining)
-            except (HTTPError, ValidationError, ValueError, KeyError, TypeError) as error:
+            except (HTTPError, ValidationError, ValueError, KeyError, TypeError, TimeoutError, RuntimeError) as error:
                 reason = f"node resolution failed: {error}"
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task_id,
+                        node_id=node.id,
+                        event_type="LLM_ERROR",
+                        payload={
+                            "role": "NODE_RESOLVER",
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                            "request": getattr(self.llm, "last_request", {}),
+                            "usage": getattr(self.llm, "last_usage", {}),
+                        },
+                    )
+                )
                 await self._fail_node(task, node, reason)
                 await self._attempt_recovery(task, node, reason, graph, time_remaining)
                 return True
             if cancellation.is_set():
                 node.status = NodeStatus.CANCELLED
                 await self.repository.save_node(node)
+                await self._persist_cancellation(task)
                 return True
             await self.repository.save_event(
                 TaskEvent(
@@ -1490,8 +1659,8 @@ class TaskService:
             if acceptance:
                 operation.metadata.setdefault("expected", acceptance)
             project = await self.repository.get_project(task.project_id) if task.project_id else None
-            if project and operation.tool == "project" and operation.method == "analyze":
-                operation.args["root"] = project.path
+            if operation.tool in {"project", "codegraph"} and operation.method in {"analyze", "build", "system"}:
+                operation.args["root"] = project.path if project else self.context_builder.workspace_root
             operation_key = operation.idempotency_key or self._operation_key(
                 task.id, node.id, operation
             )

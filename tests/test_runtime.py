@@ -9,7 +9,6 @@ import pytest
 from assistant.application import TaskService
 from assistant.config import Settings
 from assistant.context import ContextBuilder
-from assistant.prompts.v1.template import render
 from assistant.devices.computer.browser import BrowserTool
 from assistant.devices.computer.web import WebTool
 from assistant.devices.registry import DEVICE_BRANCHES, build_tool_registry
@@ -30,6 +29,7 @@ from assistant.domain.models import (
     TaskStatus,
     VerificationDecision,
 )
+from assistant.idle import IdleCycle
 from assistant.infrastructure.db import Database
 from assistant.infrastructure.orm import LeaseRow
 from assistant.infrastructure.repositories import TaskRepository
@@ -44,11 +44,10 @@ from assistant.llm import (
     PlanProposal,
     VerificationResult,
 )
+from assistant.planning import plan_coverage_warnings
 from assistant.project_analysis import ProjectAnalyzer
 from assistant.prompts.v1.template import render
-from assistant.planning import plan_coverage_warnings
 from assistant.recovery import RecoveryManager
-from assistant.idle import IdleCycle
 from assistant.runtime import TaskRuntime
 from assistant.startup.manager import StartupManager
 from assistant.tools import MockTool, NotificationTool, Tool, ToolDefinition, ToolRegistry
@@ -968,7 +967,13 @@ async def test_all_llm_contexts_match_their_role_templates_and_stay_bounded():
     assert "system_graph" not in contexts["node_resolver"]
     assert "graph" not in contexts["replanner"]
     assert "failed_node" in contexts["replanner"]["failure_context"]
-    assert len(contexts["final_response"]["events"][0]["payload"]["output"]) == 2000 + len("... [truncated]")
+    assert all(
+        set(action) == {"name", "description", "methods"}
+        for action in contexts["planner"]["available_actions"]
+    )
+    assert any("argument_schema" in action for action in contexts["node_resolver"]["available_actions"])
+    assert "available_actions" not in contexts["replanner"]
+    assert len(contexts["final_response"]["events"][0]["payload"]["output"]) == 1200 + len("... [truncated]")
 
 
 @pytest.mark.asyncio
@@ -1019,6 +1024,31 @@ async def test_runtime_does_not_consume_tasks_when_llm_is_not_ready():
     assert called == []
     assert runtime.last_active_count == 0
     assert runtime.metrics_snapshot()["not_ready_passes"] == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_rechecks_async_readiness_after_startup_degradation():
+    task = Task(goal="work", status=TaskStatus.QUEUED)
+    called = []
+    readiness = iter([False, True])
+
+    async def check_ready():
+        return next(readiness)
+
+    class Repository:
+        async def list_tasks(self):
+            return [task]
+
+    runtime = TaskRuntime(
+        Repository(),
+        lambda task_id: _record_task(called, task_id),
+        is_ready=check_ready,
+    )
+
+    assert await runtime.run_once() == 0
+    assert await runtime.run_once() == 1
+    assert called == [task.id]
+    assert runtime.readiness_snapshot() is True
 
 
 @pytest.mark.asyncio
@@ -1215,6 +1245,40 @@ async def test_invalid_planner_graph_is_rejected_before_persistence(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_empty_planner_response_is_repaired_into_workspace_inspection(tmp_path):
+    class EmptyPlanner(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal()
+
+    (tmp_path / "main.py").write_text("print('ok')", encoding="utf-8")
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'empty-plan.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        provider = EmptyPlanner(
+            Operation(tool="project", method="analyze", args={"root": "wrong"})
+        )
+        service = TaskService(
+            session,
+            provider,
+            build_tool_registry(),
+            workspace_root=str(tmp_path),
+        )
+        task = await service.create_task(TaskRequest(goal="audit the project and report findings"))
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        events = await service.repository.list_events(task.id)
+        assert any(event.event_type == "PLAN_REPAIRED" for event in events)
+        node = next(
+            node for node in await service.repository.list_nodes(task.id)
+            if node.type is NodeType.OPERATION
+        )
+        assert node.output_data["output"]["root"] == str(tmp_path.resolve())
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_single_project_is_selected_and_analysis_uses_registered_path(tmp_path):
     project_path = tmp_path / "project"
     project_path.mkdir()
@@ -1322,6 +1386,8 @@ async def test_recovery_requeues_planning_tasks(tmp_path):
         recovered = await RecoveryManager(session).recover()
         assert recovered == 1
         assert (await repository.get_task(task.id)).status is TaskStatus.QUEUED
+        assert await RecoveryManager(session).recover() == 0
+        assert len(await repository.list_events(task.id)) == 1
     await database.close()
 
 
@@ -2106,8 +2172,13 @@ async def test_terminal_task_persists_one_final_response(tmp_path):
 
         assert result.status is TaskStatus.SUCCEEDED
         assert persisted.metadata["final_response"]["summary"]
+        assert "final_response_pending" not in persisted.metadata
         assert any(
             event.event_type == "FINAL_RESPONSE_READY"
+            for event in await service.repository.list_events(task.id)
+        )
+        assert any(
+            event.event_type == "FINAL_RESPONSE_STARTED"
             for event in await service.repository.list_events(task.id)
         )
     await database.close()

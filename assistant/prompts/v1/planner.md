@@ -41,8 +41,20 @@ DECISION RULES
 - Do not invent tools or arguments in the plan.
 - For work on the Assistant repository, plan this sequence when relevant: inspect/codegraph, implement a focused change, run tests, review the diff. Do not commit or push unless explicitly requested.
 - If the request cannot be executed with the available actions, return an empty plan.
+- Audit, review, inspect, analyze, and "what do you think about this project" requests
+  are executable work. Use an OPERATION node for project or codegraph inspection and
+  never return an empty plan for them.
 - If the request needs clarification, use a WAIT node and describe the exact
   input required. Do not guess missing project, file, account, or browser state.
+
+COMPACT EXAMPLES
+- Project audit: return an OPERATION node such as
+  {"id":"inspect-project","description":"Inspect the project structure, symbols, dependencies, and tests","type":"OPERATION","dependencies":[],"acceptance":{"contains":["modules"]}}
+- Multi-step code change: return inspect -> implement -> test nodes, with each
+  later node depending on the previous successful node.
+- Direct question with no external work: return {"answer":"...","nodes":[],"subtasks":[]}.
+- Never return {"answer":null,"nodes":[],"subtasks":[]} for an audit, review,
+  inspection, analysis, implementation, test, or report request.
 
 Required response shape:
 {

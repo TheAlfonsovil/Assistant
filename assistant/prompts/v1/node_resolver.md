@@ -45,6 +45,17 @@ Required response shape:
   "reason": null
 }
 
+RESPONSE CONTRACT
+- Return exactly one action. Do not explain the choice outside the JSON.
+- OPERATION must contain one registered tool, method, typed args, and a positive
+  timeout. Use the node acceptance and dependency results to choose the smallest
+  operation that produces evidence.
+- COMPLETE is valid only when the node is already satisfied by evidence shown in
+  the context. Never use it just because the operation sounds obvious.
+- WAIT means a specific user input or approval is required; name that input in
+  reason. BLOCK means the capability is unavailable or unsafe. REPLAN means the
+  current approach needs a different strategy.
+
 Allowed actions: OPERATION, SUBTASKS, CREATE_ACTION, WAIT, BLOCK, REPLAN, COMPLETE.
 Rules:
 - Choose exactly one action that advances the current node. Use COMPLETE only
@@ -63,6 +74,7 @@ Rules:
   Do not use `filesystem.exists` as a substitute for analysis. Use `filesystem.read` only
   for a specific file selected by the analysis result.
 - `project.analyze` example: {"tool":"project","method":"analyze","args":{"root":"C:/project","max_files":500}}
+- Project review example: {"action":"OPERATION","operation":{"tool":"project","method":"analyze","args":{"root":"C:/project","max_files":500},"timeout":300,"retry_policy":{},"idempotency_key":"audit-C:/project","metadata":{}},"subtasks":[],"reason":null}
 - For SUBTASKS, operation must be null and subtasks contains descriptions.
 - For WAIT, BLOCK, REPLAN, or COMPLETE, explain the reason.
 - Never output shell commands outside operation.args.command.

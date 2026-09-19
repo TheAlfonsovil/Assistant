@@ -29,18 +29,15 @@ def render(template: str, context: dict[str, Any], output_schema: dict[str, Any]
             "but never expose chain-of-thought; return only the requested JSON output."
         ),
         "user_prompt": context.get("user_prompt", ""),
-        "long_term_memory": context.get("long_term_memory", context.get("relevant_memory", [])),
+        "long_term_memory": context.get("long_term_memory", []),
         "assistant_state": context.get("assistant_state", {}),
         "task": context.get("task", {}),
         "node": context.get("node", {}),
         "dependencies": context.get("dependency_results", []),
         "completed_artifacts": context.get("completed_artifacts", []),
-        "available_actions": context.get("available_actions", context.get("available_tools", [])),
+        "available_actions": context.get("available_actions", []),
         "constraints": context.get("constraints", {}),
-        "failure_context": context.get(
-            "failure_context",
-            {"failure": context.get("failure"), "failed_node": context.get("failed_node")},
-        ),
+        "failure_context": context.get("failure_context", {}),
         "execution_evidence": context.get("events", context.get("dependency_results", [])),
         "output_schema": output_schema,
     }

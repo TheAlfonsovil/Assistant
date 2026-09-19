@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-from uuid import uuid4
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import cast
+from uuid import uuid4
 
 from .domain.models import TaskStatus
 from .idle import IdleCycle
@@ -23,7 +24,7 @@ class TaskRuntime:
         interval: float = 5.0,
         idle_cycle: IdleCycle | None = None,
         max_backoff: float = 60.0,
-        is_ready: Callable[[], bool] | None = None,
+        is_ready: Callable[[], bool | Awaitable[bool]] | None = None,
     ):
         self.repository = repository
         self.execute_task = execute_task
@@ -35,6 +36,7 @@ class TaskRuntime:
         self.last_started_at: datetime | None = None
         self.last_completed_at: datetime | None = None
         self.last_error: str | None = None
+        self.last_ready: bool | None = None
         self.last_active_count = 0
         self.metrics = {
             "passes": 0,
@@ -50,6 +52,9 @@ class TaskRuntime:
 
     def metrics_snapshot(self) -> dict[str, int]:
         return dict(self.metrics)
+
+    def readiness_snapshot(self) -> bool | None:
+        return self.last_ready
 
     def idle_snapshot(self) -> dict[str, object]:
         return {
@@ -88,7 +93,11 @@ class TaskRuntime:
         self.metrics["passes"] += 1
         self.last_started_at = datetime.now(UTC)
         await self._persist_heartbeat()
-        if not self.is_ready():
+        readiness = self.is_ready()
+        if asyncio.iscoroutine(readiness) or isinstance(readiness, Awaitable):
+            readiness = await cast(Awaitable[bool], readiness)
+        self.last_ready = bool(readiness)
+        if not self.last_ready:
             self.metrics["not_ready_passes"] += 1
             await self._run_idle(has_work=False)
             self.last_active_count = 0

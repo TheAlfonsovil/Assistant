@@ -53,7 +53,7 @@ class StartupManager:
             report.loaded_memories = existing_memory
             report.user_profile = self._user_profile()
             unfinished = await repository.list_tasks()
-            legacy_budget = 3600.0
+            legacy_budget = 36000.0
             configured_budget = max(1.0, float(getattr(self.settings, "task_max_execution_time", 86400.0)))
             for task in unfinished:
                 if task.budget.max_execution_time == legacy_budget:

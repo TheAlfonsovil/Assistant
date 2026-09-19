@@ -28,16 +28,18 @@ class RecoveryManager:
             row.error = "recovered after process restart"
             row.finished_at = None
             recovered_task_ids.add(row.task_id)
-            self.session.add(
-                EventRow(
-                    id=f"recovery-node-{row.id}",
-                    task_id=row.task_id,
-                    node_id=row.id,
-                    event_type="NODE_RECOVERED",
-                    payload={"previous_status": previous_status, "reason": "process restart"},
-                    created_at=now,
+            event_id = f"recovery-node-{row.id}"
+            if await self.session.get(EventRow, event_id) is None:
+                self.session.add(
+                    EventRow(
+                        id=event_id,
+                        task_id=row.task_id,
+                        node_id=row.id,
+                        event_type="NODE_RECOVERED",
+                        payload={"previous_status": previous_status, "reason": "process restart"},
+                        created_at=now,
+                    )
                 )
-            )
             recovered += 1
         if recovered_task_ids:
             tasks = await self.session.execute(
@@ -54,15 +56,17 @@ class RecoveryManager:
         for row in planning.scalars():
             row.status = TaskStatus.QUEUED.value
             row.failure_reason = "planning recovered after process restart"
-            self.session.add(
-                EventRow(
-                    id=f"recovery-task-{row.id}",
-                    task_id=row.id,
-                    event_type="TASK_RECOVERED_FROM_PLANNING",
-                    payload={"reason": "process restart", "next_status": TaskStatus.QUEUED.value},
-                    created_at=now,
+            event_id = f"recovery-task-{row.id}"
+            if await self.session.get(EventRow, event_id) is None:
+                self.session.add(
+                    EventRow(
+                        id=event_id,
+                        task_id=row.id,
+                        event_type="TASK_RECOVERED_FROM_PLANNING",
+                        payload={"reason": "process restart", "next_status": TaskStatus.QUEUED.value},
+                        created_at=now,
+                    )
                 )
-            )
             recovered += 1
         if recovered or expired_leases.rowcount:
             await self.session.commit()

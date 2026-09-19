@@ -1,12 +1,13 @@
 import asyncio
-import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from httpx import HTTPError
 
+from .devices.registry import DEVICE_BRANCHES
 from .domain.models import (
     ChatRequest,
     IdleConfigurationRequest,
@@ -16,7 +17,6 @@ from .domain.models import (
     TaskRedefinitionRequest,
     TaskRequest,
 )
-from .devices.registry import DEVICE_BRANCHES
 from .idle import IdleCycle
 from .runtime import TaskRuntime
 from .startup.bootstrap import AssistantContext, create_context
@@ -26,6 +26,13 @@ from .startup.bootstrap import AssistantContext, create_context
 async def lifespan(app: FastAPI):
     context = await create_context()
     app.state.context = context
+
+    async def check_llm_ready() -> bool:
+        try:
+            return await asyncio.wait_for(context.service.llm.check_ready(), timeout=5.0)
+        except (HTTPError, OSError, TimeoutError, ValueError):
+            return False
+
     runtime = TaskRuntime(
         context.service.repository,
         lambda task_id: context.service.run_task(task_id, wait_for_retry=False),
@@ -34,7 +41,7 @@ async def lifespan(app: FastAPI):
             supervise=lambda has_work: context.service.reconcile_idle(),
             enabled=context.settings.idle_enabled,
         ),
-        is_ready=lambda: context.startup.llm_ready,
+        is_ready=check_llm_ready,
     )
     worker = asyncio.create_task(runtime.run_forever(), name="assistant-task-runtime")
     app.state.runtime = runtime
@@ -68,6 +75,8 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
     estimated_response_tokens = 0
     actual_prompt_tokens = 0
     actual_response_tokens = 0
+    actual_usage_events = 0
+    llm_response_events = 0
     prefill_seconds = 0.0
     generation_seconds = 0.0
     measured_generation_tokens = 0
@@ -94,11 +103,14 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             chars = payload.get("context_chars", 0)
             estimated_prompt_tokens += int(chars / 4) if isinstance(chars, (int, float)) else 0
         if event.event_type == "LLM_RESPONSE":
+            llm_response_events += 1
             chars = payload.get("response_chars", 0)
             estimated_response_tokens += int(chars / 4) if isinstance(chars, (int, float)) else 0
             usage = payload.get("usage", {})
             actual_prompt_tokens += int(usage.get("prompt_eval_count", 0) or 0)
             actual_response_tokens += int(usage.get("eval_count", 0) or 0)
+            if usage.get("prompt_eval_count") or usage.get("eval_count"):
+                actual_usage_events += 1
             prefill_seconds += float(usage.get("prompt_eval_duration", 0) or 0) / 1_000_000_000
             generation_seconds += float(usage.get("eval_duration", 0) or 0) / 1_000_000_000
             measured_generation_tokens += int(usage.get("eval_count", 0) or 0)
@@ -106,9 +118,10 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             requested_at = llm_requests.get(request_key)
             if requested_at is not None:
                 llm_latency.append(max(0, (event.created_at - requested_at).total_seconds()))
-        if event.event_type in {"LLM_RESPONSE", "LLM_RESPONSE_PARSED"}:
-            if isinstance(payload.get("elapsed_seconds"), (int, float)):
-                llm_latency.append(payload["elapsed_seconds"])
+        if event.event_type in {"LLM_RESPONSE", "LLM_RESPONSE_PARSED"} and isinstance(
+            payload.get("elapsed_seconds"), (int, float)
+        ):
+            llm_latency.append(payload["elapsed_seconds"])
         if event.event_type == "RETRY_SCHEDULED":
             retries += 1
     durations = []
@@ -126,16 +139,43 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             for event in task_task_events
             if event.event_type == "LLM_RESPONSE"
         )
+        task_actual_prompt = sum(
+            int(((event.payload or {}).get("usage") or {}).get("prompt_eval_count", 0) or 0)
+            for event in task_task_events
+            if event.event_type == "LLM_RESPONSE"
+        )
+        task_actual_response = sum(
+            int(((event.payload or {}).get("usage") or {}).get("eval_count", 0) or 0)
+            for event in task_task_events
+            if event.event_type == "LLM_RESPONSE"
+        )
+        task_actual_available = bool(task_actual_prompt or task_actual_response)
+        task_measured_total = task_actual_prompt + task_actual_response
         for event in task_task_events:
             if not event.node_id:
                 continue
-            usage = node_usage.setdefault(event.node_id, {"llm_calls": 0, "tool_calls": 0, "estimated_tokens": 0})
+            usage = node_usage.setdefault(
+                event.node_id,
+                {
+                    "llm_calls": 0,
+                    "tool_calls": 0,
+                    "estimated_tokens": 0,
+                    "actual_tokens": 0,
+                    "actual_tokens_available": False,
+                },
+            )
             payload = event.payload or {}
             if event.event_type == "LLM_REQUEST":
                 usage["llm_calls"] += 1
                 usage["estimated_tokens"] += int(payload.get("context_chars", 0) / 4)
             elif event.event_type == "LLM_RESPONSE":
                 usage["estimated_tokens"] += int(payload.get("response_chars", 0) / 4)
+                provider_usage = payload.get("usage") or {}
+                measured = int(provider_usage.get("prompt_eval_count", 0) or 0) + int(
+                    provider_usage.get("eval_count", 0) or 0
+                )
+                usage["actual_tokens"] += measured
+                usage["actual_tokens_available"] = bool(measured)
             elif event.event_type == "TOOL_CALLED":
                 usage["tool_calls"] += 1
         task_usage.append({
@@ -146,6 +186,9 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             "llm_calls": sum(1 for event in task_task_events if event.event_type == "LLM_REQUEST"),
             "tool_calls": sum(1 for event in task_task_events if event.event_type == "TOOL_CALLED"),
             "estimated_tokens": task_prompt + task_response,
+            "actual_tokens": task_measured_total,
+            "actual_tokens_available": task_actual_available,
+            "token_source": "ollama" if task_actual_available else "estimated_chars_divided_by_4",
             "duration_seconds": round(
                 max(0, (task.finished_at - task.started_at).total_seconds())
                 if task.started_at and task.finished_at else 0,
@@ -176,6 +219,24 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             "total": actual_prompt_tokens + actual_response_tokens,
             "available": bool(actual_prompt_tokens or actual_response_tokens),
             "basis": "Ollama prompt_eval_count/eval_count when provided",
+        },
+        "display_tokens": {
+            "prompt": actual_prompt_tokens if actual_prompt_tokens else estimated_prompt_tokens,
+            "response": actual_response_tokens if actual_response_tokens else estimated_response_tokens,
+            "total": (
+                actual_prompt_tokens + actual_response_tokens
+                if actual_prompt_tokens or actual_response_tokens
+                else estimated_prompt_tokens + estimated_response_tokens
+            ),
+            "source": (
+                "ollama"
+                if actual_usage_events == llm_response_events and actual_usage_events
+                else "ollama_partial"
+                if actual_usage_events
+                else "estimated_chars_divided_by_4"
+            ),
+            "measured_responses": actual_usage_events,
+            "response_events": llm_response_events,
         },
         "latency": {
             "average_task_seconds": round(sum(durations) / len(durations), 2) if durations else 0,
@@ -281,7 +342,9 @@ async def dashboard_data(request: Request):
     return {
         "health": {
             "status": startup.status,
-            "llm_ready": startup.llm_ready,
+            "llm_ready": runtime.readiness_snapshot()
+            if runtime.readiness_snapshot() is not None
+            else startup.llm_ready,
             "database_ready": startup.database_ready,
             "unfinished_tasks": startup.unfinished_tasks,
             "recovered_nodes": startup.recovered_nodes,
@@ -292,10 +355,17 @@ async def dashboard_data(request: Request):
                 "last_completed_at": runtime.last_completed_at,
                 "last_error": runtime.last_error,
                 "metrics": runtime.metrics_snapshot(),
+                "llm_ready": runtime.readiness_snapshot(),
                 "idle": runtime.idle_snapshot(),
             },
         },
-        "tasks": [task.model_dump(mode="json") for task in tasks],
+        "tasks": [
+            {
+                **task.model_dump(mode="json"),
+                "final_response": task.metadata.get("final_response"),
+            }
+            for task in tasks
+        ],
         "task_nodes": {
             task_id: [node.model_dump(mode="json") for node in nodes]
             for task_id, nodes in task_nodes.items()
@@ -363,7 +433,19 @@ async def purge_expired_memory(request: Request):
 @app.post("/memory/reset")
 @app.post("/runtime/reset")
 async def reset_memory(request: Request):
+    runtime = request.app.state.runtime
+    worker = request.app.state.worker
+    runtime.stop()
+    worker.cancel()
+    try:
+        await worker
+    except asyncio.CancelledError:
+        pass
     deleted = await service(request).service.repository.reset_state()
+    runtime.stop_requested = False
+    request.app.state.worker = asyncio.create_task(
+        runtime.run_forever(), name="assistant-task-runtime"
+    )
     return {"reset": True, "deleted": deleted, "total": sum(deleted.values())}
 
 
