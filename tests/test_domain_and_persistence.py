@@ -17,6 +17,7 @@ from assistant.domain.models import (
 )
 from assistant.infrastructure.db import Database
 from assistant.infrastructure.repositories import TaskRepository
+from assistant.project_analysis import ProjectAnalyzer
 
 
 def test_graph_resolves_dependencies_and_rejects_cycles():
@@ -118,3 +119,17 @@ async def test_memory_expiration_redaction_deletion_and_export(tmp_path):
         assert await repository.delete_memory(current.id) is True
         assert await repository.list_memory() == []
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_project_analyzer_emits_inheritance_and_composition_edges(tmp_path):
+    (tmp_path / "sample.py").write_text(
+        "class Base:\n    pass\n\nclass Dependency:\n    pass\n\nclass Child(Base):\n    def __init__(self):\n        self.dependency = Dependency()\n",
+        encoding="utf-8",
+    )
+
+    result = await ProjectAnalyzer().analyze(str(tmp_path))
+
+    assert result.success is True
+    kinds = {edge["kind"] for edge in result.output["dependency_edges"]}
+    assert {"inherits", "composes"}.issubset(kinds)

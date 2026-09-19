@@ -10,15 +10,16 @@ class InvalidStateTransition(ValueError):
 _TASK_TRANSITIONS = {
     TaskStatus.CREATED: {TaskStatus.QUEUED, TaskStatus.WAITING},
     TaskStatus.QUEUED: {TaskStatus.PLANNING, TaskStatus.READY, TaskStatus.RUNNING, TaskStatus.WAITING, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
-    TaskStatus.PLANNING: {TaskStatus.QUEUED, TaskStatus.READY, TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
-    TaskStatus.READY: {TaskStatus.PLANNING, TaskStatus.RUNNING, TaskStatus.WAITING, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.SUCCEEDED, TaskStatus.CANCELLED, TaskStatus.QUEUED},
-    TaskStatus.RUNNING: {TaskStatus.READY, TaskStatus.WAITING, TaskStatus.VERIFYING, TaskStatus.SUCCEEDED, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.CANCELLED},
-    TaskStatus.VERIFYING: {TaskStatus.READY, TaskStatus.WAITING, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.SUCCEEDED, TaskStatus.CANCELLED},
+    TaskStatus.PLANNING: {TaskStatus.QUEUED, TaskStatus.READY, TaskStatus.FINALIZING, TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
+    TaskStatus.READY: {TaskStatus.PLANNING, TaskStatus.RUNNING, TaskStatus.WAITING, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.FINALIZING, TaskStatus.SUCCEEDED, TaskStatus.CANCELLED, TaskStatus.QUEUED},
+    TaskStatus.RUNNING: {TaskStatus.READY, TaskStatus.WAITING, TaskStatus.VERIFYING, TaskStatus.FINALIZING, TaskStatus.SUCCEEDED, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.CANCELLED},
+    TaskStatus.VERIFYING: {TaskStatus.READY, TaskStatus.WAITING, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.FINALIZING, TaskStatus.SUCCEEDED, TaskStatus.CANCELLED},
     TaskStatus.WAITING: {TaskStatus.READY, TaskStatus.QUEUED, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
-    TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.QUEUED, TaskStatus.CANCELLED},
-    TaskStatus.FAILED: {TaskStatus.READY, TaskStatus.QUEUED, TaskStatus.CANCELLED},
-    TaskStatus.SUCCEEDED: set(),
-    TaskStatus.CANCELLED: set(),
+    TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.QUEUED, TaskStatus.FINALIZING, TaskStatus.CANCELLED},
+    TaskStatus.FAILED: {TaskStatus.READY, TaskStatus.QUEUED, TaskStatus.FINALIZING, TaskStatus.CANCELLED},
+    TaskStatus.FINALIZING: {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
+    TaskStatus.SUCCEEDED: {TaskStatus.FINALIZING},
+    TaskStatus.CANCELLED: {TaskStatus.FINALIZING},
 }
 
 _NODE_TRANSITIONS = {

@@ -14,6 +14,7 @@ class NodeScheduler:
             TaskStatus.SUCCEEDED,
             TaskStatus.WAITING,
             TaskStatus.BLOCKED,
+            TaskStatus.FINALIZING,
         }:
             return None
         now = datetime.now(UTC)

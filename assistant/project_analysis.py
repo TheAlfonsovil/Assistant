@@ -197,6 +197,13 @@ class ProjectAnalyzer:
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 symbols.append({"kind": type(node).__name__, "name": node.name, "file": source, "line": node.lineno})
+                if isinstance(node, ast.ClassDef):
+                    class_id = f"{source}:{node.lineno}:{node.name}"
+                    for base in node.bases:
+                        edges.append({"from": class_id, "to": ast.unparse(base), "kind": "inherits"})
+                    for child in ast.walk(node):
+                        if isinstance(child, ast.Call):
+                            edges.append({"from": class_id, "to": ast.unparse(child.func), "kind": "composes"})
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     edges.append({"from": module, "to": alias.name, "kind": "imports"})

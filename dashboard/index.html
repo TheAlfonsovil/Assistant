@@ -14,7 +14,7 @@
       <nav class="nav" aria-label="Navegación principal">
         <button class="nav-item active" data-view="overview"><span class="nav-icon">◈</span><span>Resumen</span><kbd>01</kbd></button>
         <button class="nav-item" data-view="tasks"><span class="nav-icon">≡</span><span>Cola de trabajo</span><kbd>02</kbd></button>
-        <button class="nav-item" data-view="trace"><span class="nav-icon">⌁</span><span>Observabilidad LLM</span><kbd>03</kbd></button>
+        <button class="nav-item" data-view="trace"><span class="nav-icon">⌁</span><span>Observabilidad</span><kbd>03</kbd></button>
       </nav>
       <div class="nav-group-label">SISTEMA</div>
       <nav class="nav" aria-label="Navegación del sistema">
@@ -47,7 +47,7 @@
 
       <section class="view" data-view-panel="tasks"><div class="page-intro"><div><p class="eyebrow">WORK QUEUE</p><h1>Cola de trabajo</h1><p class="intro-copy">Cada tarea tiene un estado, una evidencia y un siguiente paso.</p></div><button id="new-task" class="button primary">+ Nueva tarea</button></div><div class="toolbar"><div class="toolbar-title"><span class="toolbar-dot"></span><strong>Tareas persistentes</strong><span class="toolbar-count">actualizadas en vivo</span></div><input id="task-filter" class="input" placeholder="Buscar tareas..." aria-label="Buscar tareas"></div><div class="task-layout"><section class="panel task-panel"><div id="task-list" class="task-list"></div></section><section id="task-inspector" class="panel inspector empty-inspector"><div class="empty"><span class="empty-icon">↗</span><strong>Selecciona una tarea</strong><span>Su estado, nodos y acciones aparecerán aquí.</span></div></section></div></section>
 
-      <section class="view" data-view-panel="trace"><div class="page-intro trace-intro"><div><p class="eyebrow">MODEL OBSERVABILITY</p><h1>Observabilidad LLM</h1><p class="intro-copy">El contexto enviado, la respuesta validada y la decisión resultante.</p></div><select id="trace-task" class="input"><option value="">Selecciona una tarea</option></select></div><section id="trace-workspace" class="trace-workspace"><div class="empty panel"><span class="empty-icon">⌁</span><strong>Selecciona una tarea para inspeccionar el modelo</strong><span>Las conversaciones aparecerán aquí.</span></div></section></section>
+      <section class="view" data-view-panel="trace"><div class="page-intro trace-intro"><div><p class="eyebrow">TASK OBSERVABILITY</p><h1>Observabilidad</h1><p class="intro-copy">El recorrido completo de la tarea, desde su creación hasta su finalización.</p></div><select id="trace-task" class="input"><option value="">Selecciona una tarea</option></select></div><section id="trace-workspace" class="trace-workspace"><div class="empty panel"><span class="empty-icon">⌁</span><strong>Selecciona una tarea para inspeccionar su recorrido</strong><span>Las interacciones aparecerán aquí.</span></div></section></section>
 
       <section class="view" data-view-panel="activity"><div class="page-intro"><div><p class="eyebrow">EVENT STREAM</p><h1>Actividad</h1><p class="intro-copy">La secuencia de eventos que mantiene el sistema en movimiento.</p></div></div><section class="panel activity-panel"><div class="activity-head"><span>EVENTO</span><span>TAREA</span><span>MOMENTO</span></div><div id="event-stream" class="event-stream"></div></section></section>
 

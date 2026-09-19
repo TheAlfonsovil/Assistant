@@ -375,6 +375,16 @@ async def test_planner_context_includes_resolved_project_and_workflow_guidance(t
     await database.close()
 
 
+def test_empty_plan_fallback_preserves_codegraph_intent():
+    proposal = TaskService._fallback_plan(Task(goal="actualiza el codegraph y audita el proyecto"))
+
+    assert [node.id for node in proposal.nodes] == [
+        "fallback-codegraph-build",
+        "fallback-project-inspection",
+    ]
+    assert proposal.nodes[1].dependencies == ["fallback-codegraph-build"]
+
+
 def test_plan_reports_missing_goal_coverage():
     proposal = PlanProposal(
         nodes=[PlanNodeProposal(id="step", description="inspect configuration")]
@@ -2256,6 +2266,33 @@ async def test_terminal_task_persists_one_final_response(tmp_path):
             event.event_type == "FINAL_RESPONSE_STARTED"
             for event in await service.repository.list_events(task.id)
         )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_project_operations_persist_graph_and_audit_metadata(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-operation.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, MockLLMProvider(), ToolRegistry())
+        project = await service.create_project(Project(name="sample", path=str(tmp_path)))
+        task = await service.create_task(TaskRequest(goal="refresh project", project_id=project.id))
+
+        await service._persist_project_operation_result(
+            task,
+            Operation(tool="codegraph", method="build"),
+            {"success": True, "output": {"graph": {"nodes": [], "edges": []}}},
+        )
+        await service._persist_project_operation_result(
+            task,
+            Operation(tool="project", method="audit"),
+            {"success": True, "output": {"audit": {"test_result": {"available": True}}}},
+        )
+
+        persisted = await service.get_project(project.id)
+        assert persisted.codegraph_version == 1
+        assert persisted.codegraph_updated_at is not None
+        assert persisted.last_audited_at is not None
     await database.close()
 
 

@@ -68,6 +68,7 @@ class StartupManager:
                     TaskStatus.RUNNING,
                     TaskStatus.WAITING,
                     TaskStatus.BLOCKED,
+                    TaskStatus.FINALIZING,
                 }
                 for task in unfinished
             )

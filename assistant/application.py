@@ -9,6 +9,7 @@ import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from time import monotonic
+from typing import Any
 from uuid import uuid4
 
 from httpx import HTTPError
@@ -727,19 +728,31 @@ class TaskService:
 
     @staticmethod
     def _fallback_plan(task: Task) -> PlanProposal:
+        goal = task.goal.casefold()
+        wants_graph = "codegraph" in goal or "grafo" in goal
+        nodes = []
+        if wants_graph:
+            nodes.append(
+                PlanNodeProposal(
+                    id="fallback-codegraph-build",
+                    description="Actualizar el codegraph del proyecto y conservar sus relaciones estructurales",
+                    type="OPERATION",
+                )
+            )
+        nodes.append(
+            PlanNodeProposal(
+                id="fallback-project-inspection",
+                description=(
+                    "Auditar el proyecto: estructura, configuración, dependencias, tests y evidencia de runtime"
+                ),
+                type="OPERATION",
+                dependencies=["fallback-codegraph-build"] if wants_graph else [],
+            )
+        )
         return PlanProposal(
             task_id=task.id,
             coverage=["audit the project and collect executable evidence"],
-            nodes=[
-                PlanNodeProposal(
-                    id="fallback-project-inspection",
-                    description=(
-                        "Audit the project structure, configuration, dependencies, tests, and safe "
-                        "runtime evidence for the requested review"
-                    ),
-                    type="OPERATION",
-                )
-            ],
+            nodes=nodes,
         )
 
     async def _complete_direct_answer(self, task: Task, root_node: TaskNode, answer: str) -> None:
@@ -791,9 +804,16 @@ class TaskService:
             and not task.metadata.get("final_response_pending")
         ):
             return
+        final_status = task.status
+        task.metadata["_final_status"] = final_status.value
+        task.metadata["_final_finished_at"] = task.finished_at.isoformat() if task.finished_at else None
+        task.status = TaskStatus.FINALIZING
+        task.finished_at = None
+        await self.repository.save_task(task)
         respond = getattr(self.llm, "respond", None)
         if respond is None:
             await self._save_fallback_response(task, "final response provider unavailable")
+            await self._restore_final_status(task)
             return
         used_llm_calls = int(task.metadata.get("llm_calls", 0))
         if used_llm_calls >= task.budget.max_llm_calls:
@@ -805,6 +825,7 @@ class TaskService:
                 )
             )
             await self._save_fallback_response(task, "final response budget exhausted")
+            await self._restore_final_status(task)
             return
         task.metadata["llm_calls"] = used_llm_calls + 1
         nodes = await self.repository.list_nodes(task.id)
@@ -898,6 +919,7 @@ class TaskService:
             await self.repository.save_event(
                 TaskEvent(task_id=task.id, event_type="FINAL_RESPONSE_READY")
             )
+            await self._restore_final_status(task)
         except Exception as error:
             logger.exception("Final response generation failed for %s", task.id)
             await self.repository.save_event(
@@ -913,6 +935,16 @@ class TaskService:
                 )
             )
             await self._save_fallback_response(task, "final response generation failed")
+            await self._restore_final_status(task)
+
+    async def _restore_final_status(self, task: Task) -> None:
+        status = task.metadata.pop("_final_status", None)
+        finished_at = task.metadata.pop("_final_finished_at", None)
+        if status is None:
+            return
+        task.status = TaskStatus(status)
+        task.finished_at = datetime.fromisoformat(finished_at) if finished_at else datetime.now(UTC)
+        await self.repository.save_task(task)
 
     async def _save_fallback_response(self, task: Task, reason: str) -> None:
         if task.metadata.get("final_response") is not None and not task.metadata.get("final_response_pending"):
@@ -926,7 +958,7 @@ class TaskService:
         ]
         summary = task.result_summary or task.failure_reason or "Task finished without a generated report"
         task.metadata["final_response"] = AssistantResponse(
-            response_type="blocked" if task.status is TaskStatus.BLOCKED else "report",
+            response_type="blocked" if task.metadata.get("_final_status") == TaskStatus.BLOCKED.value or task.status is TaskStatus.BLOCKED else "report",
             title="Task result",
             summary=summary,
             evidence=evidence[:20],
@@ -953,12 +985,33 @@ class TaskService:
         task.status = status
         task.failure_reason = reason if status is not TaskStatus.SUCCEEDED else task.failure_reason
         task.finished_at = datetime.now(UTC)
-        await self.repository.save_task(task)
+        await self._ensure_final_response(task)
         await self.repository.save_event(
             TaskEvent(task_id=task.id, event_type=event_type, payload=payload or {"reason": reason})
         )
-        await self._ensure_final_response(task)
         return task
+
+    async def _persist_project_operation_result(self, task: Task, operation, result: dict[str, Any]) -> None:
+        if not task.project_id or not result.get("success"):
+            return
+        project = await self.repository.get_project(task.project_id)
+        if project is None or not isinstance(result.get("output"), dict):
+            return
+        output = result["output"]
+        event_type = None
+        if operation.tool == "codegraph" and operation.method == "build" and output.get("graph"):
+            project.codegraph = output
+            project.codegraph_version += 1
+            project.codegraph_updated_at = datetime.now(UTC)
+            event_type = "PROJECT_CODEGRAPH_UPDATED"
+        if operation.tool == "project" and operation.method == "audit" and output.get("audit") is not None:
+            project.last_audited_at = datetime.now(UTC)
+            event_type = "PROJECT_AUDITED"
+        if event_type:
+            await self.repository.update_project(project)
+            await self.repository.save_event(
+                TaskEvent(task_id=task.id, event_type=event_type, payload={"project_id": project.id})
+            )
 
     async def _deterministic_result_summary(self, task: Task) -> str:
         nodes = await self.repository.list_nodes(task.id)
@@ -1741,6 +1794,7 @@ class TaskService:
                     result.setdefault("metadata", {})["retry_blocked"] = (
                         "non-idempotent operation requires an explicit idempotency key"
                     )
+                await self._persist_project_operation_result(task, operation, result)
                 await self.repository.save_event(
                     TaskEvent(
                         task_id=task_id,
