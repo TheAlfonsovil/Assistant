@@ -1,255 +1,119 @@
-const state = { data: null, selectedTask: null };
+const state = { data: null, selectedTask: null, view: "overview" };
 const $ = (selector) => document.querySelector(selector);
-const esc = (value) => String(value ?? "").replace(/[&<>\"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[char]));
-const date = (value) => value ? new Date(value).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "short" }) : "-";
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[char]));
+const date = (value) => value ? new Date(value).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "medium" }) : "-";
 const shortId = (value) => value ? value.slice(0, 8) : "-";
+const json = (value) => JSON.stringify(value ?? {}, null, 2);
 
 async function api(path, options = {}) {
   const response = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(body || `HTTP ${response.status}`);
-  }
+  if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
   return response.json();
 }
-
 function toast(message, error = false) {
-  const element = $("#toast");
-  element.textContent = message;
-  element.style.background = error ? "var(--red)" : "var(--cyan)";
-  element.classList.add("show");
-  window.setTimeout(() => element.classList.remove("show"), 3000);
+  const element = $("#toast"); element.textContent = message; element.className = `toast show ${error ? "error" : ""}`;
+  window.setTimeout(() => element.classList.remove("show"), 3500);
 }
-
-async function load() {
-  try {
-    state.data = await api("/dashboard/data");
-    render();
-    $("#last-refresh").textContent = `Actualizado ${new Date().toLocaleTimeString("es-ES")}`;
-  } catch (error) {
-    toast(`No se pudo leer el runtime: ${error.message}`, true);
-  }
+function setView(view) {
+  state.view = view;
+  document.querySelectorAll("[data-view-panel]").forEach((panel) => panel.classList.toggle("active", panel.dataset.viewPanel === view));
+  document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
+  const titles = { overview: "Resumen operativo", tasks: "Tareas persistentes", trace: "Conversaciones LLM", activity: "Actividad reciente", resources: "Recursos conectados", chat: "Chat persistente" };
+  $("#view-title").textContent = titles[view] || "Operations";
+  if (view === "trace" && state.selectedTask) renderTrace(state.selectedTask);
 }
-
-function render() {
-  const data = state.data;
-  const health = data.health;
-  const metrics = health.runtime.metrics || {};
-  const tasks = data.tasks;
-  const active = tasks.filter((task) => ["QUEUED", "PLANNING", "READY", "RUNNING", "VERIFYING", "WAITING"].includes(task.status));
-  const successful = tasks.filter((task) => task.status === "SUCCEEDED").length;
-  const failed = tasks.filter((task) => ["FAILED", "BLOCKED"].includes(task.status)).length;
-
-  $("#hero-status").textContent = health.status || (health.llm_ready ? "READY" : "DEGRADED");
-  $("#hero-health").className = `health-orb ${health.llm_ready ? "" : "warning"}`;
-  $("#stats").innerHTML = [
-    ["EN EJECUCIÓN", active.length, "Tareas activas"],
-    ["COMPLETADAS", successful, "Resultado persistido"],
-    ["INCIDENTES", failed, "Fallidas o bloqueadas"],
-    ["NODOS", Object.values(data.node_status_counts).reduce((sum, value) => sum + value, 0), "En todos los grafos"],
-  ].map(([label, value, note]) => `<div class="stat"><span>${label}</span><strong>${value}</strong><small class="muted">${note}</small></div>`).join("");
-
-  renderTasks(tasks);
-  renderAnalytics(data.analytics || {});
-  renderChart(data.status_counts);
-  renderMetrics(metrics, health.runtime);
-  renderEvents(data.events);
-  renderIdle(health.runtime.idle || {});
-  renderResources(data);
-  renderChat(data.tasks);
-  fillProjects(data.projects);
-  if (state.selectedTask) renderDetail(state.selectedTask);
-}
-
 function renderIdle(idle) {
   const enabled = Boolean(idle.enabled);
   $("#idle-toggle").setAttribute("aria-pressed", String(enabled));
   $("#idle-status").textContent = enabled ? "ACTIVO" : "PAUSADO";
-  $("#idle-status").className = enabled ? "status-on" : "status-off";
-  const last = idle.last_supervision_result;
-  $("#idle-detail").textContent = last === null || last === undefined ? "sin pasada" : "supervisión lista";
 }
-
-function renderResources(data) {
-  const memoriesByKind = data.memories.reduce((counts, memory) => {
-    counts[memory.kind] = (counts[memory.kind] || 0) + 1;
-    return counts;
-  }, {});
-  const devices = (data.devices || []).map((device) => `<div class="resource-group"><div class="resource-title"><b>${esc(device.name)} · ${esc(device.platform || "generic")}</b><span class="resource-state state-${esc(device.status)}">${esc(device.status)}</span></div><small>${esc(device.description)} · transporte: ${esc(device.transport || "local")}</small><p>${device.capabilities.length ? device.capabilities.map(esc).join(" · ") : "Sin adaptador registrado"}</p></div>`).join("") || `<div class="empty">No hay dispositivos registrados.</div>`;
-  const projects = data.projects.slice(0, 5).map((project) => `<div class="resource-row"><span>${esc(project.name)}</span><small>${project.enabled ? "habilitado" : "deshabilitado"}${project.codegraph ? " · grafo disponible" : ""}</small></div>`).join("") || `<div class="empty">No hay proyectos registrados.</div>`;
-  const memories = Object.entries(memoriesByKind).map(([kind, count]) => `<div class="resource-row"><span>${esc(kind)}</span><strong>${count}</strong></div>`).join("") || `<div class="empty">No hay memoria persistida.</div>`;
-  $("#resource-summary").innerHTML = `<div class="resource-section"><p class="eyebrow">DISPOSITIVOS</p>${devices}</div><div class="resource-section"><p class="eyebrow">PROYECTOS · ${data.projects.length}</p>${projects}</div><div class="resource-section"><p class="eyebrow">MEMORIA · ${data.memories.length}</p>${memories}</div>`;
+function render(data) {
+  state.data = data;
+  const tasks = data.tasks || [], health = data.health, runtime = health.runtime || {}, metrics = runtime.metrics || {};
+  const active = tasks.filter((task) => ["QUEUED", "PLANNING", "READY", "RUNNING", "VERIFYING", "WAITING"].includes(task.status));
+  const failed = tasks.filter((task) => ["FAILED", "BLOCKED"].includes(task.status));
+  $("#hero-status").textContent = health.status || "UNKNOWN";
+  $("#runtime-label").textContent = health.llm_ready ? "READY" : "DEGRADED";
+  $("#health-dot").className = health.llm_ready ? "ready" : "warning";
+  $("#runtime-dot").className = health.llm_ready ? "ready" : "warning";
+  $("#stats").innerHTML = [["ACTIVAS", active.length], ["COMPLETADAS", tasks.filter((task) => task.status === "SUCCEEDED").length], ["INCIDENTES", failed.length], ["LLM CALLS", data.analytics?.estimated_tokens?.total ? formatNumber(data.analytics.estimated_tokens.total) : 0]].map(([label, value]) => `<div class="stat"><small>${label}</small><strong>${value}</strong></div>`).join("");
+  renderMetrics(metrics); renderChart(data.status_counts || {}); renderAnalytics(data.analytics || {}); renderTasks(tasks); renderEvents(data.events || []); renderResources(data); renderChat(tasks); fillProjects(data.projects || []); renderIdle(runtime.idle || {});
+  if (state.selectedTask) { renderInspector(state.selectedTask); renderTrace(state.selectedTask); }
 }
-
-function renderChat(tasks) {
-  const chats = tasks.filter((task) => task.source === "DASHBOARD_CHAT" || task.metadata?.interaction === "chat").slice(0, 15).reverse();
-  $("#chat-history").innerHTML = chats.map((task) => `<div class="chat-turn"><div class="chat-message user"><span>TÚ</span><p>${esc(task.goal)}</p></div><div class="chat-message assistant"><span>ASSISTANT · ${esc(task.status)}</span><p>${esc(task.result_summary || (task.status === "WAITING" ? "Necesita información adicional para continuar." : "Procesando en la cola persistente."))}</p></div></div>`).join("") || `<div class="empty">La conversación aparecerá aquí.</div>`;
+function renderMetrics(metrics) {
+  const values = [["Pasadas", metrics.passes], ["Despachos", metrics.tasks_dispatched], ["Errores", metrics.task_errors], ["Pasadas idle", metrics.idle_passes], ["Sin LLM", metrics.not_ready_passes], ["Errores runtime", metrics.runtime_errors]];
+  $("#runtime-metrics").innerHTML = values.map(([label, value]) => `<div class="metric"><small>${label}</small><b>${value ?? 0}</b></div>`).join("");
 }
-
+function renderChart(counts) {
+  const total = Math.max(1, Object.values(counts).reduce((sum, value) => sum + value, 0));
+  const order = ["RUNNING", "PLANNING", "QUEUED", "READY", "VERIFYING", "WAITING", "SUCCEEDED", "FAILED", "BLOCKED", "CANCELLED"];
+  $("#status-chart").innerHTML = order.filter((key) => counts[key]).map((key) => `<div class="bar-line"><span>${key}</span><i><b style="width:${Math.max(5, counts[key] / total * 100)}%"></b></i><strong>${counts[key]}</strong></div>`).join("") || `<div class="empty">Sin tareas persistidas.</div>`;
+}
 function renderAnalytics(analytics) {
-  const tokens = analytics.estimated_tokens || {};
-  const actualTokens = analytics.actual_tokens || {};
-  const latency = analytics.latency || {};
-  const throughput = analytics.throughput || {};
-  const model = analytics.model || "configured-provider";
-  $("#analytics-note").textContent = `${model} · tokens estimados`;
-  $("#analytics-kpis").innerHTML = [
-    ["TOKENS TOTALES", formatNumber(tokens.total), "prompt + respuesta"],
-    ["TOKENS MEDIDOS", actualTokens.available ? formatNumber(actualTokens.total) : "-", actualTokens.available ? "datos de Ollama" : "sin telemetría"],
-    ["ÉXITO", `${throughput.success_rate ?? 0}%`, `${throughput.completed_tasks ?? 0} completadas`],
-    ["DURACIÓN MEDIA", formatSeconds(latency.average_task_seconds), "por tarea terminada"],
-    ["REINTENTOS", throughput.retries ?? 0, "recuperaciones programadas"],
-  ].map(([label, value, note]) => `<div class="analytics-kpi"><span>${label}</span><strong>${value}</strong><small>${note}</small></div>`).join("");
-
+  const tokens = analytics.estimated_tokens || {}, throughput = analytics.throughput || {}, latency = analytics.latency || {};
+  $("#analytics-note").textContent = analytics.model || "modelo configurado";
+  $("#analytics-kpis").innerHTML = [["TOKENS EST.", formatNumber(tokens.total)], ["ÉXITO", `${throughput.success_rate ?? 0}%`], ["PREFILL", formatSeconds(latency.prefill_seconds)], ["GENERACIÓN", formatSeconds(latency.generation_seconds)], ["TOKENS/S", formatNumber(latency.generation_tokens_per_second)], ["REINTENTOS", throughput.retries ?? 0]].map(([label, value]) => `<div><small>${label}</small><b>${value}</b></div>`).join("");
   const phases = analytics.phase_counts || {};
-  $("#llm-analysis").innerHTML = Object.entries(phases).map(([phase, count]) => {
-    const ratio = Math.min(100, count / Math.max(1, Object.values(phases).reduce((a, b) => a + b, 0)) * 100);
-    return `<div class="analysis-row"><div><b>${esc(phase)}</b><small>${count} llamadas</small></div><div class="analysis-bar"><i style="width:${ratio}%"></i></div></div>`;
-  }).join("") || `<div class="empty">Aún no hay llamadas LLM registradas.</div>`;
-  $("#llm-analysis").insertAdjacentHTML("beforeend", `<div class="token-split"><span>Entrada <b>${formatNumber(tokens.prompt)}</b></span><span>Salida <b>${formatNumber(tokens.response)}</b></span></div>`);
-
-  const tools = analytics.tool_counts || {};
-  $("#tool-analysis").innerHTML = Object.entries(tools).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([tool, count]) => `<div class="analysis-row compact"><div><b>${esc(tool)}</b><small>${count} ejecuciones</small></div><strong>${formatSeconds(latency.average_tool_seconds)}</strong></div>`).join("") || `<div class="empty">Aún no hay herramientas ejecutadas.</div>`;
-  const durations = analytics.task_durations || [];
-  const maxDuration = Math.max(1, ...durations.map((item) => item.seconds));
-  $("#speed-analysis").innerHTML = durations.slice(0, 8).map((item) => `<div class="speed-row"><div><b>${esc(item.goal)}</b><small>${formatSeconds(item.seconds)}</small></div><div class="analysis-bar"><i style="width:${Math.max(4, item.seconds / maxDuration * 100)}%"></i></div></div>`).join("") || `<div class="empty">Completa una tarea para ver velocidad.</div>`;
+  const phaseRows = Object.entries(phases).map(([phase, count]) => `<div class="analysis-row"><span>${esc(phase)}</span><b>${count} intercambios</b></div>`).join("");
+  $("#llm-analysis").innerHTML = `<div class="timing-split"><div><small>PREFILL / entrada</small><i><b style="width:${timingRatio(latency.prefill_seconds, latency.prefill_seconds + latency.generation_seconds)}%"></b></i></div><div><small>GENERACIÓN / salida</small><i><b class="generation-bar" style="width:${timingRatio(latency.generation_seconds, latency.prefill_seconds + latency.generation_seconds)}%"></b></i></div></div>${phaseRows || `<div class="empty">Aún no hay actividad LLM.</div>`}`;
 }
-
+function renderTasks(tasks) {
+  const filter = ($( "#task-filter")?.value || "").toLowerCase().trim();
+  const filtered = tasks.filter((task) => !filter || `${task.goal} ${task.status} ${task.id}`.toLowerCase().includes(filter));
+  $("#task-list").innerHTML = filtered.map((task) => `<button class="task-card ${state.selectedTask === task.id ? "selected" : ""}" data-task="${esc(task.id)}"><i class="status-mark status-${esc(task.status)}"></i><span><strong>${esc(task.goal)}</strong><small>${shortId(task.id)} · ${date(task.created_at)}</small></span><em class="status-${esc(task.status)}">${esc(task.status)}</em></button>`).join("") || `<div class="empty">No hay tareas persistidas.</div>`;
+  $("#task-list").querySelectorAll("[data-task]").forEach((button) => button.addEventListener("click", () => selectTask(button.dataset.task)));
+}
+function renderEvents(events) {
+  $("#event-stream").innerHTML = events.slice(0, 80).map((event) => `<div class="event"><i></i><div><strong>${esc(event.event_type)}</strong><small>${shortId(event.task_id)}${event.node_id ? ` · nodo ${shortId(event.node_id)}` : ""}</small></div><time>${date(event.created_at)}</time></div>`).join("") || `<div class="empty">Sin eventos.</div>`;
+}
+function renderResources(data) {
+  const devices = (data.devices || []).map((device) => `<div class="resource"><strong>${esc(device.name)} / ${esc(device.platform || "generic")}</strong><small>${esc(device.status)} · ${esc(device.transport || "local")}</small><p>${(device.capabilities || []).map(esc).join(" · ") || "Sin adaptador"}</p></div>`).join("");
+  const projects = (data.projects || []).map((project) => `<div class="resource-line"><span>${esc(project.name)}</span><small>${project.project_type} · ${project.enabled ? "activo" : "pausado"}</small></div>`).join("");
+  $("#resource-summary").innerHTML = `<div class="resource-group"><p class="kicker">DISPOSITIVOS</p>${devices || "<div class=empty>Sin dispositivos.</div>"}</div><div class="resource-group"><p class="kicker">PROYECTOS DE CÓDIGO</p>${projects || "<div class=empty>Sin proyectos.</div>"}</div><div class="resource-group"><p class="kicker">MEMORIA</p><strong>${data.memories.length} registros persistidos</strong></div>`;
+}
+function renderChat(tasks) {
+  const chats = tasks.filter((task) => task.source === "DASHBOARD_CHAT" || task.metadata?.interaction === "chat").slice(0, 20).reverse();
+  $("#chat-history").innerHTML = chats.map((task) => `<div class="chat-turn"><small>TÚ · ${date(task.created_at)}</small><p>${esc(task.goal)}</p><div><small>ASSISTANT · ${esc(task.status)}</small><p>${esc(task.result_summary || "Procesando en la cola persistente.")}</p></div></div>`).join("") || `<div class="empty">La conversación aparecerá aquí.</div>`;
+}
+function fillProjects(projects) {
+  [$("#project"), $("#chat-project")].forEach((select) => { if (!select) return; const current = select.value; select.innerHTML = `<option value="">${select.id === "project" ? "Resolver automáticamente" : "Sin proyecto"}</option>` + projects.filter((project) => project.enabled).map((project) => `<option value="${esc(project.id)}">${esc(project.name)}${project.is_default ? " · default" : ""}</option>`).join(""); select.value = current; });
+  const trace = $("#trace-task"), current = trace.value; trace.innerHTML = `<option value="">Selecciona una tarea</option>` + (state.data?.tasks || []).map((task) => `<option value="${task.id}">${esc(task.goal)} · ${esc(task.status)}</option>`).join(""); trace.value = current || state.selectedTask || "";
+}
+function taskEvents(taskId) { return state.data?.task_events?.[taskId] || (state.data?.events || []).filter((event) => event.task_id === taskId); }
+function llmEvents(taskId) { return taskEvents(taskId).filter((event) => ["LLM_REQUEST", "LLM_RESPONSE"].includes(event.event_type)); }
+function renderTrace(taskId) {
+  if (!taskId || !state.data) return;
+  const events = llmEvents(taskId);
+  $("#trace-workspace").innerHTML = events.map((event, index) => {
+    const payload = event.payload || {}, isRequest = event.event_type === "LLM_REQUEST";
+    const request = isRequest ? payload.context : null;
+    const response = isRequest ? null : (payload.response || payload);
+    const renderedPrompt = !isRequest && payload.request ? payload.request.rendered_instructions : null;
+    const body = isRequest ? `<div class="trace-block"><label>CONTEXTO ESTRUCTURADO</label><pre>${esc(json(request))}</pre></div>` : `<div class="trace-block"><label>RESPUESTA VALIDADA</label><pre>${esc(json(response))}</pre></div>${renderedPrompt ? `<details class="trace-prompt"><summary>PROMPT RENDERIZADO REAL · ${payload.request.prompt_chars} caracteres</summary><pre>${esc(renderedPrompt)}</pre></details>` : ""}`;
+    return `<article class="llm-card"><header><span class="trace-number">${String(index + 1).padStart(2, "0")}</span><div><strong>${isRequest ? "REQUEST / contexto enviado" : "RESPONSE / respuesta recibida"}</strong><small>${esc(payload.role || "LLM")} · ${date(event.created_at)} · ${payload.context_chars || payload.response_chars || 0} caracteres</small></div><em>${isRequest ? "OUT" : "IN"}</em></header><div class="trace-meta"><span>${isRequest ? "Contexto al proveedor" : "Decisión + prompt real"}</span><span>${payload.usage ? `${payload.usage.prompt_eval_count || 0} prompt · ${payload.usage.eval_count || 0} response tokens` : "telemetría no disponible"}</span></div>${body}</article>`;
+  }).join("") || `<div class="empty">Esta tarea aún no tiene intercambios LLM persistidos.</div>`;
+}
+function renderInspector(taskId) {
+  const task = state.data?.tasks.find((item) => item.id === taskId); if (!task) return;
+  const nodes = state.data.task_nodes[taskId] || [], usage = (state.data.analytics?.task_usage || []).find((item) => item.id === taskId);
+  $("#task-inspector").className = "panel inspector";
+  $("#task-inspector").innerHTML = `<div class="inspector-head"><div><p class="kicker">TASK INSPECTOR</p><h3>${esc(task.goal)}</h3><small>${shortId(task.id)} · ${esc(task.status)}</small></div><span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div><div class="inspector-actions">${["WAITING", "BLOCKED"].includes(task.status) ? `<button class="button primary" data-action="input">Resolver</button>` : ""}${task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : ""}${!["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? `<button class="button ghost" data-action="cancel">Cancelar</button>` : ""}<button class="button ghost" data-action="trace">Ver LLM trace</button></div><div class="usage-strip"><span>LLM <b>${usage?.llm_calls || 0}</b></span><span>TOOLS <b>${usage?.tool_calls || 0}</b></span><span>NODOS <b>${nodes.length}</b></span><span>TOKENS <b>${formatNumber(usage?.estimated_tokens || 0)}</b></span></div><p class="kicker">NODOS DEL GRAFO</p><div class="node-list">${nodes.map((node) => `<div class="node-row"><i class="status-mark status-${esc(node.status)}"></i><div><strong>${esc(node.description)}</strong><small>${esc(node.type)} · ${esc(node.status)}${node.error ? ` · ${esc(node.error)}` : ""}</small></div></div>`).join("") || "<div class=empty>Sin nodos.</div>"}</div>`;
+  $("#task-inspector").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => taskAction(button.dataset.action, task)));
+}
+function selectTask(taskId) { state.selectedTask = taskId; renderTasks(state.data.tasks); renderInspector(taskId); renderTrace(taskId); }
+async function taskAction(action, task) { try { if (action === "cancel") await api(`/tasks/${task.id}/cancel`, { method: "POST" }); if (action === "resume") await api(`/tasks/${task.id}/resume`, { method: "POST" }); if (action === "trace") { setView("trace"); return; } if (action === "input") { const value = window.prompt("Input JSON para la tarea", "{}"); if (value === null) return; await api(`/tasks/${task.id}/input`, { method: "POST", body: JSON.stringify({ input: JSON.parse(value) }) }); } toast("Orden actualizada"); await load(); } catch (error) { toast(`No se pudo actualizar: ${error.message}`, true); } }
 function formatNumber(value) { return new Intl.NumberFormat("es-ES").format(value || 0); }
 function formatSeconds(value) { const seconds = Number(value || 0); return seconds < 60 ? `${seconds.toFixed(1)}s` : `${(seconds / 60).toFixed(1)}m`; }
+function timingRatio(value, total) { return total ? Math.max(4, Number(value || 0) / total * 100) : 4; }
+async function load() { try { const data = await api("/dashboard/data"); render(data); $("#last-refresh").textContent = `Actualizado ${new Date().toLocaleTimeString("es-ES")}`; } catch (error) { toast(`No se pudo leer el runtime: ${error.message}`, true); } }
 
-function renderTasks(tasks) {
-  const list = $("#task-list");
-  const filter = ($("#task-filter")?.value || "").toLowerCase().trim();
-  tasks = tasks.filter((task) => !filter || `${task.goal} ${task.status} ${task.id}`.toLowerCase().includes(filter));
-  if (!tasks.length) {
-    list.innerHTML = `<div class="empty">No hay tareas persistidas. Lanza una orden para empezar.</div>`;
-    return;
-  }
-  list.innerHTML = tasks.slice(0, 25).map((task) => `<div class="task-row" data-task="${esc(task.id)}">
-    <i class="task-accent status-${esc(task.status)}"></i><div><h3>${esc(task.goal)}</h3><span class="task-meta">${shortId(task.id)} · ${date(task.created_at)} · prioridad ${task.priority}</span></div><span class="badge status-${esc(task.status)}">${esc(task.status)}</span>
-  </div>`).join("");
-  list.querySelectorAll("[data-task]").forEach((row) => row.addEventListener("click", () => selectTask(row.dataset.task)));
-}
-
-function renderChart(counts) {
-  const total = Object.values(counts).reduce((sum, value) => sum + value, 0) || 1;
-  const order = ["RUNNING", "PLANNING", "QUEUED", "READY", "VERIFYING", "WAITING", "SUCCEEDED", "FAILED", "BLOCKED", "CANCELLED"];
-  $("#status-chart").innerHTML = order.filter((status) => counts[status]).map((status) => `<div class="bar-line"><span>${status}</span><div class="bar"><i style="width:${Math.max(4, counts[status] / total * 100)}%"></i></div><b>${counts[status]}</b></div>`).join("") || `<div class="empty">Sin actividad todavía</div>`;
-}
-
-function renderMetrics(metrics, runtime) {
-  const entries = [["Pasadas", metrics.passes], ["Despachos", metrics.tasks_dispatched], ["Errores de tarea", metrics.task_errors], ["Pasadas idle", metrics.idle_passes], ["Sin LLM", metrics.not_ready_passes], ["Errores runtime", metrics.runtime_errors]];
-  $("#runtime-metrics").innerHTML = entries.map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value ?? 0}</strong></div>`).join("");
-  if (runtime.last_error) toast(`Runtime: ${runtime.last_error}`, true);
-}
-
-function renderEvents(events) {
-  $("#event-stream").innerHTML = events.slice(0, 35).map((event) => `<div class="event"><i></i><div><b>${esc(event.event_type)}</b><span>${shortId(event.task_id)}${event.node_id ? ` · nodo ${shortId(event.node_id)}` : ""}</span></div><time>${date(event.created_at)}</time></div>`).join("") || `<div class="empty">El stream aparecerá cuando exista actividad.</div>`;
-}
-
-function fillProjects(projects) {
-  const select = $("#project");
-  const current = select.value;
-  select.innerHTML = `<option value="">Resolver automáticamente</option>` + projects.filter((project) => project.enabled).map((project) => `<option value="${esc(project.id)}">${esc(project.name)}${project.is_default ? " · default" : ""}</option>`).join("");
-  select.value = current;
-  const chatSelect = $("#chat-project");
-  const chatCurrent = chatSelect.value;
-  chatSelect.innerHTML = `<option value="">Sin proyecto</option>` + projects.filter((project) => project.enabled).map((project) => `<option value="${esc(project.id)}">${esc(project.name)}</option>`).join("");
-  chatSelect.value = chatCurrent;
-}
-
-function selectTask(taskId) {
-  state.selectedTask = taskId;
-  renderDetail(taskId);
-  $("#detail-panel").scrollIntoView({ behavior: "smooth", block: "start" });
-}
-
-function renderDetail(taskId) {
-  const task = state.data.tasks.find((item) => item.id === taskId);
-  if (!task) return;
-  const nodes = state.data.task_nodes[taskId] || [];
-  const edges = state.data.task_edges[taskId] || [];
-  const events = state.data.events.filter((event) => event.task_id === taskId).slice(0, 40);
-  const usage = (state.data.analytics?.task_usage || []).find((item) => item.id === taskId);
-  const nodeUsage = state.data.analytics?.node_usage || {};
-  const llmTrace = events.filter((event) => ["LLM_REQUEST", "LLM_RESPONSE"].includes(event.event_type));
-  $("#detail-panel").classList.remove("hidden");
-  $("#detail-title").textContent = task.goal;
-  const controls = ["WAITING", "BLOCKED"].includes(task.status) ? `<button class="button primary" data-action="input">${task.status === "BLOCKED" ? "Resolver bloqueo" : "Aportar input"}</button>` : "";
-  const resume = task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : "";
-  const cancel = ["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? "" : `<button class="button" data-action="cancel">Cancelar</button>`;
-  const nodeNames = Object.fromEntries(nodes.map((node) => [node.id, node.description]));
-  const usageBlock = usage ? `<div class="usage-strip"><span>LLM <b>${usage.llm_calls}</b></span><span>TOOLS <b>${usage.tool_calls}</b></span><span>NODOS <b>${usage.nodes}</b></span><span>TOKENS <b>${formatNumber(usage.estimated_tokens)}</b></span><span>TIEMPO <b>${formatSeconds(usage.duration_seconds)}</b></span></div>` : "";
-  const trace = llmTrace.map((event) => `<details class="trace-entry" ${event.event_type === "LLM_RESPONSE" ? "open" : ""}><summary>${esc(event.event_type)} · ${esc(event.payload?.role || "LLM")}</summary><pre>${esc(JSON.stringify(event.payload, null, 2))}</pre></details>`).join("") || "<div class=empty>Esta tarea aún no tiene trazas LLM.</div>";
-  $("#detail-content").innerHTML = `<div class="detail-actions">${controls}${resume}${cancel}<span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div>${usageBlock}<div class="llm-trace"><p class="eyebrow">LLM TRACE · REQUEST / RESPONSE</p>${trace}</div><div class="detail-grid"><div><p class="eyebrow">GRAPH NODES · ${nodes.length}</p><div class="node-list">${nodes.map((node) => { const item = nodeUsage[node.id] || {}; return `<div class="node-item status-${esc(node.status)}"><strong>${esc(node.description)}</strong><small>${esc(node.type)} · ${esc(node.status)} · retries ${node.retry_count}</small><small>${item.llm_calls || 0} LLM · ${item.tool_calls || 0} tools · ${formatNumber(item.estimated_tokens)} tokens est.</small>${node.error ? `<small>${esc(node.error)}</small>` : ""}</div>`; }).join("") || "<div class=empty>El grafo todavía no se ha generado.</div>"}</div><p class="eyebrow graph-label">DEPENDENCIES · ${edges.length}</p><div class="node-list">${edges.map((edge) => `<div class="node-item"><small>${esc(nodeNames[edge.from_node] || shortId(edge.from_node))} → ${esc(nodeNames[edge.to_node] || shortId(edge.to_node))} · ${esc(edge.dependency_type)}</small></div>`).join("") || "<div class=empty>Sin dependencias.</div>"}</div></div><div><p class="eyebrow">TASK EVENTS</p><div class="detail-events">${events.map((event) => `<div class="event"><i></i><div><b>${esc(event.event_type)}</b><span>${esc(event.payload?.reason || event.payload?.role || "evento persistido")}</span></div><time>${date(event.created_at)}</time></div>`).join("") || "<div class=empty>Sin eventos.</div>"}</div></div></div>`;
-  $("#detail-content").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => taskAction(button.dataset.action, task)));
-}
-
-function selectModule(module) {
-  document.querySelectorAll(".module-panel, [data-module].module-panel, main > [data-module], main > div[data-module]").forEach((element) => {
-    element.classList.toggle("module-hidden", element.dataset.module !== module);
-  });
-  document.querySelectorAll("[data-module-target]").forEach((button) => {
-    button.classList.toggle("active", button.dataset.moduleTarget === module);
-  });
-  state.activeModule = module;
-}
-
-async function taskAction(action, task) {
-  try {
-    if (action === "cancel") await api(`/tasks/${task.id}/cancel`, { method: "POST" });
-    if (action === "resume") await api(`/tasks/${task.id}/resume`, { method: "POST" });
-    if (action === "input") {
-      const answer = window.prompt("Input JSON para la tarea", "{}");
-      if (answer === null) return;
-      await api(`/tasks/${task.id}/input`, { method: "POST", body: JSON.stringify({ input: JSON.parse(answer) }) });
-    }
-    toast("Orden actualizada");
-    await load();
-  } catch (error) { toast(`No se pudo actualizar: ${error.message}`, true); }
-}
-
+document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
 $("#refresh").addEventListener("click", load);
-document.querySelectorAll("[data-module-target]").forEach((button) => button.addEventListener("click", () => selectModule(button.dataset.moduleTarget)));
-$("#idle-toggle").addEventListener("click", async () => {
-  try {
-    const enabled = $("#idle-toggle").getAttribute("aria-pressed") !== "true";
-    const idle = await api("/runtime/idle", { method: "PUT", body: JSON.stringify({ enabled }) });
-    renderIdle(idle); toast(`Ciclo idle ${idle.enabled ? "activado" : "pausado"}`);
-  } catch (error) { toast(`No se pudo cambiar idle: ${error.message}`, true); await load(); }
-});
-$("#reset-memory").addEventListener("click", async () => {
-  if (!window.confirm("Esto borrará tareas, eventos, grafos, leases, resultados y memoria. Los proyectos se conservarán. ¿Continuar?")) return;
-  try {
-    const result = await api("/memory/reset", { method: "POST" });
-    state.selectedTask = null;
-    toast(`Estado restablecido: ${result.total} registros eliminados`);
-    await load();
-  } catch (error) { toast(`No se pudo reiniciar la memoria: ${error.message}`, true); }
-});
+$("#idle-toggle").addEventListener("click", async () => { try { const enabled = $("#idle-toggle").getAttribute("aria-pressed") !== "true"; renderIdle(await api("/runtime/idle", { method: "PUT", body: JSON.stringify({ enabled }) })); } catch (error) { toast(error.message, true); } });
+$("#reset-memory").addEventListener("click", async () => { if (!window.confirm("Borrar tareas, grafos, eventos, leases, resultados y memoria? Los proyectos se conservan.")) return; try { const result = await api("/runtime/reset", { method: "POST" }); state.selectedTask = null; toast(`Estado limpio: ${result.total} registros eliminados`); await load(); } catch (error) { toast(error.message, true); } });
 $("#task-filter").addEventListener("input", () => state.data && renderTasks(state.data.tasks));
-$("#new-task").addEventListener("click", () => $("#modal").classList.remove("hidden"));
-$("#close-modal").addEventListener("click", () => $("#modal").classList.add("hidden"));
-$("#close-detail").addEventListener("click", () => { state.selectedTask = null; $("#detail-panel").classList.add("hidden"); });
-$("#task-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  try {
-    const body = { goal: $("#goal").value, priority: Number($("#priority").value || 0) };
-    if ($("#project").value) body.project_id = $("#project").value;
-    const task = await api("/tasks", { method: "POST", body: JSON.stringify(body) });
-    $("#modal").classList.add("hidden"); $("#goal").value = ""; toast(`Orden creada: ${shortId(task.id)}`); await load(); selectTask(task.id);
-  } catch (error) { toast(`No se pudo crear: ${error.message}`, true); }
-});
-$("#chat-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  try {
-    const task = await api("/chat", { method: "POST", body: JSON.stringify({ message: $("#chat-message").value, project_id: $("#chat-project").value || null }) });
-    $("#chat-message").value = "";
-    toast(`Consulta en cola: ${shortId(task.id)}`);
-    await load();
-  } catch (error) { toast(`No se pudo enviar el mensaje: ${error.message}`, true); }
-});
-selectModule("overview");
-load();
-window.setInterval(load, 5000);
+$("#trace-task").addEventListener("change", (event) => { state.selectedTask = event.target.value || null; renderTrace(state.selectedTask); });
+$("#new-task").addEventListener("click", () => $("#modal").classList.remove("hidden")); $("#close-modal").addEventListener("click", () => $("#modal").classList.add("hidden"));
+$("#task-form").addEventListener("submit", async (event) => { event.preventDefault(); try { const body = { goal: $("#goal").value, priority: Number($("#priority").value || 0) }; if ($("#project").value) body.project_id = $("#project").value; const task = await api("/tasks", { method: "POST", body: JSON.stringify(body) }); $("#modal").classList.add("hidden"); $("#goal").value = ""; await load(); selectTask(task.id); setView("tasks"); } catch (error) { toast(error.message, true); } });
+$("#chat-form").addEventListener("submit", async (event) => { event.preventDefault(); try { await api("/chat", { method: "POST", body: JSON.stringify({ message: $("#chat-message").value, project_id: $("#chat-project").value || null }) }); $("#chat-message").value = ""; toast("Consulta enviada a la cola"); await load(); } catch (error) { toast(error.message, true); } });
+setView("overview"); load(); window.setInterval(load, 5000);

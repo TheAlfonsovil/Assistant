@@ -68,6 +68,9 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
     estimated_response_tokens = 0
     actual_prompt_tokens = 0
     actual_response_tokens = 0
+    prefill_seconds = 0.0
+    generation_seconds = 0.0
+    measured_generation_tokens = 0
     llm_latency = []
     tool_latency = []
     retries = 0
@@ -96,6 +99,9 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             usage = payload.get("usage", {})
             actual_prompt_tokens += int(usage.get("prompt_eval_count", 0) or 0)
             actual_response_tokens += int(usage.get("eval_count", 0) or 0)
+            prefill_seconds += float(usage.get("prompt_eval_duration", 0) or 0) / 1_000_000_000
+            generation_seconds += float(usage.get("eval_duration", 0) or 0) / 1_000_000_000
+            measured_generation_tokens += int(usage.get("eval_count", 0) or 0)
             request_key = (event.task_id, event.node_id, payload.get("role", "unknown"))
             requested_at = llm_requests.get(request_key)
             if requested_at is not None:
@@ -175,6 +181,11 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             "average_task_seconds": round(sum(durations) / len(durations), 2) if durations else 0,
             "average_llm_seconds": round(sum(llm_latency) / len(llm_latency), 2) if llm_latency else 0,
             "average_tool_seconds": round(sum(tool_latency) / len(tool_latency), 2) if tool_latency else 0,
+            "prefill_seconds": round(prefill_seconds, 2),
+            "generation_seconds": round(generation_seconds, 2),
+            "generation_tokens_per_second": round(
+                measured_generation_tokens / generation_seconds, 2
+            ) if generation_seconds else 0,
         },
         "throughput": {
             "completed_tasks": completed,
@@ -294,6 +305,10 @@ async def dashboard_data(request: Request):
             for task_id, edges in task_edges.items()
         },
         "events": [event.model_dump(mode="json") for event in events[:200]],
+        "task_events": {
+            task_id: [event.model_dump(mode="json") for event in task_events[task_id]]
+            for task_id in task_events
+        },
         "status_counts": status_counts,
         "node_status_counts": node_status_counts,
         "projects": [project.model_dump(mode="json") for project in projects],

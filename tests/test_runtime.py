@@ -9,6 +9,7 @@ import pytest
 from assistant.application import TaskService
 from assistant.config import Settings
 from assistant.context import ContextBuilder
+from assistant.prompts.v1.template import render
 from assistant.devices.computer.browser import BrowserTool
 from assistant.devices.computer.web import WebTool
 from assistant.devices.registry import DEVICE_BRANCHES, build_tool_registry
@@ -219,7 +220,7 @@ async def test_codegraph_builds_system_relationships_and_prompt_context(tmp_path
     planner_context = await context.for_planner(
         Task(goal="understand the system", metadata={"include_system_graph": True})
     )
-    assert planner_context["system_graph"]["graph"]["nodes"]
+    assert "system_graph" not in planner_context
 
 
 @pytest.mark.asyncio
@@ -792,6 +793,30 @@ async def test_ollama_provider_traces_prompt_and_validated_response():
 
 
 @pytest.mark.asyncio
+async def test_ollama_provider_exposes_prefill_and_generation_timing():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "response": '{"task_id": null, "nodes": []}',
+                "prompt_eval_count": 1200,
+                "eval_count": 240,
+                "prompt_eval_duration": 2_000_000_000,
+                "eval_duration": 3_000_000_000,
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OllamaLLMProvider("http://ollama.test", "test-model", client=client)
+    await provider.plan({"task": {"goal": "timing"}})
+
+    assert provider.last_usage["prompt_eval_duration"] == 2_000_000_000
+    assert provider.last_usage["eval_duration"] == 3_000_000_000
+    assert provider.last_usage["prompt_eval_count"] == 1200
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_ollama_circuit_breaker_opens_after_repeated_failures():
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, text="unavailable")
@@ -895,7 +920,55 @@ async def test_context_builder_separates_planner_and_resolver_context():
     assert "constraints" in planner_context
     assert resolver_context["node"]["description"] == "run tests"
     assert "node" not in planner_context
-    assert planner_context["relevant_memory"][0]["key"] == "language"
+    assert planner_context["long_term_memory"][0]["key"] == "language"
+    assert "relevant_memory" not in planner_context
+    assert "available_tools" not in planner_context
+    assert "relevant_memory" not in resolver_context
+    assert "available_tools" not in resolver_context
+
+
+@pytest.mark.asyncio
+async def test_all_llm_contexts_match_their_role_templates_and_stay_bounded():
+    class Repository:
+        async def search_memory(self, query):
+            return [MemoryRecord(kind="system", key="policy", value="data only")]
+
+    task = Task(goal="inspect project")
+    node = TaskNode(
+        task_id=task.id,
+        type=NodeType.OPERATION,
+        description="run tests",
+        status=NodeStatus.READY,
+        metadata={"acceptance": {"exit_code": 0}},
+    )
+    graph = TaskGraph([node])
+    operation = Operation(tool="shell", method="exec", args={"command": "pytest -q"})
+    result = OperationResult(success=False, error="failed", output={"exit_code": 1})
+    builder = ContextBuilder(Repository(), ToolRegistry())
+    contexts = {
+        "planner": await builder.for_planner(task),
+        "node_resolver": await builder.for_resolver(task, node, graph),
+        "replanner": await builder.for_replanner(task, node, graph, result),
+        "verifier": await builder.for_verifier(task, node, operation, result),
+        "final_response": await builder.for_final_response(
+            task,
+            [
+                type("Event", (), {"event_type": "TOOL_RESULT", "payload": {"output": "x" * 10000}})()
+            ],
+        ),
+    }
+
+    for role, context in contexts.items():
+        template = (Path(__file__).parents[1] / "assistant" / "prompts" / "v1" / f"{role}.md").read_text()
+        rendered = render(template, context, {})
+        assert "{{" not in rendered
+        assert len(rendered) < 15000
+
+    assert "project" not in contexts["planner"]
+    assert "system_graph" not in contexts["node_resolver"]
+    assert "graph" not in contexts["replanner"]
+    assert "failed_node" in contexts["replanner"]["failure_context"]
+    assert len(contexts["final_response"]["events"][0]["payload"]["output"]) == 2000 + len("... [truncated]")
 
 
 @pytest.mark.asyncio

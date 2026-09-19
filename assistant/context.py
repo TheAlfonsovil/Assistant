@@ -35,9 +35,6 @@ class ContextBuilder:
                 "deadline": task.deadline,
                 "metadata": task.metadata,
             },
-            "project": await self._project_context(
-                task.project_id, include_graph=bool(task.metadata.get("include_project_graph"))
-            ),
             "constraints": {
                 "max_retries": task.budget.max_retries,
                 "max_execution_time": task.budget.max_execution_time,
@@ -50,11 +47,8 @@ class ContextBuilder:
                     "A direct answer must contain no executable nodes.",
                 ],
             },
-            "available_tools": [definition.model_dump() for definition in self.tools.definitions()],
             "available_actions": [definition.model_dump() for definition in self.tools.definitions()],
-            "relevant_memory": memories,
             "long_term_memory": memories,
-            "system_graph": await self._system_graph_context(task),
         }
 
     async def for_resolver(self, task: Task, node: TaskNode, graph: TaskGraph) -> dict[str, Any]:
@@ -72,17 +66,6 @@ class ContextBuilder:
                         "error": dependency.error,
                     }
                 )
-        completed_results = [
-            {
-                "node_id": candidate.id,
-                "description": candidate.description,
-                "output": compact(candidate.output_data, limit=3000),
-            }
-            for candidate in graph.nodes.values()
-            if candidate.id != node.id
-            and candidate.status.value == "SUCCEEDED"
-            and candidate.output_data
-        ][-12:]
         completed_artifacts = [
             {
                 "node_id": candidate.id,
@@ -103,11 +86,7 @@ class ContextBuilder:
                 "workspace_root": self.workspace_root,
             },
             "long_term_memory": memories,
-            "relevant_memory": memories,
             "task": {"id": task.id, "goal": task.goal, "status": task.status},
-            "project": await self._project_context(
-                task.project_id, include_graph=bool(task.metadata.get("include_project_graph"))
-            ),
             "node": {
                 "id": node.id,
                 "type": node.type,
@@ -121,9 +100,7 @@ class ContextBuilder:
                 "review_status": node.metadata.get("review_status"),
             },
             "dependency_results": dependency_results,
-            "completed_results": completed_results,
             "completed_artifacts": completed_artifacts[-20:],
-            "available_tools": [definition.model_dump() for definition in self.tools.definitions()],
             "available_actions": [definition.model_dump() for definition in self.tools.definitions()],
             "constraints": {
                 "deadline": task.deadline,
@@ -131,7 +108,6 @@ class ContextBuilder:
                 "must_choose_one_action": True,
                 "do_not_repeat_previous_error": bool(node.error),
             },
-            "system_graph": await self._system_graph_context(task),
         }
 
     async def _project_context(
@@ -191,21 +167,21 @@ class ContextBuilder:
     ) -> dict[str, Any]:
         return {
             "phase": "VERIFIER",
-            "task_goal": task.goal,
+            "user_prompt": task.goal,
+            "task": {"id": task.id, "goal": task.goal, "status": task.status},
             "node": {
                 "id": node.id,
                 "description": node.description,
                 "acceptance": node.metadata.get("acceptance", {}),
             },
-            "operation": operation.model_dump(mode="json"),
-            "result": result.model_dump(mode="json"),
-            "success_evidence": {
+            "execution_evidence": {
+                "operation": compact(operation.model_dump(mode="json"), limit=2000),
+                "result": compact(result.model_dump(mode="json"), limit=5000),
                 "exit_code": result.output.get("exit_code")
                 if isinstance(result.output, dict)
                 else None,
-                "output": result.output,
-                "artifacts": result.artifacts,
             },
+            "constraints": {"acceptance": node.metadata.get("acceptance", {})},
         }
 
     async def for_replanner(
@@ -221,26 +197,31 @@ class ContextBuilder:
                 "workspace_root": self.workspace_root,
             },
             "task": {"id": task.id, "goal": task.goal, "status": task.status},
-            "project": await self._project_context(
-                task.project_id, include_graph=bool(task.metadata.get("include_project_graph"))
-            ),
             "long_term_memory": memories,
-            "failed_node": {"id": node.id, "description": node.description, "error": node.error},
-            "failure": failure.model_dump(mode="json"),
-            "recovery_policy": {
-                "max_attempts": task.budget.max_recovery_attempts,
-                "attempts_used": task.metadata.get("recovery_attempts", 0),
-                "allowed_strategies": ["RETRY_NODE", "FIX", "RESTART_TASK", "BLOCK"],
-                "instruction": "Prefer the smallest safe recovery. Preserve completed nodes and evidence.",
+            "failure_context": {
+                "failed_node": {"id": node.id, "description": node.description, "error": node.error},
+                "failure": compact(failure.model_dump(mode="json"), limit=5000),
+                "recovery_policy": {
+                    "max_attempts": task.budget.max_recovery_attempts,
+                    "attempts_used": task.metadata.get("recovery_attempts", 0),
+                    "allowed_strategies": ["RETRY_NODE", "FIX", "RESTART_TASK", "BLOCK"],
+                },
             },
-            "graph": {
-                "nodes": [
-                    {"id": item.id, "description": item.description, "status": item.status}
-                    for item in graph.nodes.values()
-                ],
-                "edges": [edge.model_dump() for edge in graph.edges],
-            },
-            "instruction": "Choose a changed strategy; do not repeat the failed operation unchanged.",
-            "available_tools": [definition.model_dump() for definition in self.tools.definitions()],
             "available_actions": [definition.model_dump() for definition in self.tools.definitions()],
+        }
+
+    async def for_final_response(self, task: Task, events: list[Any]) -> dict[str, Any]:
+        return {
+            "phase": "FINAL_RESPONSE",
+            "user_prompt": task.goal,
+            "task": task.model_dump(mode="json"),
+            "assistant_state": {"status": task.status.value},
+            "events": [
+                {
+                    "event": event.event_type,
+                    "payload": compact(event.payload, limit=2000),
+                }
+                for event in events[-40:]
+            ],
+            "long_term_memory": [],
         }

@@ -178,6 +178,7 @@ class OllamaLLMProvider:
         self._consecutive_failures = 0
         self._circuit_opened_at: float | None = None
         self.last_usage: dict[str, int] = {}
+        self.last_request: dict[str, Any] = {}
 
     @property
     def circuit_state(self) -> str:
@@ -237,6 +238,12 @@ class OllamaLLMProvider:
             "role": role,
             "instructions": rendered_instructions,
         }
+        self.last_request = {
+            "role": role,
+            "prompt": prompt,
+            "rendered_instructions": rendered_instructions,
+            "prompt_chars": len(rendered_instructions),
+        }
         started = time.perf_counter()
         self._trace(
             {
@@ -272,7 +279,14 @@ class OllamaLLMProvider:
             raw = payload.get("response", payload)
             self.last_usage = {
                 key: int(payload[key])
-                for key in ("prompt_eval_count", "eval_count")
+                for key in (
+                    "prompt_eval_count",
+                    "eval_count",
+                    "prompt_eval_duration",
+                    "eval_duration",
+                    "load_duration",
+                    "total_duration",
+                )
                 if isinstance(payload.get(key), (int, float))
             }
             raw_chars = len(raw) if isinstance(raw, str) else len(json.dumps(raw, default=str))

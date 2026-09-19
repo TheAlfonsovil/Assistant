@@ -35,9 +35,12 @@ def render(template: str, context: dict[str, Any], output_schema: dict[str, Any]
         "node": context.get("node", {}),
         "dependencies": context.get("dependency_results", []),
         "completed_artifacts": context.get("completed_artifacts", []),
-        "available_actions": context.get("available_tools", []),
+        "available_actions": context.get("available_actions", context.get("available_tools", [])),
         "constraints": context.get("constraints", {}),
-        "failure_context": context.get("failure", context.get("failed_node", {})),
+        "failure_context": context.get(
+            "failure_context",
+            {"failure": context.get("failure"), "failed_node": context.get("failed_node")},
+        ),
         "execution_evidence": context.get("events", context.get("dependency_results", [])),
         "output_schema": output_schema,
     }

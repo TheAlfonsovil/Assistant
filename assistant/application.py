@@ -589,10 +589,11 @@ class TaskService:
         failure = OperationResult(success=False, error=reason, error_type=ErrorType.UNKNOWN)
         context = await self.context_builder.for_replanner(task, node, graph, failure)
         branch_name = f"assistant/recovery/{task.id[:8]}-{attempts + 1}"
-        context["recovery_policy"]["failed_node_id"] = node.id
-        context["recovery_policy"]["branch_name"] = branch_name
-        context["recovery_policy"]["deployment"] = "Use only a registered deployment tool; otherwise finish BLOCKED."
-        context["recovery_policy"]["task_restart_warning"] = (
+        recovery_policy = context["failure_context"]["recovery_policy"]
+        recovery_policy["failed_node_id"] = node.id
+        recovery_policy["branch_name"] = branch_name
+        recovery_policy["deployment"] = "Use only a registered deployment tool; otherwise finish BLOCKED."
+        recovery_policy["task_restart_warning"] = (
             "Restart only when preserving the current graph would be unsafe."
         )
         try:
@@ -760,13 +761,10 @@ class TaskService:
         await self.repository.save_task(task)
         try:
             events = await self.repository.list_events(task.id)
-            response_context = {
-                "phase": "FINAL_RESPONSE",
-                "user_prompt": task.goal,
-                "task": task.model_dump(mode="json"),
-                "assistant_state": {"status": task.status.value},
-                "events": [
-                    {"event": event.event_type, "payload": event.payload}
+            response_context = await self.context_builder.for_final_response(
+                task,
+                [
+                    event
                     for event in events
                     if event.event_type
                     in {
@@ -782,8 +780,7 @@ class TaskService:
                         "RETRY_SCHEDULED",
                     }
                 ],
-                "long_term_memory": [],
-            }
+            )
             response = await asyncio.wait_for(
                 respond(response_context),
                 timeout=min(60.0, max(1.0, task.budget.max_execution_time)),
@@ -1058,7 +1055,7 @@ class TaskService:
                         event_type="LLM_REQUEST",
                         payload={
                             "role": "PLANNER",
-                            "context": compact(planner_context),
+                            "context": json.loads(json.dumps(planner_context, default=str)),
                             "context_chars": len(json.dumps(planner_context, default=str)),
                         },
                     )
@@ -1080,6 +1077,8 @@ class TaskService:
                         event_type="LLM_RESPONSE",
                         payload={
                             "role": "PLANNER",
+                            "response": proposal.model_dump(mode="json"),
+                            "request": getattr(self.llm, "last_request", {}),
                             "nodes": [
                                 {
                                     "id": item.id,
@@ -1340,7 +1339,7 @@ class TaskService:
                     payload={
                         "role": "NODE_RESOLVER",
                         "description": node.description,
-                        "context": compact(context),
+                        "context": json.loads(json.dumps(context, default=str)),
                         "context_chars": len(json.dumps(context, default=str)),
                     },
                 )
@@ -1366,6 +1365,8 @@ class TaskService:
                     event_type="LLM_RESPONSE",
                     payload={
                         "role": "NODE_RESOLVER",
+                        "response": decision.model_dump(mode="json"),
+                        "request": getattr(self.llm, "last_request", {}),
                         "action": decision.action,
                         "tool": decision.operation.tool if decision.operation else None,
                         "method": decision.operation.method if decision.operation else None,
