@@ -23,8 +23,13 @@ AVAILABLE ACTIONS
 CONSTRAINTS
 {{constraints}}
 
+PLANNER FEEDBACK
+{{planner_feedback}}
+
 DECISION RULES
 - Return JSON only and follow the schema below.
+- `coverage` is only a list of goals covered by the plan. It is never executable
+  work and it cannot be used instead of `nodes` or `subtasks`.
 - For a simple factual, conversational, or computational request that needs no tool, return an empty `nodes` list and put the answer in the `answer` field.
 - For any request that changes files, uses an external service, needs current computer state, or has multiple steps, return executable nodes and leave `answer` null.
 - Treat audit, review, inspect, test, fix, improve, refactor, Sonar, and rework as
@@ -74,6 +79,40 @@ COMPACT EXAMPLES
 - Direct question with no external work: return {"answer":"...","nodes":[],"subtasks":[]}.
 - Never return {"answer":null,"nodes":[],"subtasks":[]} for an audit, review,
   inspection, analysis, implementation, test, or report request.
+
+VALID RESPONSE EXAMPLE FOR A MULTI-STEP REQUEST
+{
+  "task_id": null,
+  "answer": null,
+  "coverage": ["Actualizar el codegraph", "Auditar el proyecto"],
+  "nodes": [
+    {
+      "id": "build-codegraph",
+      "description": "Actualizar el codegraph del proyecto",
+      "type": "OPERATION",
+      "dependencies": [],
+      "dependency_types": {},
+      "priority": 1,
+      "acceptance": {"contains": ["graph"]},
+      "metadata": {}
+    },
+    {
+      "id": "audit-project",
+      "description": "Auditar estructura, configuración, dependencias y tests del proyecto",
+      "type": "OPERATION",
+      "dependencies": ["build-codegraph"],
+      "dependency_types": {},
+      "priority": 1,
+      "acceptance": {"contains": ["audit"]},
+      "metadata": {}
+    }
+  ],
+  "subtasks": []
+}
+
+INVALID RESPONSE EXAMPLE
+{"task_id": null, "answer": null, "coverage": ["Actualizar el codegraph", "Auditar el proyecto"], "nodes": [], "subtasks": []}
+The invalid example must be corrected by returning executable nodes, not accepted as a plan.
 
 Required response shape:
 {

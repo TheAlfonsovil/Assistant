@@ -58,6 +58,7 @@ class ContextBuilder:
                     "A direct answer must contain no executable nodes.",
                 ],
             },
+            "planner_feedback": "",
             "available_actions": self._available_actions(summary=True),
             "long_term_memory": memories,
         }
@@ -109,6 +110,7 @@ class ContextBuilder:
                 "previous_error": node.error,
                 "output": compact(node.output_data, limit=4000),
                 "review_status": node.metadata.get("review_status"),
+                "operation_hint": node.metadata.get("operation_hint"),
             },
             "dependency_results": dependency_results,
             "completed_artifacts": completed_artifacts[-20:],

@@ -383,6 +383,13 @@ def test_empty_plan_fallback_preserves_codegraph_intent():
         "fallback-project-inspection",
     ]
     assert proposal.nodes[1].dependencies == ["fallback-codegraph-build"]
+    assert proposal.nodes[0].metadata["operation_hint"] == {
+        "tool": "codegraph",
+        "method": "build",
+        "args": {"max_files": 500},
+        "timeout": 300,
+    }
+    assert proposal.nodes[1].metadata["operation_hint"]["method"] == "audit"
 
 
 def test_plan_reports_missing_goal_coverage():
@@ -1360,6 +1367,41 @@ async def test_empty_planner_response_is_repaired_into_workspace_inspection(tmp_
             if node.type is NodeType.OPERATION
         )
         assert node.output_data["output"]["root"] == str(tmp_path.resolve())
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_planner_response_is_retried_before_repair(tmp_path):
+    class RetryPlanner(MockLLMProvider):
+        def __init__(self):
+            super().__init__()
+            self.plan_calls = 0
+
+        async def plan(self, context):
+            self.plan_calls += 1
+            if self.plan_calls == 1:
+                return PlanProposal(
+                    answer=None,
+                    coverage=["Actualizar el codegraph", "Auditar el proyecto"],
+                )
+            return PlanProposal(
+                nodes=[PlanNodeProposal(id="audit", description="audit the project")]
+            )
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'planner-retry.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        provider = RetryPlanner()
+        service = TaskService(session, provider, build_tool_registry(), workspace_root=str(tmp_path))
+        task = await service.create_task(TaskRequest(goal="audit the project"))
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert provider.plan_calls == 2
+        events = await service.repository.list_events(task.id)
+        assert any(event.event_type == "PLANNER_RETRY_REQUESTED" for event in events)
+        assert not any(event.event_type == "PLAN_REPAIRED" for event in events)
     await database.close()
 
 

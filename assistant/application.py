@@ -25,6 +25,7 @@ from .domain.models import (
     GraphEdge,
     NodeStatus,
     NodeType,
+    Operation,
     OperationResult,
     Project,
     Task,
@@ -737,6 +738,14 @@ class TaskService:
                     id="fallback-codegraph-build",
                     description="Actualizar el codegraph del proyecto y conservar sus relaciones estructurales",
                     type="OPERATION",
+                    metadata={
+                        "operation_hint": {
+                            "tool": "codegraph",
+                            "method": "build",
+                            "args": {"max_files": 500},
+                            "timeout": 300,
+                        }
+                    },
                 )
             )
         nodes.append(
@@ -747,6 +756,14 @@ class TaskService:
                 ),
                 type="OPERATION",
                 dependencies=["fallback-codegraph-build"] if wants_graph else [],
+                metadata={
+                    "operation_hint": {
+                        "tool": "project",
+                        "method": "audit",
+                        "args": {"max_files": 500},
+                        "timeout": 300,
+                    }
+                },
             )
         )
         return PlanProposal(
@@ -1274,6 +1291,36 @@ class TaskService:
                         },
                     )
                 )
+                if proposal.answer is None and not proposal.nodes and not proposal.subtasks:
+                    if await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
+                        retry_context = dict(planner_context)
+                        retry_context["planner_feedback"] = (
+                            "INVALID PLAN: coverage is descriptive only. Return executable nodes "
+                            "or subtasks, or provide a direct answer in answer."
+                        )
+                        await self.repository.save_event(
+                            TaskEvent(
+                                task_id=task_id,
+                                event_type="PLANNER_RETRY_REQUESTED",
+                                payload={"reason": "empty executable plan"},
+                            )
+                        )
+                        proposal = await self._call_llm(
+                            self.llm.plan(retry_context), time_remaining
+                        )
+                        await self.repository.save_event(
+                            TaskEvent(
+                                task_id=task_id,
+                                event_type="LLM_RESPONSE",
+                                payload={
+                                    "role": "PLANNER_RETRY",
+                                    "response": proposal.model_dump(mode="json"),
+                                    "request": getattr(self.llm, "last_request", {}),
+                                    "response_chars": len(json.dumps(proposal.model_dump(mode="json"), default=str)),
+                                    "usage": getattr(self.llm, "last_usage", {}),
+                                },
+                            )
+                        )
                 try:
                     validate_plan_quality(proposal, task.budget.max_plan_nodes)
                 except ValueError as error:
@@ -1720,6 +1767,9 @@ class TaskService:
                 )
                 return True
             operation = decision.operation
+            operation_hint = node.metadata.get("operation_hint")
+            if isinstance(operation_hint, dict):
+                operation = Operation.model_validate(operation_hint)
             tool_definition = self.tools.definition(operation.tool)
             if tool_definition is not None:
                 await self.renew_lease(
@@ -1729,7 +1779,7 @@ class TaskService:
             if acceptance:
                 operation.metadata.setdefault("expected", acceptance)
             project = await self.repository.get_project(task.project_id) if task.project_id else None
-            if operation.tool in {"project", "codegraph"} and operation.method in {"analyze", "build", "system"}:
+            if operation.tool in {"project", "codegraph"} and operation.method in {"analyze", "audit", "build", "system"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
             operation_key = operation.idempotency_key or self._operation_key(
                 task.id, node.id, operation
