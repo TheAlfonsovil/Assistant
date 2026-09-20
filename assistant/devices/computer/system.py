@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import os
-import platform
 import asyncio
 import json
+import os
+import platform
 import subprocess
 import sys
 from typing import Any

@@ -680,7 +680,15 @@ class TaskService:
         )
         try:
             decision = await self._call_llm(self.llm.replan(context), time_remaining)
-        except Exception as error:
+        except (
+            HTTPError,
+            ValidationError,
+            KeyError,
+            TypeError,
+            TimeoutError,
+            RuntimeError,
+            ValueError,
+        ) as error:
             await self.repository.save_event(
                 TaskEvent(
                     task_id=task.id,
@@ -2374,11 +2382,10 @@ class TaskService:
                     TaskStatus.WAITING,
                     TaskStatus.CANCELLED,
                 }
-            ):
-                if task is not None:
-                    await self._ensure_final_response(task)
-                    self._cancellation_events.pop(task.id, None)
-                    return task
+            ) and task is not None:
+                await self._ensure_final_response(task)
+                self._cancellation_events.pop(task.id, None)
+                return task
         task = await self.repository.get_task(task_id)
         if task:
             graph = await self.graph(task_id)

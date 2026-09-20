@@ -15,6 +15,18 @@ El proyecto ya tiene una base valida de trabajador persistente: SQLite como fuen
 - La memoria de usuario y del sistema se actualiza de forma idempotente.
 - Hay trazabilidad por eventos y pruebas de regresion.
 
+## Ajustes de alcance de la auditoria
+
+- Las métricas de SQLite pertenecen a **recursos y memoria**, no a observabilidad general:
+  deben mostrar estado de la conexión, tamaño de la base de datos, número de tablas,
+  recuento de filas por tabla, crecimiento, bloqueos y última migración aplicada.
+- Las métricas de dispositivos pertenecen a **recursos > dispositivos**:
+  deben mostrar disponibilidad, transporte, capacidades, latencia, errores,
+  reconexiones y última actividad de cada rama.
+- Las trazas entre API, planner, LLM, herramienta y verificador ya forman parte de
+  la **observabilidad de la tarea**. No se deben duplicar como una carencia
+  independiente; lo que falta es completar su cobertura y hacerla consultable.
+
 ## Riesgos prioritarios
 
 ### P0: ejecucion de comandos
@@ -38,6 +50,16 @@ El runtime tiene backoff y heartbeat persistido, y aisla excepciones por tarea. 
 ### P1: memoria
 
 Existe almacenamiento y recuperacion, pero faltan expiracion, borrado, correccion, exportacion, consentimiento por tipo y redaccion. La memoria debe distinguir hechos, preferencias, perfil, contexto temporal y resultados de tareas; nunca debe guardar secretos por defecto.
+
+En esta misma sección debe incorporarse un panel de recursos SQLite con:
+
+- salud de la conexión y modo WAL;
+- tamaño del fichero y espacio libre;
+- tablas y recuento de filas;
+- crecimiento de eventos, tareas, nodos y memoria;
+- bloqueos y tiempos de escritura;
+- última migración y versión de esquema;
+- fecha del último backup y resultado de la última restauración verificada.
 
 ### P2: resiliencia de red y LLM
 
@@ -99,3 +121,43 @@ Estas medidas no convierten la API en un servicio seguro ni sustituyen un superv
 - Ollama aplica thinking por fase: Planner medio, Resolver bajo, Replanner alto,
   Verifier apagado y respuesta final baja; el razonamiento no se incluye en el JSON.
 - La memoria tiene expiración, purga en idle, exportación, borrado y redacción explícita.
+
+## Recursos > dispositivos
+
+La sección de dispositivos debe ser el lugar único para las métricas de hardware
+y transportes. Para cada dispositivo o rama debe exponer disponibilidad,
+capacidades anunciadas, latencia de la última operación, errores consecutivos,
+reconexiones, último heartbeat y timestamp de la última actividad. Esto complementa
+la observabilidad de la tarea, pero no la sustituye.
+
+## Observabilidad de la tarea
+
+La trazabilidad API -> planner -> LLM -> herramienta -> verificador ya está
+contemplada en la observabilidad de cada tarea mediante eventos persistidos.
+La mejora pendiente es cubrir todos los caminos de error, propagar un correlation
+ID estable, medir cada tramo y permitir consultar la secuencia completa desde el
+dashboard sin duplicar métricas en la sección de dispositivos.
+
+## Límites de arquitectura y mantenibilidad
+
+La separación entre política, ejecución y efectos externos debe quedar explícita:
+
+- **API/control plane**: recibe solicitudes y expone estado; no ejecuta efectos por sí mismo.
+- **Scheduler**: decide qué tarea puede avanzar y aplica prioridades, fairness y backpressure.
+- **Workers de ejecución**: ejecutan operaciones con lease, timeout, cancelación e idempotencia.
+- **Policy engine**: evalúa permisos, riesgo y necesidad de aprobación antes de efectos externos.
+- **Adaptadores de dispositivos**: encapsulan transporte, capacidades, reconexión y health.
+
+La extracción recomendada es gradual: primero policy engine y adaptadores,
+después lease manager y execution coordinator, y finalmente scheduler y recovery
+coordinator. Cada extracción debe conservar los contratos actuales y añadir pruebas
+de arquitectura que impidan que API, scheduler o planner llamen directamente a
+filesystem, shell, Git o transportes físicos.
+
+La meta de mantenibilidad para producción incluye:
+
+- ADRs para decisiones de arquitectura y seguridad;
+- CI con lint, tests y análisis estático;
+- contratos versionados para herramientas y dispositivos;
+- runbooks operativos de recuperación, backup, restauración y pérdida de conexión;
+- pruebas de límites de dependencia entre las capas anteriores.

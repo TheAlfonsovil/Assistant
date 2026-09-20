@@ -65,12 +65,12 @@ class TaskGraph:
             if (
                 edge.dependency_type is DependencyType.SUCCESS
                 and dependency.status is not NodeStatus.SUCCEEDED
-            ):
-                if not (
+                and not (
                     dependency.status is NodeStatus.CANCELLED
                     and dependency.metadata.get("branch_skipped") is True
-                ):
-                    return False
+                )
+            ):
+                return False
             if (
                 edge.dependency_type is DependencyType.FAILURE
                 and dependency.status is not NodeStatus.FAILED

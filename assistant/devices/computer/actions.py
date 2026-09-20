@@ -368,7 +368,7 @@ class ProjectTool(Tool):
         try:
             for change in changes:
                 if not isinstance(change, dict) or not isinstance(change.get("path"), str) or not isinstance(change.get("content"), str):
-                    raise ValueError("each change requires string path and content")
+                    raise TypeError("each change requires string path and content")
                 path = (project_root / change["path"]).resolve()
                 if project_root not in path.parents:
                     raise ValueError(f"change path escapes project: {change['path']}")
@@ -468,9 +468,9 @@ def register_actions(registry) -> None:
 
 
 __all__ = [
+    "DeploymentTool",
     "FilesystemTool",
     "GitTool",
-    "DeploymentTool",
     "ProjectTool",
     "ShellTool",
     "register_actions",

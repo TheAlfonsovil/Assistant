@@ -3,7 +3,6 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from assistant.domain.errors import GraphCycleError
-from assistant.domain.state import InvalidStateTransition
 from assistant.domain.graph import TaskGraph
 from assistant.domain.models import (
     DependencyType,
@@ -15,6 +14,7 @@ from assistant.domain.models import (
     TaskNode,
     TaskStatus,
 )
+from assistant.domain.state import InvalidStateTransition
 from assistant.infrastructure.db import Database
 from assistant.infrastructure.repositories import TaskRepository
 from assistant.project_analysis import ProjectAnalyzer
@@ -41,6 +41,28 @@ def test_graph_resolves_dependencies_and_rejects_cycles():
                 GraphEdge(from_node=second.id, to_node=first.id),
             ],
         )
+
+
+def test_graph_allows_success_dependency_for_skipped_branch():
+    skipped = TaskNode(
+        task_id="task",
+        description="skipped branch",
+        type=NodeType.OPERATION,
+        status=NodeStatus.CANCELLED,
+        metadata={"branch_skipped": True},
+    )
+    dependent = TaskNode(
+        task_id="task",
+        description="dependent",
+        type=NodeType.OPERATION,
+        status=NodeStatus.READY,
+    )
+    graph = TaskGraph(
+        [skipped, dependent],
+        [GraphEdge(from_node=skipped.id, to_node=dependent.id)],
+    )
+
+    assert graph.dependencies_satisfied(dependent.id) is True
 
 
 @pytest.mark.asyncio

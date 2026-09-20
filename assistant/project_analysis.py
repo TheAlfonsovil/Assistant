@@ -179,7 +179,7 @@ class ProjectAnalyzer:
                 "stdout": stdout.decode(errors="replace")[-12000:],
                 "stderr": stderr.decode(errors="replace")[-12000:],
             }
-        except asyncio.TimeoutError:
+        except TimeoutError:
             process.kill()
             return {"available": True, "command": command, "timed_out": True}
         except OSError as error:

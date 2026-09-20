@@ -1,6 +1,6 @@
+import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-import json
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession

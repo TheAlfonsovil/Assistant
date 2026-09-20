@@ -4,7 +4,6 @@ import re
 
 from .llm import PlanProposal
 
-
 _ALLOWED_TYPES = {"OPERATION", "SUBTASK", "DECISION", "VERIFY", "WAIT", "CONDITION", "NOTIFY"}
 _ALLOWED_CONDITION_OPERATORS = {
     "truthy",

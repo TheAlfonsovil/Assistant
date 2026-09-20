@@ -6,7 +6,7 @@ import json
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 import httpx
 from pydantic import BaseModel, Field
@@ -131,7 +131,7 @@ class MockLLMProvider:
 
 
 class OllamaLLMProvider:
-    DEFAULT_REASONING_POLICY = {
+    DEFAULT_REASONING_POLICY: ClassVar[dict[str, str]] = {
         "PLANNER": "medium",
         "NODE_RESOLVER": "low",
         "REPLANNER": "high",
