@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import re
+import shutil
 import socket
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -241,6 +242,17 @@ class TaskService:
         return await self.repository.update_project(project)
 
     async def delete_project(self, project_id: str) -> bool:
+        project = await self.repository.get_project(project_id)
+        if project is None:
+            return False
+        project_path = Path(project.path).resolve()
+        projects_root = Path(self.projects_root).expanduser().resolve()
+        if project_path == projects_root or project_path.parent != projects_root:
+            raise ValueError("project deletion is limited to a direct child of projects_root")
+        if project_path.exists():
+            if not project_path.is_dir():
+                raise ValueError("project path is not a directory")
+            await asyncio.to_thread(shutil.rmtree, project_path)
         return await self.repository.delete_project(project_id)
 
     async def create_project_audit_task(

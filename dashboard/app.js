@@ -87,7 +87,7 @@ function renderResources(data) {
   const devices = (data.devices || []).map((device) => `<button class="resource resource-select" data-resource="device:${esc(device.name)}"><strong>${esc(device.name)} / ${esc(device.platform || "generic")}</strong><small>${esc(device.status)} · ${esc(device.transport || "local")}</small><p>${(device.capabilities || []).map(esc).join(" · ") || "Sin adaptador"}</p></button>`).join("");
   const projects = (data.projects || []).map((project) => `<button class="resource resource-select" data-resource="project:${esc(project.id)}"><strong>${esc(project.name)} / ${esc(project.project_type || "code")}</strong><small>${project.enabled ? "ACTIVO" : "PAUSADO"} · ${project.is_default ? "default" : "registrado"}</small><p>${esc(project.description || project.path)}</p></button>`).join("");
   const memories = (data.memories || []).map((memory) => `<button class="resource resource-select" data-resource="memory:${esc(memory.id)}"><strong>${esc(memory.key)}</strong><small>${esc(memory.kind)} · ${esc(memory.source || "USER")}</small><p>${esc(memoryPreview(memory.value))}</p></button>`).join("");
-  $("#resource-summary").innerHTML = `<div class="resource-group"><p class="kicker">DISPOSITIVOS</p>${devices || "<div class=empty>Sin dispositivos.</div>"}</div><div class="resource-group"><p class="kicker">PROYECTOS DE CÓDIGO</p>${projects || "<div class=empty>Sin proyectos.</div>"}</div><div class="resource-group"><p class="kicker">MEMORIA</p><div class="resource-count">${data.memories.length} registros persistidos</div>${memories || "<div class=empty>Sin memoria persistida.</div>"}</div>`;
+  $("#resource-summary").innerHTML = `<div class="resource-group"><p class="kicker">DISPOSITIVOS</p>${devices || "<div class=empty>Sin dispositivos.</div>"}</div><div class="resource-group"><p class="kicker">PROYECTOS DE CÓDIGO</p>${projects || "<div class=empty>Sin proyectos.</div>"}</div><div class="resource-group"><p class="kicker">MEMORIA · SQLITE</p><div class="resource-count">${data.memories.length} registros persistidos en la BD</div>${memories || "<div class=empty>Sin memoria persistida.</div>"}</div>`;
   $("#resource-summary").querySelectorAll("[data-resource]").forEach((item) => item.addEventListener("click", () => renderResourceDetail(item.dataset.resource, data)));
 }
 function memoryPreview(value) { const text = typeof value === "string" ? value : JSON.stringify(value); return text.length > 160 ? `${text.slice(0, 157)}...` : text; }
@@ -104,7 +104,19 @@ function renderResourceDetail(resourceId, data) {
   const tools = (data.tools || []).filter((tool) => toolNames.includes(tool.name));
   $("#resource-detail").className = "resource-detail";
   const facts = kind === "device" ? data.system || {} : { path: resource.path, type: resource.project_type, codegraph: resource.codegraph_version ? `v${resource.codegraph_version}` : "no actualizado", last_audit: date(resource.last_audited_at) };
-  $("#resource-detail").innerHTML = `<div class="resource-detail-head"><p class="kicker">${kind === "device" ? "DISPOSITIVO" : "PROYECTO"}</p><h3>${esc(resource.name)}</h3><small>${esc(resource.description || resource.path || "")}</small></div><div class="resource-facts">${Object.entries(facts).map(([key, value]) => `<span><small>${esc(key)}</small><b>${esc(value)}</b></span>`).join("")}</div><div class="resource-tools"><strong>HERRAMIENTAS DISPONIBLES</strong>${tools.map((tool) => `<div><b>${esc(tool.name)}</b><span>${esc(tool.description)}</span><small>${tool.methods.map(esc).join(" · ")}</small></div>`).join("") || "<span>Sin herramientas registradas.</span>"}</div>`;
+  $("#resource-detail").innerHTML = `<div class="resource-detail-head"><p class="kicker">${kind === "device" ? "DISPOSITIVO" : "PROYECTO"}</p><h3>${esc(resource.name)}</h3><small>${esc(resource.description || resource.path || "")}</small></div><div class="resource-facts">${Object.entries(facts).map(([key, value]) => `<span><small>${esc(key)}</small><b>${esc(value)}</b></span>`).join("")}</div>${kind === "project" ? `<button class="button danger project-delete" data-project-id="${esc(resource.id)}">Borrar proyecto y directorio</button>` : ""}<div class="resource-tools"><strong>HERRAMIENTAS DISPONIBLES</strong>${tools.map((tool) => `<div><b>${esc(tool.name)}</b><span>${esc(tool.description)}</span><small>${tool.methods.map(esc).join(" · ")}</small></div>`).join("") || "<span>Sin herramientas registradas.</span>"}</div>`;
+  const deleteButton = $("#resource-detail .project-delete");
+  if (deleteButton) deleteButton.addEventListener("click", async () => {
+    if (!window.confirm(`Borrar ${resource.name}, su directorio y su registro persistido?`)) return;
+    try {
+      await api(`/projects/${encodeURIComponent(resource.id)}`, { method: "DELETE" });
+      state.selectedTask = null;
+      $("#resource-detail").className = "resource-detail empty";
+      $("#resource-detail").innerHTML = "<strong>Proyecto borrado</strong><span>El directorio y el registro de SQLite han sido eliminados.</span>";
+      toast("Proyecto borrado");
+      await load();
+    } catch (error) { toast(error.message, true); }
+  });
 }
 function renderChat(tasks) {
   const chats = tasks.filter((task) => task.source === "DASHBOARD_CHAT" || task.metadata?.interaction === "chat").slice(0, 20).reverse();

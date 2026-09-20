@@ -4,6 +4,7 @@ from pathlib import Path
 from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 
 class Base(DeclarativeBase):
@@ -30,7 +31,12 @@ class Database:
         ensure_sqlite_directory(url)
         async_url = async_database_url(url)
         connect_args = {"timeout": 30} if async_url.startswith("sqlite+") else {}
-        self.engine = create_async_engine(async_url, future=True, connect_args=connect_args)
+        engine_options = {"future": True, "connect_args": connect_args}
+        if async_url.startswith("sqlite+"):
+            # SQLite connections are cheap and request/task scoped sessions must
+            # never pin a shared QueuePool connection across a long LLM call.
+            engine_options["poolclass"] = NullPool
+        self.engine = create_async_engine(async_url, **engine_options)
         if async_url.startswith("sqlite+"):
             event.listen(self.engine.sync_engine, "connect", self._configure_sqlite)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)

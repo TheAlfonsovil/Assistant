@@ -18,8 +18,8 @@ from assistant.tools import Tool, ToolDefinition
 class WebTool(Tool):
     definition = ToolDefinition(
         name="web",
-        description="Search the public web or fetch a public HTTP page",
-        methods=["search", "fetch"],
+        description="Search, fetch, and extract readable research content from public web pages",
+        methods=["search", "fetch", "extract"],
         argument_schema={
             "query": {"type": "string"},
             "url": {"type": "string"},
@@ -46,6 +46,19 @@ class WebTool(Tool):
             if not isinstance(url, str):
                 return self._invalid("web.fetch requires url")
             return await self._request(url, timeout)
+        if method == "extract":
+            url = args.get("url")
+            if not isinstance(url, str):
+                return self._invalid("web.extract requires url")
+            result = await self._request(url, timeout)
+            if result.success:
+                parsed = _ReadablePageParser()
+                parsed.feed(result.output["content"])
+                result.output["title"] = parsed.title
+                result.output["text"] = " ".join(parsed.text)[:100_000]
+                result.output["links"] = parsed.links[:100]
+                result.output.pop("content", None)
+            return result
         return self._invalid(f"Unsupported web method: {method}")
 
     async def _request(self, url: str, timeout: float, **metadata: Any) -> OperationResult:
@@ -120,6 +133,50 @@ class _SearchResultParser(HTMLParser):
                 self.results.append({"title": title[:200], "url": self._href})
             self._href = None
             self._text = []
+
+
+class _ReadablePageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title = ""
+        self.text: list[str] = []
+        self.links: list[dict[str, str]] = []
+        self._in_title = False
+        self._skip_depth = 0
+        self._href: str | None = None
+        self._link_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._skip_depth += 1
+        if tag == "title":
+            self._in_title = True
+        if tag == "a" and attributes.get("href"):
+            self._href = attributes["href"]
+            self._link_text = []
+
+    def handle_data(self, data: str) -> None:
+        value = " ".join(data.split())
+        if not value or self._skip_depth:
+            return
+        if self._in_title:
+            self.title += value
+        elif self._href is None:
+            self.text.append(value)
+        if self._href is not None:
+            self._link_text.append(value)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript", "svg"} and self._skip_depth:
+            self._skip_depth -= 1
+        if tag == "title":
+            self._in_title = False
+        if tag == "a" and self._href is not None:
+            label = " ".join(self._link_text).strip()
+            self.links.append({"url": self._href, "text": label[:200]})
+            self._href = None
+            self._link_text = []
 
 
 __all__ = ["WebTool"]

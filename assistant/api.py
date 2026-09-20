@@ -99,7 +99,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.2.2", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.2.3", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
 
 
@@ -583,7 +583,11 @@ async def update_project(request: Request, project_id: str, project_request: Pro
 
 @app.delete("/projects/{project_id}")
 async def delete_project(request: Request, project_id: str):
-    if not await service(request).service.delete_project(project_id):
+    try:
+        deleted = await service(request).service.delete_project(project_id)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if not deleted:
         raise HTTPException(404, "Project not found")
     return {"deleted": True, "id": project_id}
 

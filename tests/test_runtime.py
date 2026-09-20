@@ -426,6 +426,29 @@ async def test_web_blocks_local_destinations():
 
 
 @pytest.mark.asyncio
+async def test_web_extract_returns_readable_text_and_links(monkeypatch):
+    tool = WebTool()
+
+    async def fake_request(url, timeout, **metadata):
+        return OperationResult(
+            success=True,
+            output={
+                "url": url,
+                "status_code": 200,
+                "content": "<html><title>Guide</title><script>ignore()</script><p>Hello world</p><a href='https://example.com'>Next</a></html>",
+            },
+        )
+
+    monkeypatch.setattr(tool, "_request", fake_request)
+    result = await tool.execute("extract", {"url": "https://example.org"}, 5)
+
+    assert result.success is True
+    assert result.output["title"] == "Guide"
+    assert result.output["text"] == "Hello world"
+    assert result.output["links"] == [{"url": "https://example.com", "text": "Next"}]
+
+
+@pytest.mark.asyncio
 async def test_browser_open_records_origin_and_url(tmp_path, monkeypatch):
     monkeypatch.setattr("webbrowser.open", lambda url, new: True)
     tool = BrowserTool(tmp_path / "browser-log.jsonl")
@@ -510,6 +533,28 @@ async def test_planner_context_includes_resolved_project_and_workflow_guidance(t
             action for action in context["available_actions"] if action["name"] == "project"
         )
         assert "audit" in project_action["methods"]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_project_removes_directory_and_persistent_registration(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'delete-project.db'}")
+    await database.create_all()
+    projects_root = tmp_path / "projects"
+    project_path = projects_root / "test_zone"
+    project_path.mkdir(parents=True)
+    (project_path / "README.md").write_text("temporary", encoding="utf-8")
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            ToolRegistry(),
+            projects_root=str(projects_root),
+        )
+        project = await service.create_project(Project(name="test_zone", path=str(project_path)))
+        assert await service.delete_project(project.id) is True
+        assert not project_path.exists()
+        assert await service.get_project(project.id) is None
     await database.close()
 
 

@@ -2,7 +2,7 @@ import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -190,6 +190,9 @@ class TaskRepository:
         return project
 
     async def delete_project(self, project_id: str) -> bool:
+        await self.session.execute(
+            update(TaskRow).where(TaskRow.project_id == project_id).values(project_id=None)
+        )
         result = await self.session.execute(delete(ProjectRow).where(ProjectRow.id == project_id))
         await self.session.commit()
         return result.rowcount > 0
