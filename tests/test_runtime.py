@@ -512,6 +512,70 @@ def test_plan_reports_missing_goal_coverage():
     assert any("goal terms" in warning for warning in warnings)
 
 
+def test_plan_does_not_warn_about_missing_optional_coverage():
+    proposal = PlanProposal(
+        nodes=[PlanNodeProposal(id="audit", description="auditar el proyecto")]
+    )
+
+    warnings = plan_coverage_warnings(proposal, "audita el proyecto y dime que te parece")
+
+    assert warnings == []
+
+
+def test_empty_plan_fallback_opens_youtube_in_default_browser():
+    proposal = TaskService._fallback_plan(Task(goal="abre youtube"))
+
+    assert proposal is not None
+    assert [node.id for node in proposal.nodes] == ["fallback-browser-open"]
+    assert proposal.nodes[0].metadata["operation_hint"] == {
+        "tool": "browser",
+        "method": "open",
+        "args": {
+            "url": "https://www.youtube.com",
+            "origin": f"{proposal.task_id}/fallback-browser-open",
+        },
+        "timeout": 60,
+    }
+
+
+def test_browser_intent_replaces_direct_answer_with_open_operation():
+    task = Task(goal="abre youtube")
+    proposal = PlanProposal(answer="Necesito saber qué navegador prefieres")
+
+    normalized = TaskService._normalize_browser_intent(task, proposal)
+
+    assert normalized.answer is None
+    assert normalized.nodes[0].metadata["operation_hint"]["method"] == "open"
+
+
+def test_project_audit_plan_removes_generic_verification_node():
+    task = Task(
+        goal="audita el proyecto",
+        metadata={"workflow": "project_audit", "run_tests": False},
+    )
+    proposal = PlanProposal(
+        nodes=[
+            PlanNodeProposal(
+                id="audit",
+                description="Auditar el proyecto",
+                type="OPERATION",
+                metadata={"action": "project.audit"},
+            ),
+            PlanNodeProposal(
+                id="verify",
+                description="Verificar el informe",
+                type="VERIFY",
+                dependencies=["audit"],
+            ),
+        ]
+    )
+
+    normalized = TaskService._normalize_project_audit_plan(task, proposal)
+
+    assert [node.id for node in normalized.nodes] == ["audit"]
+    assert normalized.nodes[0].dependencies == []
+
+
 def test_final_response_template_receives_execution_evidence():
     template = (Path(__file__).parents[1] / "assistant" / "prompts" / "v1" / "final_response.md").read_text(
         encoding="utf-8"

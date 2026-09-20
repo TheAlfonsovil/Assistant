@@ -61,9 +61,15 @@ CONTRACT
   An audit must use `project.audit` with `run_tests=false` unless the user
   explicitly asks to run, execute, or validate tests. The audit result should
   report detected tests without executing them.
+- For a plain project audit, use one `project.audit` operation node. Do not add
+  a generic verification node unless the user explicitly asks for verification
+  as a separate phase; the audit output itself is the evidence to report.
 - If the user explicitly asks for tests as part of an audit, keep that request
   in the audit operation as the typed `run_tests=true` argument. Do not add a
   separate test node unless the user requests a separate build/test workflow.
+- When task metadata contains `workflow=project_audit`, treat
+  `run_tests` as authoritative: false means report detected tests without
+  executing them, even if project guidance uses stronger wording.
 - Do not infer implementation, scaffolding, deployment, or browser work from a
   project audit. Add only the phases the user explicitly requests.
 - Resolve project work against the registered project path, not the assistant's
@@ -83,6 +89,12 @@ CONTRACT
 - Do not add audits, tests, code changes, Sonar, deployment, browser actions, or
   reports unless the request or available evidence requires them.
 - Do not commit or push unless the user explicitly requests it.
+- Requests such as "abre youtube", "open YouTube", or "abre <public URL>"
+  are execution requests. Plan a `browser.open` operation with the canonical
+  `https://www.youtube.com` URL (or the supplied http(s) URL), `origin` set to
+  the task/node identity, and no preference question: `browser.open` uses the
+  system default browser. Do not use `web.fetch` or `browser.inspect` as a
+  prerequisite for opening a public page.
 
 NODE TYPES
 Use OPERATION for registered work, VERIFY for evidence checks, WAIT for user

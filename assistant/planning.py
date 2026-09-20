@@ -23,6 +23,9 @@ class PlanQualityError(ValueError):
 _COVERAGE_STOPWORDS = {
     "para", "como", "este", "esta", "that", "this", "with", "from", "into",
     "the", "and", "que", "una", "uno", "los", "las", "del", "por", "con",
+    "dime", "decir", "parece", "parecer", "proyecto", "project", "audita",
+    "auditar", "audit", "audite", "revisa", "revisar", "review", "analiza",
+    "analizar", "inspect", "inspecciona", "inspeccionar", "ejecuta", "ejecutar",
 }
 
 
@@ -39,8 +42,8 @@ def plan_coverage_warnings(proposal: PlanProposal, goal: str) -> list[str]:
     warnings = []
     if missing and len(missing) >= max(2, len(terms) // 2):
         warnings.append(f"plan does not mention goal terms: {', '.join(missing[:8])}")
-    if terms and not declared:
-        warnings.append("planner did not declare coverage items")
+    # Coverage is supplementary metadata, not a second plan contract. An
+    # executable plan without it is valid and should not produce noisy warnings.
     return warnings
 
 

@@ -212,8 +212,13 @@ class TaskService:
         if project is None or not project.enabled:
             return None
         goal = project.audit_prompt
-        if run_tests and "test" not in goal.casefold():
-            goal = f"{goal.rstrip('.')} and execute the detected tests."
+        if run_tests:
+            if "test" not in goal.casefold():
+                goal = f"{goal.rstrip('.')} and execute the detected tests."
+        else:
+            goal = (
+                f"{goal.rstrip('.')} Report detected tests without executing them."
+            )
         return await self.create_task(
             TaskRequest(
                 goal=goal,
@@ -815,9 +820,72 @@ class TaskService:
         return proposal.model_copy(update={"task_id": proposal.task_id or task.id, "nodes": nodes})
 
     @staticmethod
+    def _normalize_project_audit_plan(task: Task, proposal: PlanProposal) -> PlanProposal:
+        """Keep the dedicated audit workflow focused on its single audit operation."""
+        if task.metadata.get("workflow") != "project_audit":
+            return proposal
+        audit_nodes = [
+            node for node in proposal.nodes
+            if node.metadata.get("action") == "project.audit"
+            or (
+                node.metadata.get("operation_hint", {}).get("tool") == "project"
+                and node.metadata.get("operation_hint", {}).get("method") == "audit"
+            )
+            or "auditar el proyecto" in node.description.casefold()
+            or "audit the project" in node.description.casefold()
+        ]
+        if len(audit_nodes) != 1:
+            return proposal
+        audit = audit_nodes[0]
+        audit = audit.model_copy(update={"dependencies": []})
+        return proposal.model_copy(update={"nodes": [audit]})
+
+    @staticmethod
+    def _normalize_browser_intent(task: Task, proposal: PlanProposal) -> PlanProposal:
+        """Prevent a direct-answer response from swallowing a simple browser action."""
+        if proposal.answer is None or proposal.nodes or proposal.subtasks:
+            return proposal
+        fallback = TaskService._fallback_plan(task)
+        if fallback is None or not fallback.nodes:
+            return proposal
+        if fallback.nodes[0].metadata.get("operation_hint", {}).get("tool") != "browser":
+            return proposal
+        return fallback
+
+    @staticmethod
     def _fallback_plan(task: Task) -> PlanProposal | None:
         goal = task.goal.casefold()
         wants_graph = "codegraph" in goal or "grafo" in goal
+        browser_url = None
+        if re.search(r"\b(?:abre|abrir|open)\s+youtube\b", goal):
+            browser_url = "https://www.youtube.com"
+        else:
+            supplied_url = re.search(r"https?://[^\s]+", task.goal, flags=re.IGNORECASE)
+            if supplied_url and re.search(r"\b(?:abre|abrir|open)\b", goal):
+                browser_url = supplied_url.group(0).rstrip(".,;)")
+        if browser_url:
+            return PlanProposal(
+                task_id=task.id,
+                coverage=["open the requested public page in the default browser"],
+                nodes=[
+                    PlanNodeProposal(
+                        id="fallback-browser-open",
+                        description=f"Abrir {browser_url} en el navegador predeterminado",
+                        type="OPERATION",
+                        metadata={
+                            "operation_hint": {
+                                "tool": "browser",
+                                "method": "open",
+                                "args": {
+                                    "url": browser_url,
+                                    "origin": f"{task.id}/fallback-browser-open",
+                                },
+                                "timeout": 60,
+                            }
+                        },
+                    )
+                ],
+            )
         creation_match = re.search(
             r"\b(?:llamado|llamada|named|name[d]?)\s+['\"]?([a-zA-Z0-9_-]+)",
             task.goal,
@@ -1532,6 +1600,7 @@ class TaskService:
                             },
                         )
                     )
+                proposal = self._normalize_browser_intent(task, proposal)
                 if proposal.answer is None and not proposal.nodes and not proposal.subtasks:
                     normalized = self._normalize_coverage_plan(task, proposal)
                     if normalized.nodes:
@@ -1546,6 +1615,7 @@ class TaskService:
                                 },
                             )
                         )
+                proposal = self._normalize_project_audit_plan(task, proposal)
                 try:
                     validate_plan_quality(proposal, task.budget.max_plan_nodes)
                 except ValueError as error:
