@@ -17,6 +17,9 @@ TASK
 RESOLVED PROJECT
 {{project}}
 
+EXECUTION TARGET
+{{execution_target}}
+
 AVAILABLE ACTIONS
 {{available_actions}}
 
@@ -68,6 +71,10 @@ DECISION RULES
   never return an empty plan for them.
 - If the request needs clarification, use a WAIT node and describe the exact
   input required. Do not guess missing project, file, account, or browser state.
+- The execution target identifies whether work is performed against a registered
+  project or a device. For computer requests such as opening a browser or
+  creating a project, use the computer target and the corresponding computer
+  tool; do not require a code project.
 
 COMPACT EXAMPLES
 - Project audit: return an OPERATION node such as

@@ -11,9 +11,9 @@ from .devices.registry import DEVICE_BRANCHES
 from .domain.models import (
     ChatRequest,
     IdleConfigurationRequest,
+    Operation,
     Project,
     ProjectRequest,
-    Operation,
     TaskInputRequest,
     TaskRedefinitionRequest,
     TaskRequest,
@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.1.10", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.1.11", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
 
 
@@ -472,6 +472,8 @@ async def create_chat_message(request: Request, chat_request: ChatRequest):
             goal=chat_request.message,
             source="DASHBOARD_CHAT",
             project_id=chat_request.project_id,
+            target_type=chat_request.target_type,
+            target_id=chat_request.target_id,
             metadata={"interaction": "chat", "requested_format": "answer"},
         )
     )

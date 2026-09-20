@@ -225,6 +225,8 @@ class TaskRequest(BaseModel):
     source: str = "USER"
     project_id: str | None = None
     project_name: str | None = None
+    target_type: str | None = None
+    target_id: str | None = None
     priority: int = 0
     deadline: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -233,6 +235,8 @@ class TaskRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=10000)
     project_id: str | None = None
+    target_type: str | None = None
+    target_id: str | None = None
 
 
 class IdleConfigurationRequest(BaseModel):

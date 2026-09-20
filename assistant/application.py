@@ -29,7 +29,6 @@ from .domain.models import (
     OperationResult,
     Project,
     Task,
-    TaskBudget,
     TaskEvent,
     TaskNode,
     TaskRequest,
@@ -39,7 +38,6 @@ from .infrastructure.orm import IdempotencyRow, LeaseRow
 from .infrastructure.repositories import TaskRepository
 from .llm import AssistantResponse, LLMProvider, PlanNodeProposal, PlanProposal
 from .observability import compact
-from .planning import plan_coverage_warnings, validate_plan_quality
 from .planning import plan_coverage_warnings, validate_plan_quality
 from .project_analysis import ProjectAnalyzer
 from .scheduler import NodeScheduler
@@ -58,6 +56,7 @@ class TaskService:
         verifier=None,
         event_sink=None,
         workspace_root: str = ".",
+        projects_root: str = r"C:\Assistant",
         default_execution_time: float | None = None,
         final_response_timeout: float = 36000.0,
         max_steps: int = 1000,
@@ -68,7 +67,13 @@ class TaskService:
         self.tools = tools
         self.verifier = verifier or DeterministicVerifier()
         self.scheduler = NodeScheduler()
-        self.context_builder = ContextBuilder(self.repository, tools, workspace_root=workspace_root)
+        self.context_builder = ContextBuilder(
+            self.repository,
+            tools,
+            workspace_root=workspace_root,
+            projects_root=projects_root,
+        )
+        self.projects_root = projects_root
         self.default_execution_time = default_execution_time
         self.final_response_timeout = max(1.0, final_response_timeout)
         self.max_steps = max(1, max_steps)
@@ -77,25 +82,42 @@ class TaskService:
 
     async def create_task(self, request: TaskRequest) -> Task:
         enabled_projects = await self.repository.list_projects(enabled_only=True)
-        project = await self.repository.resolve_project(request.project_id, request.project_name)
+        target = self._requested_target(request)
+        project = (
+            await self.repository.resolve_project(request.project_id, request.project_name)
+            if target is None or target["type"] == "project"
+            else None
+        )
+        if target and target["type"] == "project":
+            project = await self.repository.resolve_project(target["id"], None)
+            if project is None:
+                raise ValueError("requested project was not found or is not enabled")
+        if target and target["type"] == "device":
+            self._validate_device_target(target["id"])
         if (request.project_id or request.project_name) and project is None:
             raise ValueError("requested project was not found or is not enabled")
         defaults = [item for item in enabled_projects if item.is_default]
         requires_project_selection = (
-            not request.project_id
+            target is None
+            and not request.project_id
             and not request.project_name
             and len(defaults) != 1
             and len(enabled_projects) > 1
         )
-        task_data = request.model_dump(exclude={"project_name"})
+        task_data = request.model_dump(exclude={"project_name", "target_type", "target_id"})
         task_data["project_id"] = project.id if project else None
         task = Task.model_validate(task_data)
+        if target:
+            task.metadata["target"] = target
         if self.default_execution_time is not None:
             task.budget.max_execution_time = max(1.0, self.default_execution_time)
         if requires_project_selection:
             task.metadata["clarification"] = {
                 "kind": "project_selection",
-                "options": [{"id": item.id, "name": item.name} for item in enabled_projects],
+                "options": [
+                    {"type": "project", "id": item.id, "name": item.name}
+                    for item in enabled_projects
+                ] + [{"type": "device", "id": "computer", "name": "Ordenador"}],
             }
         if project:
             project.last_used_at = datetime.now(UTC)
@@ -125,6 +147,21 @@ class TaskService:
             payload=task.metadata.get("clarification", {}),
         ))
         return task
+
+    @staticmethod
+    def _requested_target(request: TaskRequest) -> dict[str, str] | None:
+        if request.target_type is None and request.target_id is None:
+            return None
+        target_type = request.target_type or "device"
+        target_id = request.target_id or ("computer" if target_type == "device" else "")
+        if target_type not in {"project", "device"} or not target_id:
+            raise ValueError("target_type must be project or device and target_id is required")
+        return {"type": target_type, "id": target_id}
+
+    @staticmethod
+    def _validate_device_target(device_id: str) -> None:
+        if device_id not in {"computer", "mobile", "home", "robot"}:
+            raise ValueError("requested device was not found")
 
     async def create_project(self, project: Project) -> Project:
         project.path = str(Path(project.path).expanduser().resolve())
@@ -385,15 +422,27 @@ class TaskService:
             raise ValueError("task is not waiting for user input or blocked")
         clarification = task.metadata.get("clarification", {})
         selecting_project = clarification.get("kind") == "project_selection"
+        selected_target = None
         if selecting_project:
-            selected = await self.repository.resolve_project(
-                input_data.get("project_id"), input_data.get("project_name")
-            )
-            if selected is None:
-                raise ValueError("input must select one enabled project by project_id or project_name")
-            task.project_id = selected.id
-            selected.last_used_at = datetime.now(UTC)
-            await self.repository.update_project(selected)
+            target_type = input_data.get("target_type")
+            target_id = input_data.get("target_id")
+            if target_type == "device":
+                if not isinstance(target_id, str):
+                    raise ValueError("input must select a device target")
+                self._validate_device_target(target_id)
+                task.project_id = None
+                selected_target = {"type": "device", "id": target_id}
+            else:
+                selected = await self.repository.resolve_project(
+                    input_data.get("project_id") or target_id, input_data.get("project_name")
+                )
+                if selected is None:
+                    raise ValueError("input must select one enabled project by project_id or project_name")
+                task.project_id = selected.id
+                selected.last_used_at = datetime.now(UTC)
+                await self.repository.update_project(selected)
+                selected_target = {"type": "project", "id": selected.id}
+            task.metadata["target"] = selected_target
             task.metadata.pop("clarification", None)
         candidate_status = (
             NodeStatus.WAITING if task.status is TaskStatus.WAITING else NodeStatus.BLOCKED
@@ -1002,6 +1051,10 @@ class TaskService:
         task.status = status
         task.failure_reason = reason if status is not TaskStatus.SUCCEEDED else task.failure_reason
         task.finished_at = datetime.now(UTC)
+        # Persist the terminal intent before final-report generation. If the
+        # provider is unavailable, the task must not remain indefinitely in
+        # PLANNING/RUNNING while the fallback report is assembled.
+        await self.repository.save_task(task)
         await self._ensure_final_response(task)
         await self.repository.save_event(
             TaskEvent(task_id=task.id, event_type=event_type, payload=payload or {"reason": reason})
@@ -1230,11 +1283,18 @@ class TaskService:
         cancellation = self._cancellation_event(task_id)
         if cancellation.is_set():
             return False
-        if task.status is TaskStatus.QUEUED:
+        if task.status in {TaskStatus.QUEUED, TaskStatus.PLANNING}:
+            was_already_planning = task.status is TaskStatus.PLANNING
             task.status = TaskStatus.PLANNING
             await self.repository.save_task(task)
             await self.repository.save_event(
-                TaskEvent(task_id=task_id, event_type="TASK_PLANNED", payload={"status": task.status})
+                TaskEvent(
+                    task_id=task_id,
+                    event_type="TASK_PLANNING_RETRY" if was_already_planning else "TASK_PLANNED",
+                    payload={"status": task.status, "reason": "recovered planning state"}
+                    if was_already_planning
+                    else {"status": task.status},
+                )
             )
             try:
                 if not await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
@@ -1779,7 +1839,9 @@ class TaskService:
             if acceptance:
                 operation.metadata.setdefault("expected", acceptance)
             project = await self.repository.get_project(task.project_id) if task.project_id else None
-            if operation.tool in {"project", "codegraph"} and operation.method in {"analyze", "audit", "build", "system"}:
+            if operation.tool == "project" and operation.method == "create":
+                operation.args.setdefault("root", self.projects_root)
+            elif operation.tool in {"project", "codegraph"} and operation.method in {"analyze", "audit", "build", "system"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
             operation_key = operation.idempotency_key or self._operation_key(
                 task.id, node.id, operation

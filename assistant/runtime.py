@@ -107,7 +107,12 @@ class TaskRuntime:
         tasks = await self.repository.list_tasks()
         active = [
             task for task in tasks
-            if task.status in {TaskStatus.QUEUED, TaskStatus.READY, TaskStatus.RUNNING}
+            if task.status in {
+                TaskStatus.QUEUED,
+                TaskStatus.PLANNING,
+                TaskStatus.READY,
+                TaskStatus.RUNNING,
+            }
         ]
         for task in sorted(active, key=lambda item: (-item.priority, item.created_at)):
             try:

@@ -1469,6 +1469,38 @@ async def test_ambiguous_project_selection_waits_for_explicit_input(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_device_target_skips_project_selection_and_is_available_in_context(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'device-target.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            ToolRegistry(),
+            workspace_root=str(tmp_path),
+            projects_root=r"C:\Assistant",
+        )
+        first_path = tmp_path / "first"
+        second_path = tmp_path / "second"
+        first_path.mkdir()
+        second_path.mkdir()
+        await service.create_project(Project(name="first", path=str(first_path)))
+        await service.create_project(Project(name="second", path=str(second_path)))
+
+        task = await service.create_task(
+            TaskRequest(goal="open YouTube", target_type="device", target_id="computer")
+        )
+        context = await service.context_builder.for_planner(task)
+
+        assert task.status is TaskStatus.QUEUED
+        assert task.project_id is None
+        assert task.metadata["target"] == {"type": "device", "id": "computer"}
+        assert context["execution_target"] == {"type": "device", "id": "computer"}
+        assert context["assistant_state"]["projects_root"] == r"C:\Assistant"
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_planner_acceptance_evidence_is_persisted_and_checked(tmp_path):
     class AcceptanceProvider(MockLLMProvider):
         async def plan(self, context):

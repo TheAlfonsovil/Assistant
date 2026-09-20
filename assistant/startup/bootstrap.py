@@ -65,6 +65,7 @@ async def create_context(
         build_tool_registry(),
         event_sink=event_sink,
         workspace_root=resolved_settings.workspace_root,
+        projects_root=resolved_settings.projects_root,
         default_execution_time=resolved_settings.task_max_execution_time,
         final_response_timeout=resolved_settings.final_response_timeout,
         max_steps=resolved_settings.task_max_steps,

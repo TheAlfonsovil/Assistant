@@ -10,10 +10,11 @@ from .observability import compact
 class ContextBuilder:
     """Builds role-specific, bounded contexts for each LLM phase."""
 
-    def __init__(self, repository, tools, workspace_root: str = "."):
+    def __init__(self, repository, tools, workspace_root: str = ".", projects_root: str = r"C:\Assistant"):
         self.repository = repository
         self.tools = tools
         self.workspace_root = workspace_root
+        self.projects_root = projects_root
 
     async def for_planner(self, task: Task) -> dict[str, Any]:
         memories = await self._memory_context(task.goal)
@@ -26,6 +27,8 @@ class ContextBuilder:
                 "task_status": task.status,
                 "memory_loaded": True,
                 "workspace_root": self.workspace_root,
+                "projects_root": self.projects_root,
+                "execution_target": task.metadata.get("target"),
             },
             "task": {
                 "id": task.id,
@@ -46,6 +49,7 @@ class ContextBuilder:
                 "codegraph_version": project.codegraph_version,
                 "codegraph_available": project.codegraph is not None,
             } if project else None,
+            "execution_target": task.metadata.get("target"),
             "constraints": {
                 "max_retries": task.budget.max_retries,
                 "max_execution_time": task.budget.max_execution_time,
@@ -96,9 +100,12 @@ class ContextBuilder:
                 "task_status": task.status,
                 "node_status": node.status,
                 "workspace_root": self.workspace_root,
+                "projects_root": self.projects_root,
+                "execution_target": task.metadata.get("target"),
             },
             "long_term_memory": memories,
             "task": {"id": task.id, "goal": task.goal, "status": task.status},
+            "execution_target": task.metadata.get("target"),
             "node": {
                 "id": node.id,
                 "type": node.type,
@@ -204,6 +211,8 @@ class ContextBuilder:
                 "task_status": task.status,
                 "node_status": node.status,
                 "workspace_root": self.workspace_root,
+                "projects_root": self.projects_root,
+                "execution_target": task.metadata.get("target"),
             },
             "task": {"id": task.id, "goal": task.goal, "status": task.status},
             "long_term_memory": memories,
@@ -226,6 +235,7 @@ class ContextBuilder:
                 "id": task.id,
                 "goal": task.goal,
                 "status": task.status,
+                "execution_target": task.metadata.get("target"),
                 "result_summary": task.result_summary,
                 "failure_reason": task.failure_reason,
             },

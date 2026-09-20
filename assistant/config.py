@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     persist_system_facts: bool = True
     persist_user_profile: bool = True
     workspace_root: str = "."
+    projects_root: str = r"C:\Assistant"
     user_name: str | None = None
     user_birth_date: str | None = None
     user_profession: str | None = None

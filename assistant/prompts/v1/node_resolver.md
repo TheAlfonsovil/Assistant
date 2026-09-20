@@ -17,6 +17,9 @@ TASK
 CURRENT NODE
 {{node}}
 
+EXECUTION TARGET
+{{execution_target}}
+
 DEPENDENCY RESULTS
 {{dependencies}}
 

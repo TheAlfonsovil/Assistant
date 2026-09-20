@@ -120,6 +120,22 @@ async def test_runtime_continues_after_one_task_exception():
     assert called == [tasks[0].id, tasks[1].id]
 
 
+@pytest.mark.asyncio
+async def test_runtime_retries_tasks_left_in_planning():
+    task = Task(goal="resume planner", status=TaskStatus.PLANNING)
+    called = []
+
+    async def execute(task_id):
+        called.append(task_id)
+
+    class Repository:
+        async def list_tasks(self):
+            return [task]
+
+    assert await TaskRuntime(Repository(), execute).run_once() == 1
+    assert called == [task.id]
+
+
 async def _record(goals, goal):
     goals.append(goal)
     return goal
