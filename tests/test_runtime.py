@@ -803,11 +803,11 @@ async def test_ollama_provider_sends_versioned_prompt_and_json_schema():
     provider = OllamaLLMProvider("http://ollama.test", "test-model", client=client)
     await provider.plan({"task": {"goal": "run tests"}})
     payload = json.loads(requests[0].content)
-    prompt = payload["prompt"]
+    prompt = json.loads(payload["prompt"])["instructions"]
     assert payload["format"]["type"] == "object"
     assert payload["options"] == {"temperature": 0.1, "num_ctx": 32768}
     assert payload["think"] is False
-    assert "Valid example:" in prompt
+    assert "OUTPUT SCHEMA" in prompt
     await provider.close()
 
 
