@@ -777,9 +777,75 @@ class TaskService:
             )
 
     @staticmethod
-    def _fallback_plan(task: Task) -> PlanProposal:
+    def _fallback_plan(task: Task) -> PlanProposal | None:
         goal = task.goal.casefold()
         wants_graph = "codegraph" in goal or "grafo" in goal
+        creation_match = re.search(
+            r"\b(?:llamado|llamada|named|name[d]?)\s+['\"]?([a-zA-Z0-9_-]+)",
+            task.goal,
+            flags=re.IGNORECASE,
+        )
+        creation_requested = any(
+            term in goal
+            for term in (
+                "crear un nuevo proyecto",
+                "crea un nuevo proyecto",
+                "create a new project",
+                "new project",
+            )
+        )
+        if creation_requested:
+            if not creation_match:
+                return PlanProposal(
+                    task_id=task.id,
+                    coverage=["identify the requested project before creating files"],
+                    nodes=[
+                        PlanNodeProposal(
+                            id="fallback-project-creation-input",
+                            description="Solicitar el nombre exacto del proyecto antes de crearlo",
+                            type="WAIT",
+                        )
+                    ],
+                )
+            project_name = creation_match.group(1)
+            return PlanProposal(
+                task_id=task.id,
+                coverage=["create the requested project directory"],
+                nodes=[
+                    PlanNodeProposal(
+                        id="fallback-project-create",
+                        description=f"Crear el proyecto {project_name} en la raíz configurada de proyectos",
+                        type="OPERATION",
+                        acceptance={"fields": {"name": project_name}},
+                        metadata={
+                            "operation_hint": {
+                                "tool": "project",
+                                "method": "create",
+                                "args": {"name": project_name, "template": "empty"},
+                                "timeout": 300,
+                            }
+                        },
+                    )
+                ],
+            )
+        audit_requested = any(
+            term in goal
+            for term in (
+                "audit",
+                "audita",
+                "auditar",
+                "review",
+                "revisa",
+                "revisar",
+                "inspect",
+                "inspecciona",
+                "analiza",
+                "analyze",
+                "sonar",
+            )
+        )
+        if not audit_requested and not wants_graph:
+            return None
         nodes = []
         if wants_graph:
             nodes.append(
@@ -1390,6 +1456,11 @@ class TaskService:
                         and not proposal.subtasks
                     ):
                         proposal = self._fallback_plan(task)
+                        if proposal is None:
+                            raise ValueError(
+                                "planner returned an empty plan for a task that cannot be "
+                                "safely recovered deterministically"
+                            )
                         await self.repository.save_event(
                             TaskEvent(
                                 task_id=task_id,

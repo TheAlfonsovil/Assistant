@@ -1406,6 +1406,66 @@ async def test_empty_planner_response_is_retried_before_repair(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_empty_planner_creation_fallback_creates_requested_project(tmp_path):
+    class EmptyPlanner(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal()
+
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'creation-fallback.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            EmptyPlanner(),
+            build_tool_registry(),
+            projects_root=str(projects_root),
+        )
+        task = await service.create_task(
+            TaskRequest(goal="Crea un nuevo proyecto, llamado test_zone")
+        )
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert (projects_root / "test_zone").is_dir()
+        nodes = await service.repository.list_nodes(task.id)
+        assert [node.description for node in nodes if node.type is NodeType.OPERATION] == [
+            "Crear el proyecto test_zone en la raíz configurada de proyectos"
+        ]
+        events = await service.repository.list_events(task.id)
+        assert any(
+            event.event_type == "PLAN_REPAIRED"
+            and "fallback-project-create" in event.payload.get("nodes", [])
+            for event in events
+        )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_planner_non_audit_request_is_not_replaced_with_audit(tmp_path):
+    class EmptyPlanner(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal()
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'empty-unsupported-plan.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, EmptyPlanner(), build_tool_registry())
+        task = await service.create_task(TaskRequest(goal="deploy the application"))
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.FAILED
+        nodes = await service.repository.list_nodes(task.id)
+        assert not any("Auditar el proyecto" in node.description for node in nodes)
+        events = await service.repository.list_events(task.id)
+        assert any(event.event_type == "TASK_FAILED" for event in events)
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_single_project_is_selected_and_analysis_uses_registered_path(tmp_path):
     project_path = tmp_path / "project"
     project_path.mkdir()
