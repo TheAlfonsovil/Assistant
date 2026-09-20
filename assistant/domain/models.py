@@ -93,7 +93,7 @@ class Project(BaseModel):
     path: str
     description: str = ""
     project_type: str = "code"
-    audit_prompt: str = "Audit the project, run relevant tests, and report findings with evidence"
+    audit_prompt: str = "Audit the project and report findings with evidence"
     enabled: bool = True
     is_default: bool = False
     created_at: datetime = Field(default_factory=utcnow)
@@ -259,6 +259,6 @@ class ProjectRequest(BaseModel):
     path: str
     description: str = ""
     project_type: str = "code"
-    audit_prompt: str = "Audit the project, run relevant tests, and report findings with evidence"
+    audit_prompt: str = "Audit the project and report findings with evidence"
     enabled: bool = True
     is_default: bool = False

@@ -19,8 +19,45 @@ from .domain.models import (
     TaskRequest,
 )
 from .idle import IdleCycle
+from .llm import AssistantResponse, NodeDecision, PlanProposal
+from .prompts.v1.template import render
 from .runtime import TaskRuntime
 from .startup.bootstrap import AssistantContext, create_context
+
+
+def _event_json(event) -> dict:
+    payload = event.payload or {}
+    if event.event_type == "LLM_REQUEST" and payload.get("role"):
+        role = str(payload["role"])
+        request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
+        if not request.get("rendered_instructions"):
+            context = payload.get("context")
+            prompt_path = Path(__file__).parent / "prompts" / "v1" / f"{role.lower()}.md"
+            schemas = {
+                "PLANNER": PlanProposal,
+                "NODE_RESOLVER": NodeDecision,
+                "FINAL_RESPONSE": AssistantResponse,
+            }
+            schema = schemas.get(role)
+            if isinstance(context, dict) and schema is not None and prompt_path.is_file():
+                instructions = prompt_path.read_text(encoding="utf-8")
+                rendered = render(instructions, context, schema.model_json_schema())
+                request = {
+                    "role": role,
+                    "prompt": {
+                        "role": role,
+                        "instructions": rendered,
+                    },
+                    "rendered_instructions": rendered,
+                }
+                request["prompt_chars"] = len(request["rendered_instructions"])
+        if request:
+            payload = {**payload, "request": request}
+            payload.pop("context", None)
+    return {
+        **event.model_dump(mode="json"),
+        "payload": payload,
+    }
 
 
 @asynccontextmanager
@@ -59,7 +96,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.1.13", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.1.14", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
 
 
@@ -376,9 +413,9 @@ async def dashboard_data(request: Request):
             task_id: [edge.model_dump(mode="json") for edge in edges]
             for task_id, edges in task_edges.items()
         },
-        "events": [event.model_dump(mode="json") for event in events[:200]],
+        "events": [_event_json(event) for event in events[:200]],
         "task_events": {
-            task_id: [event.model_dump(mode="json") for event in task_events[task_id]]
+            task_id: [_event_json(event) for event in task_events[task_id]]
             for task_id in task_events
         },
         "status_counts": status_counts,
@@ -525,11 +562,16 @@ async def delete_project(request: Request, project_id: str):
 
 
 @app.post("/projects/{project_id}/audit")
-async def audit_project(request: Request, project_id: str):
-    task = await service(request).service.create_project_audit_task(project_id)
+async def audit_project(request: Request, project_id: str, run_tests: bool = False):
+    task = await service(request).service.create_project_audit_task(project_id, run_tests=run_tests)
     if not task:
         raise HTTPException(404, "Project not found or disabled")
-    return {"id": task.id, "status": task.status, "project_id": task.project_id}
+    return {
+        "id": task.id,
+        "status": task.status,
+        "project_id": task.project_id,
+        "run_tests": run_tests,
+    }
 
 
 @app.post("/projects/{project_id}/codegraph/refresh")
@@ -644,6 +686,6 @@ async def get_graph(request: Request, task_id: str):
 async def get_events(request: Request, task_id: str):
     context = service(request)
     return [
-        event.model_dump(mode="json")
+        _event_json(event)
         for event in await context.service.repository.list_events(task_id)
     ]

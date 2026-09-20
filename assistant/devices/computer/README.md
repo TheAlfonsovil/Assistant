@@ -5,13 +5,22 @@ The computer branch is the only real device branch in V1. Its capabilities are r
 - `filesystem`: read, write, list, exists, info, search (recursive, limited to 500 results)
 - `shell`: exec
 - `git`: status, diff, log, branch, checkout, add, commit
-- `project`: analyze
+- `project`: analyze, audit, create, scaffold, modify
 - `system`: info (read-only local diagnostics)
 - `codegraph`: build (bounded Python module, symbol and import graph)
 - `web`: search, fetch (public HTTP(S) only)
 - `browser`: inspect, open, log, close_tab, close_site, close_browser
 
 Future computer capabilities should be added as focused tools or capabilities here, not inside the Task Engine.
+
+`project.analyze` is a bounded structural inventory. `project.audit` is a
+read-only inventory of safe manifests, detected tests and limitations; it
+accepts `run_tests` (boolean, default `false`) and only executes a detected
+test command when that value is `true`. `project.create` still only creates a
+direct child directory. `project.scaffold` is the supported high-level
+operation for a Vue + Java 25/Spring Boot 4 application with Docker Compose and
+a Windows PowerShell launcher. `project.modify` applies explicit, bounded file
+changes for a named feature and can run explicitly supplied validation commands.
 
 The `search` and `scrape_url` ideas from the `ai_testing` prototype are intentionally
 implemented as a lightweight HTTP adapter, without browser automation or

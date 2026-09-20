@@ -1,6 +1,6 @@
 [project]
 name = "assistant-core"
-version = "0.1.13"
+version = "0.1.14"
 description = "Persistent local task engine for Assistant"
 requires-python = ">=3.12"
 dependencies = [

@@ -46,6 +46,10 @@ class ContextBuilder:
                 "description": project.description,
                 "project_type": project.project_type,
                 "audit_prompt": project.audit_prompt,
+                "execution_guidance": (
+                    "Use this project-specific instruction as scope guidance, not as a "
+                    f"replacement for the user request: {project.audit_prompt}"
+                ),
                 "codegraph_version": project.codegraph_version,
                 "codegraph_available": project.codegraph is not None,
             } if project else None,

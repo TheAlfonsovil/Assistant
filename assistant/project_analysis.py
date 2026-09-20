@@ -62,8 +62,14 @@ class ProjectAnalyzer:
                 started_at=started_at,
             )
 
-    async def audit(self, root: str, max_files: int = 500, timeout: float = 60.0) -> OperationResult:
-        """Collect safe project evidence and run an automatically detected test command."""
+    async def audit(
+        self,
+        root: str,
+        max_files: int = 500,
+        timeout: float = 60.0,
+        run_tests: bool = False,
+    ) -> OperationResult:
+        """Collect safe project evidence and optionally run detected tests."""
         structural = await self.analyze(root, max_files)
         if not structural.success:
             return structural
@@ -109,16 +115,27 @@ class ProjectAnalyzer:
             if path.name in {".env", ".env.local", ".env.production"}
         ]
         test_command = self._test_command(project_root, configuration, test_files)
-        test_result = await self._run_test_command(test_command, project_root, timeout) if test_command else {
-            "available": False,
-            "reason": "No supported test command or test files detected",
-        }
+        if run_tests and test_command:
+            test_result = await self._run_test_command(test_command, project_root, timeout)
+        elif run_tests:
+            test_result = {
+                "available": False,
+                "reason": "No supported test command or test files detected",
+            }
+        else:
+            test_result = {
+                "available": bool(test_command),
+                "command": test_command,
+                "executed": False,
+                "reason": "Tests were detected but not run; set run_tests=true to execute them.",
+            }
         structural.output.update({
             "audit": {
                 "configuration": configuration,
                 "dependency_manifests": [name for name in configuration if Path(name).name not in {".gitignore", ".env.example"}],
                 "test_files": test_files[:500],
                 "test_command": test_command,
+                "run_tests": run_tests,
                 "test_result": test_result,
                 "sensitive_files": sensitive_files,
                 "sensitive_file_contents_read": False,

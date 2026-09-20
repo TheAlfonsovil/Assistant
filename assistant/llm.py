@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import time
 from collections.abc import Callable
@@ -238,6 +239,7 @@ class OllamaLLMProvider:
             "role": role,
             "instructions": rendered_instructions,
         }
+        request_schema = self._request_schema(role, schema)
         self.last_request = {
             "role": role,
             "prompt": prompt,
@@ -264,7 +266,7 @@ class OllamaLLMProvider:
                         "model": self.model,
                         "prompt": json.dumps(prompt, default=str),
                         "stream": False,
-                        "format": schema.model_json_schema(),
+                        "format": request_schema,
                         "options": {
                             "temperature": self.temperature,
                             "num_ctx": self.num_ctx,
@@ -327,6 +329,29 @@ class OllamaLLMProvider:
             }
         )
         return validated
+
+    @staticmethod
+    def _request_schema(role: str, schema: type[BaseModel]) -> dict[str, Any]:
+        """Make planner alternatives mutually exclusive for constrained decoding.
+
+        The base Pydantic schema gives every list a default empty value.  That is
+        useful for deserialization, but it also tells the model that an empty
+        executable plan is valid.  The planner must choose a direct answer or
+        at least one executable node/subtask.
+        """
+        result = copy.deepcopy(schema.model_json_schema())
+        if role != "PLANNER":
+            return result
+
+        result["anyOf"] = [
+            {
+                "required": ["answer"],
+                "properties": {"answer": {"type": "string", "minLength": 1}},
+            },
+            {"required": ["nodes"], "properties": {"nodes": {"minItems": 1}}},
+            {"required": ["subtasks"], "properties": {"subtasks": {"minItems": 1}}},
+        ]
+        return result
 
     def _trace(self, payload: dict[str, Any]) -> None:
         if self.trace_sink:

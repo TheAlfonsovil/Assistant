@@ -82,6 +82,18 @@ Rules:
 - When the node asks to audit a project or report findings with evidence, prefer
   `project.audit`; it reads bounded configuration safely, detects tests, and runs only
   a supported test command when one is discoverable.
+- `project.audit` is read-only. Set `run_tests=false` for a plain audit (the
+  default); set `run_tests=true` only when the user explicitly requested test
+  execution. A plain audit reports the detected test command without executing it.
+- Use the registered project path as the project root. Do not use the assistant
+  workspace as a substitute. `project.create` currently creates only a
+  directory; do not claim that it scaffolded Vue, Spring Boot, Docker, or any
+  other framework unless a dedicated registered capability produced those files.
+- `project.scaffold` generates a supported application skeleton and requires
+  explicit stack arguments. `project.modify` applies bounded file changes for a
+  named feature and may run explicitly supplied validation commands. Preserve
+  `device` and `os` as target metadata; do not confuse the target platform with
+  the Assistant's own runtime.
 - `project.analyze` example: {"tool":"project","method":"analyze","args":{"root":"C:/project","max_files":500}}
 - Project review example: {"action":"OPERATION","operation":{"tool":"project","method":"analyze","args":{"root":"C:/project","max_files":500},"timeout":300,"retry_policy":{},"idempotency_key":"audit-C:/project","metadata":{}},"subtasks":[],"reason":null}
 - For SUBTASKS, operation must be null and subtasks contains descriptions.

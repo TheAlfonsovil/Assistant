@@ -106,11 +106,16 @@ should be clarified by the user. The default code-project workflow creates a
 normal task for each iteration:
 
 ```text
-audit -> plan -> inspect/implement/test -> verify -> evidence report
+audit -> evidence report
 ```
 
-This keeps repeated reviews independent and durable without making the project
-itself an endlessly running task.
+The audit phase is read-only and does not run tests unless the user explicitly
+requests them. When requested, `project.audit` receives the typed argument
+`run_tests=true`; otherwise it uses `run_tests=false` and reports detected test
+commands without executing them. Implementation, deployment and browser work
+are separate phases and must not be inferred from an audit request. This keeps
+repeated reviews independent and durable without making the project itself an
+endlessly running task.
 
 ## Memory injection
 

@@ -30,10 +30,12 @@ Projects are durable code resources, separate from devices and from the process 
 Register one with `POST /projects` using its name, absolute path, description
 and audit prompt. Tasks resolve a project by explicit id or name, the default
 project, or automatically when exactly one enabled project exists. A code
-project can start the repeatable workflow with `POST /projects/{id}/audit`:
-audit, plan, execute and test, then report evidence. Each audit is a normal
-task, so the same project can be reviewed again without creating a permanent
-task.
+project can start the repeatable workflow with `POST /projects/{id}/audit`.
+Auditing is read-only: it inventories the project, safe configuration,
+dependencies, detected tests and limitations, but does not execute tests by
+default. A task must explicitly request test execution (for example,
+“audita el proyecto y ejecuta los tests”). Each audit is a normal task, so the
+same project can be reviewed again without creating a permanent task.
 
 Devices are a separate capability layer. The active computer branch represents
 Windows and uses local tools; the mobile branch represents Android and reserves

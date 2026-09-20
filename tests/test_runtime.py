@@ -86,7 +86,7 @@ async def test_computer_filesystem_info_and_search(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_project_audit_reads_safe_manifests_and_runs_tests_without_reading_env(tmp_path):
+async def test_project_audit_is_read_only_by_default_and_does_not_read_env(tmp_path):
     (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
     (tmp_path / ".env").write_text("API_TOKEN=do-not-read\n", encoding="utf-8")
     (tmp_path / "test_audit.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
@@ -100,8 +100,28 @@ async def test_project_audit_reads_safe_manifests_and_runs_tests_without_reading
     assert "pyproject.toml" in audit["configuration"]
     assert audit["sensitive_files"] == [".env"]
     assert audit["sensitive_file_contents_read"] is False
-    assert audit["test_result"]["exit_code"] == 0
+    assert audit["run_tests"] is False
+    assert audit["test_result"]["executed"] is False
+    assert audit["test_result"]["command"] == "python -m pytest -q"
     assert "do-not-read" not in json.dumps(audit)
+
+
+@pytest.mark.asyncio
+async def test_project_audit_runs_detected_tests_only_when_requested(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+    (tmp_path / "test_audit.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="audit",
+            args={"root": str(tmp_path), "max_files": 50, "run_tests": True},
+        )
+    )
+
+    assert result.success is True
+    assert result.output["audit"]["run_tests"] is True
+    assert result.output["audit"]["test_result"]["exit_code"] == 0
 
 
 @pytest.mark.asyncio
@@ -139,6 +159,96 @@ async def test_project_create_creates_direct_child_and_rejects_path_escape(tmp_p
     assert created.success is True
     assert (tmp_path / "new-app").is_dir()
     assert escaped.success is False
+
+
+@pytest.mark.asyncio
+async def test_project_scaffold_creates_vue_spring_boot_and_docker_files(tmp_path):
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="scaffold",
+            args={
+                "root": str(tmp_path),
+                "name": "test_zone",
+                "frontend": {"framework": "vue"},
+                "backend": {"language": "java", "java_version": "25", "framework": "spring-boot"},
+                "containerize": True,
+                "device": "computer",
+                "os": "windows-11",
+            },
+        )
+    )
+
+    assert result.success is True
+    project = tmp_path / "test_zone"
+    assert (project / "frontend" / "package.json").is_file()
+    assert (project / "backend" / "pom.xml").is_file()
+    assert (project / "docker-compose.yml").is_file()
+    assert (project / "run.ps1").is_file()
+    assert result.output["device"] == "computer"
+    assert result.output["os"] == "windows-11"
+
+
+@pytest.mark.asyncio
+async def test_project_scaffold_can_skip_container_files_and_reject_duplicates(tmp_path):
+    registry = build_tool_registry()
+    args = {
+        "root": str(tmp_path),
+        "name": "plain-app",
+        "frontend": {"framework": "vue"},
+        "backend": {"language": "java", "java_version": "25", "framework": "spring-boot"},
+        "containerize": False,
+    }
+    created = await registry.execute(Operation(tool="project", method="scaffold", args=args))
+    duplicate = await registry.execute(Operation(tool="project", method="scaffold", args=args))
+
+    assert created.success is True
+    assert not (tmp_path / "plain-app" / "docker-compose.yml").exists()
+    assert duplicate.success is False
+
+
+@pytest.mark.asyncio
+async def test_project_modify_applies_bounded_feature_changes_and_validation(tmp_path):
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="modify",
+            args={
+                "root": str(tmp_path),
+                "feature": "health endpoint",
+                "changes": [{"path": "backend/src/Health.java", "content": "class Health {}"}],
+                "commands": ["python -c \"from pathlib import Path; assert Path('backend/src/Health.java').exists()\""],
+            },
+        )
+    )
+
+    assert result.success is True
+    assert (tmp_path / "backend" / "src" / "Health.java").read_text(encoding="utf-8") == "class Health {}"
+    assert result.output["feature"] == "health endpoint"
+    assert result.output["validation"][0]["exit_code"] == 0
+
+
+@pytest.mark.asyncio
+async def test_project_modify_rejects_escape_and_reports_failed_validation(tmp_path):
+    registry = build_tool_registry()
+    escaped = await registry.execute(
+        Operation(
+            tool="project",
+            method="modify",
+            args={"root": str(tmp_path), "feature": "bad", "changes": [{"path": "../bad", "content": "x"}]},
+        )
+    )
+    failed = await registry.execute(
+        Operation(
+            tool="project",
+            method="modify",
+            args={"root": str(tmp_path), "feature": "bad validation", "changes": [{"path": "x", "content": "x"}], "commands": ["exit 1"]},
+        )
+    )
+
+    assert escaped.success is False
+    assert failed.success is False
+    assert failed.output["validation"][0]["exit_code"] == 1
 
 
 @pytest.mark.asyncio

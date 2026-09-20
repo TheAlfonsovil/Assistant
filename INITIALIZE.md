@@ -122,6 +122,23 @@ $projectId = "ID_DEL_PROYECTO"
 Invoke-RestMethod -Uri "http://127.0.0.1:8000/projects/$projectId/audit" -Method Post
 ```
 
+La auditoría es de solo lectura y no ejecuta tests por defecto. Detecta los
+tests y el comando disponible y los incluye en el resultado. Para pedir
+ejecución explícita usa una orden como `audita el proyecto y ejecuta los tests`,
+o crea una operación `project.audit` con `run_tests=true`. El parámetro
+`run_tests` pertenece a la herramienta, no a `.env`.
+
+La API permite el mismo control de forma explícita:
+
+```powershell
+Invoke-RestMethod -Uri "http://127.0.0.1:8000/projects/$projectId/audit?run_tests=true" -Method Post
+```
+
+La configuración del runtime se carga desde `.env` cuando existe. `.env.example`
+es únicamente una plantilla y no se carga automáticamente; cópiala a `.env` y
+ajusta sus valores. Las variables `ASSISTANT_*` controlan el proceso local,
+mientras que la memoria persistente se guarda en SQLite y no en `.env`.
+
 ## 5. Monitorizar una orden
 
 En el dashboard:

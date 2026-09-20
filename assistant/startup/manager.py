@@ -107,7 +107,7 @@ class StartupManager:
             path=str(assistant_path),
             description="Repositorio y código fuente del Assistant.",
             project_type="code",
-            audit_prompt="Audita el repositorio Assistant, ejecuta sus tests y reporta hallazgos con evidencia.",
+            audit_prompt="Audita el repositorio Assistant y reporta hallazgos con evidencia.",
             enabled=True,
         )
         projects = await repository.list_projects()

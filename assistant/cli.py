@@ -89,6 +89,12 @@ def task(
                         f"tarea={context.get('task', {}).get('id', '-')}")
                 else:
                     typer.echo("        contexto preparado")
+                template = event.payload.get("prompt_template")
+                if template:
+                    typer.echo(
+                        f"        plantilla del {event.payload.get('role', 'LLM')} "
+                        f"({len(template)} caracteres):\n{template}"
+                    )
             if fullflow and event.event_type == "LLM_RESPONSE":
                 typer.echo(f"        propuesta validada: {preview(event.payload)}")
 

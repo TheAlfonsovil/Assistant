@@ -205,15 +205,24 @@ class TaskService:
     async def delete_project(self, project_id: str) -> bool:
         return await self.repository.delete_project(project_id)
 
-    async def create_project_audit_task(self, project_id: str) -> Task | None:
+    async def create_project_audit_task(
+        self, project_id: str, run_tests: bool = False
+    ) -> Task | None:
         project = await self.repository.get_project(project_id)
         if project is None or not project.enabled:
             return None
+        goal = project.audit_prompt
+        if run_tests and "test" not in goal.casefold():
+            goal = f"{goal.rstrip('.')} and execute the detected tests."
         return await self.create_task(
             TaskRequest(
-                goal=project.audit_prompt,
+                goal=goal,
                 project_id=project.id,
-                metadata={"workflow": "project_audit", "project_name": project.name},
+                metadata={
+                    "workflow": "project_audit",
+                    "project_name": project.name,
+                    "run_tests": run_tests,
+                },
             )
         )
 
@@ -777,6 +786,27 @@ class TaskService:
             )
 
     @staticmethod
+    def _normalize_coverage_plan(task: Task, proposal: PlanProposal) -> PlanProposal:
+        """Turn coverage emitted by a weak planner into executable work.
+
+        Coverage is normally supplementary metadata.  When a model emits only
+        coverage, retaining those requested work items is safer than asking the
+        same model to repeat an unconstrained empty graph.
+        """
+        descriptions = [item.strip() for item in proposal.coverage if item.strip()]
+        if not descriptions:
+            return proposal
+        nodes = [
+            PlanNodeProposal(
+                id=f"coverage-{index}",
+                description=description,
+                type="OPERATION",
+            )
+            for index, description in enumerate(descriptions, start=1)
+        ]
+        return proposal.model_copy(update={"task_id": proposal.task_id or task.id, "nodes": nodes})
+
+    @staticmethod
     def _fallback_plan(task: Task) -> PlanProposal | None:
         goal = task.goal.casefold()
         wants_graph = "codegraph" in goal or "grafo" in goal
@@ -808,6 +838,37 @@ class TaskService:
                     ],
                 )
             project_name = creation_match.group(1)
+            scaffold_requested = any(
+                term in goal for term in ("vue", "spring boot", "springboot", "docker", "frontend", "backend")
+            )
+            if scaffold_requested:
+                return PlanProposal(
+                    task_id=task.id,
+                    coverage=["scaffold the requested application stack and validate its generated structure"],
+                    nodes=[
+                        PlanNodeProposal(
+                            id="fallback-project-scaffold",
+                            description=f"Crear el scaffold funcional de {project_name} con frontend, backend y contenedores",
+                            type="OPERATION",
+                            acceptance={"fields": {"name": project_name, "scaffolded": True}},
+                            metadata={
+                                "operation_hint": {
+                                    "tool": "project",
+                                    "method": "scaffold",
+                                    "args": {
+                                        "name": project_name,
+                                        "frontend": {"framework": "vue"},
+                                        "backend": {"language": "java", "java_version": "25", "framework": "spring-boot"},
+                                        "containerize": True,
+                                        "device": "computer",
+                                        "os": "windows-11",
+                                    },
+                                    "timeout": 300,
+                                }
+                            },
+                        )
+                    ],
+                )
             return PlanProposal(
                 task_id=task.id,
                 coverage=["create the requested project directory"],
@@ -844,6 +905,20 @@ class TaskService:
                 "sonar",
             )
         )
+        tests_requested = any(
+            term in goal
+            for term in (
+                "run tests",
+                "run the tests",
+                "execute tests",
+                "execute the tests",
+                "ejecuta los tests",
+                "ejecutar los tests",
+                "corre los tests",
+                "correr los tests",
+                "testea",
+            )
+        )
         if not audit_requested and not wants_graph:
             return None
         nodes = []
@@ -867,7 +942,7 @@ class TaskService:
             PlanNodeProposal(
                 id="fallback-project-inspection",
                 description=(
-                    "Auditar el proyecto: estructura, configuración, dependencias, tests y evidencia de runtime"
+                    "Auditar el proyecto: estructura, configuración, dependencias, tests detectados y limitaciones"
                 ),
                 type="OPERATION",
                 dependencies=["fallback-codegraph-build"] if wants_graph else [],
@@ -875,7 +950,7 @@ class TaskService:
                     "operation_hint": {
                         "tool": "project",
                         "method": "audit",
-                        "args": {"max_files": 500},
+                        "args": {"max_files": 500, "run_tests": tests_requested},
                         "timeout": 300,
                     }
                 },
@@ -1010,17 +1085,6 @@ class TaskService:
                     }
                 ],
             )
-            await self.repository.save_event(
-                TaskEvent(
-                    task_id=task.id,
-                    event_type="LLM_REQUEST",
-                    payload={
-                        "role": "FINAL_RESPONSE",
-                        "context": json.loads(json.dumps(response_context, default=str)),
-                        "context_chars": len(json.dumps(response_context, default=str)),
-                    },
-                )
-            )
             response = await asyncio.wait_for(
                 respond(response_context),
                 timeout=min(
@@ -1035,6 +1099,16 @@ class TaskService:
             else:
                 task.result_summary = response.summary
             await self.repository.save_task(task)
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="LLM_REQUEST",
+                    payload={
+                        "role": "FINAL_RESPONSE",
+                        "request": getattr(self.llm, "last_request", {}),
+                    },
+                )
+            )
             await self.repository.save_event(
                 TaskEvent(
                     task_id=task.id,
@@ -1366,17 +1440,6 @@ class TaskService:
                 if not await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
                     return True
                 planner_context = await self.context_builder.for_planner(task)
-                await self.repository.save_event(
-                    TaskEvent(
-                        task_id=task_id,
-                        event_type="LLM_REQUEST",
-                        payload={
-                            "role": "PLANNER",
-                            "context": json.loads(json.dumps(planner_context, default=str)),
-                            "context_chars": len(json.dumps(planner_context, default=str)),
-                        },
-                    )
-                )
                 try:
                     proposal = await self._call_llm(self.llm.plan(planner_context), time_remaining)
                 except TimeoutError as error:
@@ -1395,6 +1458,16 @@ class TaskService:
                 if cancellation.is_set():
                     await self._persist_cancellation(task)
                     return False
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task_id,
+                        event_type="LLM_REQUEST",
+                        payload={
+                            "role": "PLANNER",
+                            "request": getattr(self.llm, "last_request", {}),
+                        },
+                    )
+                )
                 await self.repository.save_event(
                     TaskEvent(
                         task_id=task_id,
@@ -1417,33 +1490,51 @@ class TaskService:
                         },
                     )
                 )
+                if (
+                    proposal.answer is None
+                    and not proposal.nodes
+                    and not proposal.subtasks
+                    and await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls)
+                ):
+                    retry_context = dict(planner_context)
+                    retry_context["planner_feedback"] = (
+                        "INVALID PLAN: coverage is descriptive only. Return executable nodes "
+                        "or subtasks, or provide a direct answer in answer."
+                    )
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            event_type="PLANNER_RETRY_REQUESTED",
+                            payload={"reason": "empty executable plan"},
+                        )
+                    )
+                    proposal = await self._call_llm(
+                        self.llm.plan(retry_context), time_remaining
+                    )
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            event_type="LLM_RESPONSE",
+                            payload={
+                                "role": "PLANNER_RETRY",
+                                "response": proposal.model_dump(mode="json"),
+                                "request": getattr(self.llm, "last_request", {}),
+                                "response_chars": len(json.dumps(proposal.model_dump(mode="json"), default=str)),
+                                "usage": getattr(self.llm, "last_usage", {}),
+                            },
+                        )
+                    )
                 if proposal.answer is None and not proposal.nodes and not proposal.subtasks:
-                    if await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
-                        retry_context = dict(planner_context)
-                        retry_context["planner_feedback"] = (
-                            "INVALID PLAN: coverage is descriptive only. Return executable nodes "
-                            "or subtasks, or provide a direct answer in answer."
-                        )
+                    normalized = self._normalize_coverage_plan(task, proposal)
+                    if normalized.nodes:
+                        proposal = normalized
                         await self.repository.save_event(
                             TaskEvent(
                                 task_id=task_id,
-                                event_type="PLANNER_RETRY_REQUESTED",
-                                payload={"reason": "empty executable plan"},
-                            )
-                        )
-                        proposal = await self._call_llm(
-                            self.llm.plan(retry_context), time_remaining
-                        )
-                        await self.repository.save_event(
-                            TaskEvent(
-                                task_id=task_id,
-                                event_type="LLM_RESPONSE",
+                                event_type="PLAN_NORMALIZED",
                                 payload={
-                                    "role": "PLANNER_RETRY",
-                                    "response": proposal.model_dump(mode="json"),
-                                    "request": getattr(self.llm, "last_request", {}),
-                                    "response_chars": len(json.dumps(proposal.model_dump(mode="json"), default=str)),
-                                    "usage": getattr(self.llm, "last_usage", {}),
+                                    "reason": "coverage-only planner response",
+                                    "nodes": [item.id for item in proposal.nodes],
                                 },
                             )
                         )
@@ -1733,19 +1824,6 @@ class TaskService:
             if await self._handle_structural_node(task, node, graph):
                 return True
             context = await self.context_builder.for_resolver(task, node, graph)
-            await self.repository.save_event(
-                TaskEvent(
-                    task_id=task_id,
-                    node_id=node.id,
-                    event_type="LLM_REQUEST",
-                    payload={
-                        "role": "NODE_RESOLVER",
-                        "description": node.description,
-                        "context": json.loads(json.dumps(context, default=str)),
-                        "context_chars": len(json.dumps(context, default=str)),
-                    },
-                )
-            )
             try:
                 if not await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
                     await self._block_node_for_budget(task, node, "llm_calls")
@@ -1775,6 +1853,17 @@ class TaskService:
                 await self.repository.save_node(node)
                 await self._persist_cancellation(task)
                 return True
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task_id,
+                    node_id=node.id,
+                    event_type="LLM_REQUEST",
+                    payload={
+                        "role": "NODE_RESOLVER",
+                        "request": getattr(self.llm, "last_request", {}),
+                    },
+                )
+            )
             await self.repository.save_event(
                 TaskEvent(
                     task_id=task_id,

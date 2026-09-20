@@ -106,6 +106,21 @@ function fillProjects(projects) {
 }
 function taskEvents(taskId) { return state.data?.task_events?.[taskId] || (state.data?.events || []).filter((event) => event.task_id === taskId); }
 function traceEvents(taskId) { return taskEvents(taskId); }
+function objectValue(value) {
+  if (value && typeof value === "object") return value;
+  if (typeof value !== "string") return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (_) {
+    return {};
+  }
+}
+function renderedPromptFrom(payload) {
+  const request = objectValue(payload?.request);
+  const nestedPrompt = objectValue(request.prompt);
+  return request.rendered_instructions || request.rendered_prompt || nestedPrompt.instructions || "";
+}
 function taskActivity(taskId) {
   const events = taskEvents(taskId);
   const event = events[events.length - 1];
@@ -136,13 +151,15 @@ function renderTrace(taskId) {
   const events = traceEvents(taskId);
   $("#trace-workspace").innerHTML = events.map((event, index) => {
     const payload = event.payload || {}, isRequest = event.event_type === "LLM_REQUEST", isResponse = event.event_type === "LLM_RESPONSE", isError = ["LLM_ERROR", "LLM_SKIPPED"].includes(event.event_type);
-    const request = isRequest ? payload.context : null;
+    const request = isRequest ? objectValue(payload.request) : null;
     const response = isResponse ? (payload.response || payload) : payload;
-    const renderedPrompt = payload.request ? payload.request.rendered_instructions : null;
-    const body = isRequest ? `<div class="trace-block"><label>CONTEXTO ESTRUCTURADO</label><pre>${esc(json(request))}</pre></div>` : isError ? `<div class="trace-block trace-error"><label>${event.event_type === "LLM_SKIPPED" ? "LLAMADA OMITIDA" : "ERROR REAL DEL PROVEEDOR"}</label><pre>${esc(json({ type: payload.error_type, error: payload.error || payload.reason }))}</pre></div>` : `<div class="trace-block"><label>${isResponse ? "RESPUESTA VALIDADA" : "DETALLE DEL EVENTO"}</label><pre>${esc(json(response))}</pre></div>`;
-    const prompt = renderedPrompt ? `<details class="trace-prompt"><summary>PROMPT RENDERIZADO REAL · ${payload.request.prompt_chars} caracteres</summary><pre>${esc(renderedPrompt)}</pre></details>` : "";
-    const title = isRequest ? "REQUEST / contexto enviado" : isResponse ? "RESPONSE / respuesta recibida" : isError ? "ERROR / llamada fallida" : event.event_type.replaceAll("_", " ");
-    return `<article class="llm-card ${isError ? "llm-error" : ""}"><header><span class="trace-number">${String(index + 1).padStart(2, "0")}</span><div><strong>${title}</strong><small>${esc(payload.role || (event.node_id ? `nodo ${shortId(event.node_id)}` : "tarea"))} · ${date(event.created_at)} · ${payload.context_chars || payload.response_chars || 0} caracteres</small></div><em>${isRequest ? "OUT" : isError ? "ERR" : isResponse ? "IN" : "LOG"}</em></header><div class="trace-meta"><span>${isRequest ? "Contexto al proveedor" : isResponse ? "Respuesta validada" : event.event_type}</span><span>${payload.usage ? `${payload.usage.prompt_eval_count || 0} prompt · ${payload.usage.eval_count || 0} response tokens` : "evento persistido"}</span></div>${body}${prompt}</article>`;
+    const renderedPrompt = isResponse ? renderedPromptFrom(payload) : "";
+    const requestPayload = objectValue(payload.request);
+    const prompt = "";
+    const body = isRequest ? `<div class="trace-block"><label>PROMPT EFECTIVO ENVIADO AL LLM</label><pre>${esc(request.rendered_instructions || request.rendered_prompt || objectValue(request.prompt).instructions || "No se ha persistido el prompt efectivo.")}</pre></div>` : isError ? `<div class="trace-block trace-error"><label>${event.event_type === "LLM_SKIPPED" ? "LLAMADA OMITIDA" : "ERROR REAL DEL PROVEEDOR"}</label><pre>${esc(json({ type: payload.error_type, error: payload.error || payload.reason }))}</pre></div>` : `<div class="trace-block"><label>${isResponse ? "RESPUESTA VALIDADA" : "DETALLE DEL EVENTO"}</label><pre>${esc(json(response))}</pre></div>`;
+    const title = isRequest ? "REQUEST / prompt efectivo enviado" : isResponse ? "RESPONSE / respuesta recibida" : isError ? "ERROR / llamada fallida" : event.event_type.replaceAll("_", " ");
+    const characterCount = payload.context_chars || payload.response_chars || requestPayload.prompt_chars || renderedPrompt.length || 0;
+    return `<article class="llm-card ${isError ? "llm-error" : ""}"><header><span class="trace-number">${String(index + 1).padStart(2, "0")}</span><div><strong>${title}</strong><small>${esc(payload.role || (event.node_id ? `nodo ${shortId(event.node_id)}` : "tarea"))} · ${date(event.created_at)} · ${characterCount} caracteres</small></div><em>${isRequest ? "OUT" : isError ? "ERR" : isResponse ? "IN" : "LOG"}</em></header><div class="trace-meta"><span>${isRequest ? "Prompt efectivo enviado" : isResponse ? "Respuesta validada" : event.event_type}</span><span>${payload.usage ? `${payload.usage.prompt_eval_count || 0} prompt · ${payload.usage.eval_count || 0} response tokens` : "evento persistido"}</span></div>${body}${prompt}</article>`;
   }).join("") || `<div class="empty">Esta tarea aún no tiene intercambios LLM persistidos.</div>`;
 }
 function renderInspector(taskId) {
