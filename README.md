@@ -21,6 +21,13 @@ register it in `register_actions`. To add a device, create its package and add
 one `DeviceBranch` in `assistant/devices/registry.py`. See
 [docs/architecture.md](docs/architecture.md) for the complete map.
 
+The computer branch also exposes `process.start`, `process.status`,
+`process.log` and `process.stop` for long-lived project processes. This is
+useful for starting a local frontend, backend or development server without
+blocking the task until its command timeout. Processes are tracked by the
+worker using their exact PID, and stdout/stderr are written under
+`data/processes/`; only processes started through this tool can be stopped.
+
 The initial user profile is read from `ASSISTANT_USER_*` variables in `.env`
 and persisted as one structured `user_profile` memory. The planner receives
 that profile together with task-relevant memories. The included

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -60,7 +61,7 @@ def test_device_registry_exposes_four_branches_and_computer_actions():
     assert DEVICE_BRANCHES[1].platform == "android"
     assert DEVICE_BRANCHES[1].transport == "adb"
     definitions = {definition.name for definition in build_tool_registry().definitions()}
-    assert {"filesystem", "shell", "git", "deployment", "project", "codegraph", "system", "web", "browser"} <= definitions
+    assert {"filesystem", "shell", "process", "git", "deployment", "project", "codegraph", "system", "web", "browser"} <= definitions
     assert {"device.mobile", "device.home", "device.robot"} <= definitions
 
 
@@ -83,6 +84,33 @@ async def test_computer_filesystem_info_and_search(tmp_path):
     assert search.output[0]["path"].endswith("main.py")
     assert system.success is True
     assert "os" in system.output
+
+
+@pytest.mark.asyncio
+async def test_process_tool_manages_long_running_project_process(tmp_path):
+    registry = build_tool_registry()
+    command = f'"{sys.executable}" -c "import time; print(\'ready\', flush=True); time.sleep(30)"'
+    started = await registry.execute(
+        Operation(
+            tool="process",
+            method="start",
+            args={"command": command, "cwd": str(tmp_path), "label": "test-server"},
+        )
+    )
+
+    assert started.success is True
+    process_id = started.output["process_id"]
+    status = await registry.execute(
+        Operation(tool="process", method="status", args={"process_id": process_id})
+    )
+    assert status.success is True
+    assert status.output["running"] is True
+
+    stopped = await registry.execute(
+        Operation(tool="process", method="stop", args={"process_id": process_id})
+    )
+    assert stopped.success is True
+    assert stopped.output["stopped"] is True
 
 
 @pytest.mark.asyncio
