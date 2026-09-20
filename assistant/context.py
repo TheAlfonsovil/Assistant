@@ -226,7 +226,13 @@ class ContextBuilder:
                 "recovery_policy": {
                     "max_attempts": task.budget.max_recovery_attempts,
                     "attempts_used": task.metadata.get("recovery_attempts", 0),
-                    "allowed_strategies": ["RETRY_NODE", "FIX", "RESTART_TASK", "BLOCK"],
+                    "allowed_strategies": [
+                        "RETRY_NODE",
+                        "FIX",
+                        "RESTART_TASK",
+                        "BLOCK",
+                        "ASK_USER",
+                    ],
                 },
             },
         }

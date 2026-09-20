@@ -11,6 +11,7 @@ from assistant.domain.models import (
     NodeStatus,
     NodeType,
     Task,
+    TaskEvent,
     TaskNode,
     TaskStatus,
 )
@@ -140,6 +141,43 @@ async def test_memory_expiration_redaction_deletion_and_export(tmp_path):
         assert await repository.purge_expired_memory() == 1
         assert await repository.delete_memory(current.id) is True
         assert await repository.list_memory() == []
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_health_reports_wal_and_integrity(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'health.db'}")
+    await database.create_all()
+
+    health = await database.health_check()
+
+    assert health["status"] == "ok"
+    assert health["journal_mode"] == "wal"
+    assert health["foreign_keys"] == 1
+    assert health["integrity"] == "ok"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_idempotency_result_is_reused_and_old_events_are_purged(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'maintenance.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        first = await repository.save_idempotency_result("same-operation", {"value": 1})
+        second = await repository.save_idempotency_result("same-operation", {"value": 2})
+        assert first == second == {"value": 1}
+
+        old = TaskEvent(
+            task_id="task",
+            event_type="old",
+            created_at=datetime.now(UTC) - timedelta(days=60),
+        )
+        recent = TaskEvent(task_id="task", event_type="recent")
+        await repository.save_event(old)
+        await repository.save_event(recent)
+        assert await repository.purge_old_events(retention_days=30, keep_recent=0) == 1
+        assert [event.event_type for event in await repository.list_events("task")] == ["recent"]
     await database.close()
 
 

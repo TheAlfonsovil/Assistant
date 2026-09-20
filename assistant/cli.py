@@ -169,6 +169,8 @@ def run(
             idle_cycle=IdleCycle(
                 on_idle=service.reconcile_idle,
                 supervise=lambda has_work: service.reconcile_idle(),
+                interval=context.settings.maintenance_interval,
+                supervision_interval=context.settings.maintenance_interval,
                 enabled=context.settings.idle_enabled,
             ),
             is_ready=lambda: startup.llm_ready,

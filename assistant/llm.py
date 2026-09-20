@@ -30,6 +30,7 @@ class NodeDecision(BaseModel):
     action_proposal: ActionProposal | None = None
     subtasks: list[str] = Field(default_factory=list)
     reason: str | None = None
+    user_input_required: bool = False
 
 
 class PlanNodeProposal(BaseModel):

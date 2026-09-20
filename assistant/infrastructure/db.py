@@ -1,7 +1,7 @@
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
@@ -28,13 +28,56 @@ def ensure_sqlite_directory(url: str) -> None:
 class Database:
     def __init__(self, url: str):
         ensure_sqlite_directory(url)
-        self.engine = create_async_engine(async_database_url(url), future=True)
+        async_url = async_database_url(url)
+        connect_args = {"timeout": 30} if async_url.startswith("sqlite+") else {}
+        self.engine = create_async_engine(async_url, future=True, connect_args=connect_args)
+        if async_url.startswith("sqlite+"):
+            event.listen(self.engine.sync_engine, "connect", self._configure_sqlite)
         self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+
+    @staticmethod
+    def _configure_sqlite(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
 
     async def create_all(self) -> None:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
             await connection.run_sync(self._migrate_existing_schema)
+            await connection.execute(
+                text(
+                    "CREATE TABLE IF NOT EXISTS schema_version "
+                    "(version INTEGER NOT NULL, applied_at DATETIME NOT NULL)"
+                )
+            )
+            current = await connection.scalar(text("SELECT MAX(version) FROM schema_version"))
+            if current is None:
+                await connection.execute(
+                    text(
+                        "INSERT INTO schema_version(version, applied_at) "
+                        "VALUES (1, CURRENT_TIMESTAMP)"
+                    )
+                )
+
+    async def health_check(self) -> dict[str, object]:
+        async with self.sessions() as session:
+            await session.execute(text("SELECT 1"))
+            result: dict[str, object] = {"status": "ok", "database": "connected"}
+            if self.engine.url.drivername.startswith("sqlite"):
+                result["journal_mode"] = (
+                    await session.scalar(text("PRAGMA journal_mode"))
+                )
+                result["foreign_keys"] = (
+                    await session.scalar(text("PRAGMA foreign_keys"))
+                )
+                result["integrity"] = (
+                    await session.scalar(text("PRAGMA quick_check"))
+                )
+            return result
 
     @staticmethod
     def _migrate_existing_schema(connection) -> None:

@@ -60,6 +60,8 @@ class TaskService:
         default_execution_time: float | None = None,
         final_response_timeout: float = 36000.0,
         max_steps: int = 1000,
+        event_retention_days: int = 30,
+        event_retention_keep_recent: int = 1000,
     ):
         self.repository = TaskRepository(session, event_sink=event_sink)
         self.session = session
@@ -77,6 +79,8 @@ class TaskService:
         self.default_execution_time = default_execution_time
         self.final_response_timeout = max(1.0, final_response_timeout)
         self.max_steps = max(1, max_steps)
+        self.event_retention_days = max(1, event_retention_days)
+        self.event_retention_keep_recent = max(0, event_retention_keep_recent)
         self.owner = f"{socket.gethostname()}:{id(self)}"
         self._cancellation_events: dict[str, asyncio.Event] = {}
 
@@ -173,7 +177,41 @@ class TaskService:
         return await self.repository.get_project(project_id)
 
     async def list_projects(self) -> list[Project]:
+        await self.reconcile_scaffold_projects()
         return await self.repository.list_projects()
+
+    async def reconcile_scaffold_projects(self) -> int:
+        """Recover scaffold projects created before automatic registration existed."""
+        root = Path(self.projects_root).expanduser()
+        if not root.is_dir():
+            return 0
+        projects = await self.repository.list_projects()
+        known_paths = {str(Path(item.path).resolve()).casefold() for item in projects}
+        known_names = {item.name.casefold() for item in projects}
+        recovered = 0
+        for candidate in root.iterdir():
+            if not candidate.is_dir():
+                continue
+            if not all(
+                (candidate / marker).is_file()
+                for marker in ("docker-compose.yml", "frontend/package.json", "backend/pom.xml")
+            ):
+                continue
+            resolved = str(candidate.resolve())
+            if resolved.casefold() in known_paths or candidate.name.casefold() in known_names:
+                continue
+            await self.repository.create_project(
+                Project(
+                    name=candidate.name,
+                    path=resolved,
+                    description="Scaffold project recovered from the configured projects root",
+                    project_type="code",
+                )
+            )
+            known_paths.add(resolved.casefold())
+            known_names.add(candidate.name.casefold())
+            recovered += 1
+        return recovered
 
     async def update_project(self, project: Project) -> Project:
         existing = await self.repository.get_project(project.id)
@@ -244,6 +282,12 @@ class TaskService:
         purge = getattr(self.repository, "purge_expired_memory", None)
         if purge is not None:
             await purge()
+        purge_events = getattr(self.repository, "purge_old_events", None)
+        if purge_events is not None:
+            await purge_events(
+                retention_days=self.event_retention_days,
+                keep_recent=self.event_retention_keep_recent,
+            )
         for task in await self.repository.list_tasks():
             if task.status not in {TaskStatus.READY, TaskStatus.RUNNING}:
                 continue
@@ -364,6 +408,30 @@ class TaskService:
             )
         )
         return task
+
+    async def replan_task(self, task_id: str) -> Task | None:
+        """Run the bounded recovery planner again for a failed or blocked task."""
+        task = await self.repository.get_task(task_id)
+        if task is None:
+            return None
+        if task.status not in {TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.WAITING}:
+            raise ValueError("only blocked, failed, or waiting tasks can be replanned")
+        nodes = await self.repository.list_nodes(task_id)
+        candidate = next(
+            (
+                item
+                for item in reversed(nodes)
+                if item.status in {NodeStatus.BLOCKED, NodeStatus.FAILED, NodeStatus.WAITING}
+            ),
+            None,
+        )
+        if candidate is None:
+            raise ValueError("no recoverable node was found")
+        graph = await self.graph(task_id)
+        recovered = await self._attempt_recovery(task, candidate, candidate.error or task.failure_reason or "user requested replanning", graph)
+        if not recovered:
+            raise ValueError("replanning budget exhausted or recovery analysis failed")
+        return await self.repository.get_task(task_id)
 
     async def approve_action(self, task_id: str, node_id: str, approved: bool) -> Task | None:
         task = await self.repository.get_task(task_id)
@@ -712,6 +780,7 @@ class TaskService:
                     "action": decision.action,
                     "reason": decision.reason,
                     "subtasks": decision.subtasks,
+                    "user_input_required": decision.user_input_required,
                 },
             )
         )
@@ -778,6 +847,29 @@ class TaskService:
                     node_id=node.id,
                     event_type="RECOVERY_FIX_BRANCH_CREATED",
                     payload={"steps": len(decision.subtasks)},
+                )
+            )
+            return True
+        if decision.action == "BLOCK" and decision.user_input_required:
+            node.status = NodeStatus.WAITING
+            node.error = decision.reason or "additional user information is required"
+            task.status = TaskStatus.WAITING
+            task.failure_reason = node.error
+            task.finished_at = None
+            task.metadata["clarification"] = {
+                "kind": "recovery_input",
+                "reason": node.error,
+                "node_id": node.id,
+                "prompt": decision.reason or "Provide the missing information to continue.",
+            }
+            await self.repository.save_node(node)
+            await self.repository.save_task(task)
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    node_id=node.id,
+                    event_type="USER_INPUT_REQUIRED",
+                    payload=task.metadata["clarification"],
                 )
             )
             return True
@@ -1278,12 +1370,55 @@ class TaskService:
         return task
 
     async def _persist_project_operation_result(self, task: Task, operation, result: dict[str, Any]) -> None:
-        if not task.project_id or not result.get("success"):
+        if not result.get("success"):
             return
-        project = await self.repository.get_project(task.project_id)
-        if project is None or not isinstance(result.get("output"), dict):
+        if not isinstance(result.get("output"), dict):
             return
         output = result["output"]
+        if operation.tool == "project" and operation.method == "scaffold":
+            path = output.get("path")
+            name = output.get("name")
+            if not isinstance(path, str) or not isinstance(name, str) or not Path(path).is_dir():
+                return
+            existing = next(
+                (
+                    item
+                    for item in await self.repository.list_projects()
+                    if item.path.casefold() == str(Path(path).resolve()).casefold()
+                    or item.name.casefold() == name.casefold()
+                ),
+                None,
+            )
+            project = existing or Project(
+                name=name,
+                path=path,
+                description=f"Scaffold generated by task {task.id}",
+                project_type="code",
+            )
+            if existing is None:
+                project = await self.repository.create_project(project)
+            task.project_id = project.id
+            task.metadata["created_project"] = {
+                "project_id": project.id,
+                "name": project.name,
+                "path": project.path,
+            }
+            await self.repository.save_task(task)
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="PROJECT_REGISTERED",
+                    payload={
+                        "project_id": project.id,
+                        "name": project.name,
+                        "path": project.path,
+                    },
+                )
+            )
+            return
+        project = await self.repository.get_project(task.project_id) if task.project_id else None
+        if project is None:
+            return
         event_type = None
         if operation.tool == "codegraph" and operation.method == "build" and output.get("graph"):
             project.codegraph = output
@@ -2079,6 +2214,10 @@ class TaskService:
             project = await self.repository.get_project(task.project_id) if task.project_id else None
             if operation.tool == "project" and operation.method == "create":
                 operation.args.setdefault("root", self.projects_root)
+            elif operation.tool == "project" and operation.method == "scaffold":
+                # scaffold owns the final child path: it creates <root>/<name>.
+                # Never let an LLM-provided root duplicate the project name.
+                operation.args["root"] = self.projects_root
             elif operation.tool in {"project", "codegraph"} and operation.method in {"analyze", "audit", "build", "system"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
             operation_key = operation.idempotency_key or self._operation_key(
@@ -2163,12 +2302,7 @@ class TaskService:
                     )
                 )
                 if result.get("success") or not result.get("retryable"):
-                    self.session.add(
-                        IdempotencyRow(
-                            idempotency_key=operation_key, result_json=result
-                        )
-                    )
-                    await self.session.commit()
+                    await self.repository.save_idempotency_result(operation_key, result)
             node.status = NodeStatus.VERIFYING
             task.status = TaskStatus.VERIFYING
             if not await self.renew_lease(node.id, lease_seconds):
@@ -2360,6 +2494,26 @@ class TaskService:
                 previous_id = recovery_node.id
             node.metadata["recovery_pending"] = True
             task.status = TaskStatus.READY
+        elif decision.action == "BLOCK" and decision.user_input_required:
+            node.status = NodeStatus.WAITING
+            node.error = decision.reason or "additional user information is required"
+            task.status = TaskStatus.WAITING
+            task.failure_reason = node.error
+            task.finished_at = None
+            task.metadata["clarification"] = {
+                "kind": "recovery_input",
+                "reason": node.error,
+                "node_id": node.id,
+                "prompt": decision.reason or "Provide the missing information to continue.",
+            }
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    node_id=node.id,
+                    event_type="USER_INPUT_REQUIRED",
+                    payload=task.metadata["clarification"],
+                )
+            )
         else:
             node.status = NodeStatus.BLOCKED
             node.error = decision.reason or "replanning returned no executable strategy"

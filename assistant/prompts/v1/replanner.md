@@ -23,8 +23,10 @@ CONTRACT
   the failed node is retried. Its subtasks must describe work, not explanations.
 - RESTART_TASK is exceptional: use it only when the graph state is no longer
   trustworthy, and explain why preserving it is unsafe.
-- BLOCK is required when capability, permission, user input, or approval is
-  missing. State the exact blocker; never guess.
+- BLOCK is required when capability or permission is missing. Set
+  `user_input_required=true` when the task can continue after the user supplies
+  a specific missing fact, choice, credential, or approval. State the exact
+  blocker; never guess.
 - Preserve successful nodes and their evidence. Never claim a fix, merge, test,
   deployment, or retry succeeded before a later operation proves it.
 - When Git is available, FIX may use the supplied recovery branch name. Do not
@@ -33,7 +35,7 @@ CONTRACT
   the task or redesign unrelated work.
 
 VALID SHAPE
-{"action":"FIX","operation":null,"subtasks":["Diagnose the failure","Apply the smallest correction","Validate the correction"],"reason":"The evidence shows a correctable failure"}
+{"action":"FIX","operation":null,"subtasks":["Diagnose the failure","Apply the smallest correction","Validate the correction"],"reason":"The evidence shows a correctable failure","user_input_required":false}
 
 ALLOWED ACTIONS
 OPERATION, SUBTASKS, FIX, RETRY_NODE, RESTART_TASK, BLOCK, COMPLETE.

@@ -39,7 +39,7 @@ function render(data) {
   const displayTokens = data.analytics?.display_tokens || data.analytics?.estimated_tokens || {};
   const tokenLabel = displayTokens.source === "ollama" ? "TOKENS REALES" : displayTokens.source === "ollama_partial" ? "TOKENS REALES*" : "TOKENS EST.";
   $("#stats").innerHTML = [["ACTIVAS", active.length], ["COMPLETADAS", tasks.filter((task) => task.status === "SUCCEEDED").length], ["INCIDENTES", failed.length], [tokenLabel, displayTokens.total ? formatNumber(displayTokens.total) : 0]].map(([label, value]) => `<div class="stat"><small>${label}</small><strong>${value}</strong></div>`).join("");
-  renderMetrics(metrics); renderChart(data.status_counts || {}); renderAnalytics(data.analytics || {}); renderTasks(tasks); renderEvents(data.events || []); renderResources(data); renderChat(tasks); fillProjects(data.projects || []); renderIdle(runtime.idle || {});
+  renderMetrics(metrics); renderOperationalHealth(health, runtime); renderChart(data.status_counts || {}); renderAnalytics(data.analytics || {}); renderTasks(tasks); renderEvents(data.events || []); renderResources(data); renderChat(tasks); fillProjects(data.projects || []); renderIdle(runtime.idle || {});
   if (state.selectedTask) { renderInspector(state.selectedTask); renderTrace(state.selectedTask); }
 }
 function renderMetrics(metrics) {
@@ -48,6 +48,17 @@ function renderMetrics(metrics) {
   $("#runtime-passes").textContent = formatNumber(metrics.passes);
   $("#runtime-dispatches").textContent = formatNumber(metrics.tasks_dispatched);
   $("#runtime-errors").textContent = formatNumber(metrics.task_errors + metrics.runtime_errors);
+}
+function renderOperationalHealth(health, runtime) {
+  const database = health.database || {};
+  const idle = runtime.idle || {};
+  const rows = [
+    ["API / worker", health.status || "UNKNOWN"],
+    ["SQLite", database.status === "ok" ? `${database.journal_mode || "connected"} · ${database.integrity || "unknown"}` : "DEGRADED"],
+    ["Mantenimiento", idle.last_maintenance_at ? date(idle.last_maintenance_at) : "pendiente"],
+    ["Errores mantenimiento", idle.maintenance_errors || 0],
+  ];
+  $("#operational-health").innerHTML = rows.map(([label, value]) => `<span><small>${esc(label)}</small><b>${esc(value)}</b></span>`).join("");
 }
 function renderChart(counts) {
   const total = Math.max(1, Object.values(counts).reduce((sum, value) => sum + value, 0));
@@ -143,6 +154,12 @@ function taskActivity(taskId) {
     FINAL_RESPONSE_FALLBACK: `Informe alternativo: ${event.payload?.reason || "sin motivo"}`,
     TASK_COMPLETED: "Tarea completada",
     TASK_FAILED: "Tarea fallida",
+    REPLAN_FAILED: "Falló la replanificación",
+    REPLAN_REQUESTED: "Replanteando la estrategia",
+    RECOVERY_ANALYZED: "Estrategia de recuperación analizada",
+    USER_INPUT_REQUIRED: "Se necesita información del usuario",
+    WAITING_FOR_USER: "Esperando al usuario",
+    BUDGET_EXHAUSTED: "Presupuesto agotado",
   };
   return { label: labels[event.event_type] || event.event_type, detail: date(event.created_at) };
 }
@@ -166,6 +183,10 @@ function renderInspector(taskId) {
   const task = state.data?.tasks.find((item) => item.id === taskId); if (!task) return;
   const nodes = state.data.task_nodes[taskId] || [], edges = state.data.task_edges[taskId] || [], events = taskEvents(taskId), usage = (state.data.analytics?.task_usage || []).find((item) => item.id === taskId), finalResponse = task.final_response || task.metadata?.final_response || (task.result_summary ? { response_type: "execution_summary", title: "Resumen de ejecución", summary: task.result_summary, evidence: [], limitations: ["Esta tarea no conserva un informe LLM final."] } : null);
   const activity = taskActivity(taskId);
+  const clarification = task.metadata?.clarification || {};
+  const recovery = ["WAITING", "BLOCKED", "FAILED"].includes(task.status)
+    ? `<section class="recovery-card"><p class="kicker">${task.status === "WAITING" ? "SIGUIENTE PASO" : "RECUPERACIÓN"}</p><strong>${esc(clarification.prompt || task.failure_reason || "La tarea necesita intervención para continuar.")}</strong><small>${task.status === "WAITING" ? "Aporta la información solicitada y el worker reanudará el nodo." : "Puedes pedir otra estrategia o aportar una solución concreta."}</small></section>`
+    : "";
   const tokenValue = usage?.actual_tokens_available ? formatNumber(usage.actual_tokens) : `~${formatNumber(usage?.estimated_tokens || 0)}`;
   const tokenLabel = usage?.actual_tokens_available ? "TOKENS" : "TOKENS EST.";
   const graphRows = nodes.map((node, index) => {
@@ -175,11 +196,11 @@ function renderInspector(taskId) {
   const eventRows = events.slice(-12).reverse().map((event) => `<div class="inspector-event"><span>${date(event.created_at)}</span><strong>${esc(event.event_type)}</strong><small>${event.node_id ? `nodo ${shortId(event.node_id)}` : "tarea"}</small></div>`).join("");
   $("#task-inspector").className = "panel inspector";
   const report = finalResponse ? `<section class="final-report"><div class="final-report-head"><p class="kicker">RESPUESTA FINAL</p><span class="badge status-${esc(task.status)}">${esc(finalResponse.response_type || "report")}</span></div><h4>${esc(finalResponse.title || "Resultado de la tarea")}</h4><p>${esc(finalResponse.summary || "")}</p>${Object.entries(finalResponse.sections || {}).map(([title, items]) => `<div class="final-report-section"><strong>${esc(title)}</strong><ul>${(items || []).map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>`).join("")} ${(finalResponse.evidence || []).length ? `<div class="final-report-section"><strong>Evidencia</strong><ul>${finalResponse.evidence.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}${(finalResponse.limitations || []).length ? `<div class="final-report-section report-limitations"><strong>Limitaciones</strong><ul>${finalResponse.limitations.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</section>` : "";
-  $("#task-inspector").innerHTML = `<div class="inspector-head"><div><p class="kicker">TASK INSPECTOR</p><h3>${esc(task.goal)}</h3><small>${shortId(task.id)} · ${esc(task.status)}</small></div><span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div><div class="inspector-activity"><span class="activity-pulse"></span><div><strong>${esc(activity.label)}</strong><small>${esc(activity.detail)}</small></div></div>${report}<div class="inspector-actions">${["WAITING", "BLOCKED"].includes(task.status) ? `<button class="button primary" data-action="input">Resolver</button>` : ""}${task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : ""}${!["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? `<button class="button ghost" data-action="cancel">Cancelar</button>` : ""}<button class="button ghost" data-action="trace">Ver traza</button></div><div class="usage-strip"><span>LLM <b>${usage?.llm_calls || 0}</b></span><span>TOOLS <b>${usage?.tool_calls || 0}</b></span><span>NODOS <b>${nodes.length}</b></span><span>${tokenLabel} <b>${tokenValue}</b></span></div><p class="kicker">RECORRIDO DEL GRAFO · ${edges.length} DEPENDENCIAS</p><div class="node-list">${graphRows || "<div class=empty>Sin nodos planificados.</div>"}</div><p class="kicker inspector-events-title">TRANSICIONES RECIENTES</p><div class="inspector-events">${eventRows || "<div class=empty>Sin eventos.</div>"}</div>`;
+  $("#task-inspector").innerHTML = `<div class="inspector-head"><div><p class="kicker">TASK INSPECTOR</p><h3>${esc(task.goal)}</h3><small>${shortId(task.id)} · ${esc(task.status)}</small></div><span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div><div class="inspector-activity"><span class="activity-pulse"></span><div><strong>${esc(activity.label)}</strong><small>${esc(activity.detail)}</small></div></div>${recovery}${report}<div class="inspector-actions">${["WAITING", "BLOCKED"].includes(task.status) ? `<button class="button primary" data-action="input">Resolver</button>` : ""}${["BLOCKED", "FAILED"].includes(task.status) ? `<button class="button" data-action="replan">Replanificar</button>` : ""}${task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : ""}${!["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? `<button class="button ghost" data-action="cancel">Cancelar</button>` : ""}<button class="button ghost" data-action="trace">Ver traza</button></div><div class="usage-strip"><span>LLM <b>${usage?.llm_calls || 0}</b></span><span>TOOLS <b>${usage?.tool_calls || 0}</b></span><span>NODOS <b>${nodes.length}</b></span><span>${tokenLabel} <b>${tokenValue}</b></span></div><p class="kicker">RECORRIDO DEL GRAFO · ${edges.length} DEPENDENCIAS</p><div class="node-list">${graphRows || "<div class=empty>Sin nodos planificados.</div>"}</div><p class="kicker inspector-events-title">TRANSICIONES RECIENTES</p><div class="inspector-events">${eventRows || "<div class=empty>Sin eventos.</div>"}</div>`;
   $("#task-inspector").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => taskAction(button.dataset.action, task)));
 }
 function selectTask(taskId) { state.selectedTask = taskId; renderTasks(state.data.tasks); renderInspector(taskId); renderTrace(taskId); }
-async function taskAction(action, task) { try { if (action === "cancel") await api(`/tasks/${task.id}/cancel`, { method: "POST" }); if (action === "resume") await api(`/tasks/${task.id}/resume`, { method: "POST" }); if (action === "trace") { setView("trace"); return; } if (action === "input") { const value = window.prompt("Input JSON para la tarea", "{}"); if (value === null) return; await api(`/tasks/${task.id}/input`, { method: "POST", body: JSON.stringify({ input: JSON.parse(value) }) }); } toast("Orden actualizada"); await load(); } catch (error) { toast(`No se pudo actualizar: ${error.message}`, true); } }
+async function taskAction(action, task) { try { if (action === "cancel") await api(`/tasks/${task.id}/cancel`, { method: "POST" }); if (action === "resume") await api(`/tasks/${task.id}/resume`, { method: "POST" }); if (action === "replan") await api(`/tasks/${task.id}/replan`, { method: "POST" }); if (action === "trace") { setView("trace"); return; } if (action === "input") { const prompt = task.metadata?.clarification?.prompt || "Input JSON para la tarea"; const value = window.prompt(`${prompt}\n\nFormato JSON`, "{}"); if (value === null) return; await api(`/tasks/${task.id}/input`, { method: "POST", body: JSON.stringify({ input: JSON.parse(value) }) }); } toast(action === "replan" ? "Nueva estrategia solicitada" : "Orden actualizada"); await load(); } catch (error) { toast(`No se pudo actualizar: ${error.message}`, true); } }
 function formatNumber(value) { return new Intl.NumberFormat("es-ES").format(value || 0); }
 function formatSeconds(value) { const seconds = Number(value || 0); return seconds < 60 ? `${seconds.toFixed(1)}s` : `${(seconds / 60).toFixed(1)}m`; }
 function timingRatio(value, total) { return total ? Math.max(4, Number(value || 0) / total * 100) : 4; }

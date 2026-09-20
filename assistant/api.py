@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -77,6 +78,8 @@ async def lifespan(app: FastAPI):
         idle_cycle=IdleCycle(
             on_idle=context.service.reconcile_idle,
             supervise=lambda has_work: context.service.reconcile_idle(),
+            interval=context.settings.maintenance_interval,
+            supervision_interval=context.settings.maintenance_interval,
             enabled=context.settings.idle_enabled,
         ),
         is_ready=check_llm_ready,
@@ -96,7 +99,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.1.16", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.2.0", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
 
 
@@ -331,10 +334,21 @@ def _dashboard_devices(context) -> list[dict[str, object]]:
 
 @app.get("/health")
 async def health(request: Request):
-    startup = service(request).startup
+    context = service(request)
+    startup = context.startup
     runtime = request.app.state.runtime
+    database_health = await service(request).database.health_check()
+    status = startup.status
+    if database_health.get("status") != "ok" or runtime.last_error:
+        status = "degraded"
+    if (
+        runtime.last_completed_at is not None
+        and (datetime.now(UTC) - runtime.last_completed_at).total_seconds()
+        > max(60.0, context.settings.maintenance_interval * 3)
+    ):
+        status = "degraded"
     return {
-        "status": startup.status,
+        "status": status,
         "llm_ready": startup.llm_ready,
         "first_initialization": startup.first_initialization,
         "loaded_memories": len(startup.loaded_memories),
@@ -347,6 +361,7 @@ async def health(request: Request):
             "metrics": runtime.metrics_snapshot(),
             "idle": runtime.idle_snapshot(),
         },
+        "database": database_health,
     }
 
 
@@ -377,6 +392,7 @@ async def dashboard_data(request: Request):
     analytics = _dashboard_analytics(context, tasks, task_nodes, events)
     startup = context.startup
     runtime = request.app.state.runtime
+    database_health = await context.database.health_check()
     system_result = await context.service.tools.execute(Operation(tool="system", method="info"))
     return {
         "health": {
@@ -385,6 +401,7 @@ async def dashboard_data(request: Request):
             if runtime.readiness_snapshot() is not None
             else startup.llm_ready,
             "database_ready": startup.database_ready,
+            "database": database_health,
             "unfinished_tasks": startup.unfinished_tasks,
             "recovered_nodes": startup.recovered_nodes,
             "loaded_memories": len(startup.loaded_memories),
@@ -629,6 +646,17 @@ async def redefine_task(
             task_request.description,
             task_request.metadata,
         )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if not task:
+        raise HTTPException(404, "Task not found")
+    return task.model_dump(mode="json")
+
+
+@app.post("/tasks/{task_id}/replan")
+async def replan_task(request: Request, task_id: str):
+    try:
+        task = await service(request).service.replan_task(task_id)
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
     if not task:

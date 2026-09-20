@@ -2605,6 +2605,64 @@ async def test_project_operations_persist_graph_and_audit_metadata(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_project_scaffold_registers_created_project(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-scaffold.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            build_tool_registry(),
+            projects_root=str(tmp_path),
+        )
+        task = await service.create_task(TaskRequest(goal="create test_zone"))
+        project_path = tmp_path / "test_zone"
+        project_path.mkdir()
+
+        await service._persist_project_operation_result(
+            task,
+            Operation(tool="project", method="scaffold"),
+            {
+                "success": True,
+                "output": {"path": str(project_path), "name": "test_zone"},
+            },
+        )
+
+        projects = await service.list_projects()
+        assert len(projects) == 1
+        assert projects[0].name == "test_zone"
+        assert Path(projects[0].path) == project_path.resolve()
+        assert (await service.get_task(task.id)).project_id == projects[0].id
+        assert any(
+            event.event_type == "PROJECT_REGISTERED"
+            for event in await service.repository.list_events(task.id)
+        )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_list_projects_recovers_previous_scaffold(tmp_path):
+    project_path = tmp_path / "legacy_zone"
+    (project_path / "frontend").mkdir(parents=True)
+    (project_path / "backend").mkdir()
+    for marker in ("docker-compose.yml", "frontend/package.json", "backend/pom.xml"):
+        (project_path / marker).write_text("{}", encoding="utf-8")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-recovery.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            build_tool_registry(),
+            projects_root=str(tmp_path),
+        )
+        projects = await service.list_projects()
+        assert [project.name for project in projects] == ["legacy_zone"]
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_structural_wait_node_completes_after_input(tmp_path):
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'structural-wait.db'}")
     await database.create_all()

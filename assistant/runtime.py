@@ -38,6 +38,9 @@ class TaskRuntime:
         self.last_error: str | None = None
         self.last_ready: bool | None = None
         self.last_active_count = 0
+        self.last_maintenance_at: datetime | None = None
+        self.maintenance_runs = 0
+        self.maintenance_errors = 0
         self.metrics = {
             "passes": 0,
             "tasks_dispatched": 0,
@@ -63,6 +66,9 @@ class TaskRuntime:
             "supervision_interval_seconds": self.idle_cycle.supervision_interval,
             "last_supervision_result": self.idle_cycle.last_supervision_result,
             "reentrant_skips": self.idle_cycle.reentrant_skips,
+            "last_maintenance_at": self.last_maintenance_at,
+            "maintenance_runs": self.maintenance_runs,
+            "maintenance_errors": self.maintenance_errors,
         }
 
     def set_idle_enabled(self, enabled: bool) -> None:
@@ -72,7 +78,13 @@ class TaskRuntime:
         if not self.idle_cycle.enabled:
             self.metrics["idle_skipped"] += 1
             return
-        await self.idle_cycle.run_once(has_work=has_work)
+        try:
+            await self.idle_cycle.run_once(has_work=has_work)
+            self.maintenance_runs += 1
+            self.last_maintenance_at = datetime.now(UTC)
+        except Exception:
+            self.maintenance_errors += 1
+            raise
         self.metrics["idle_passes"] += 1
 
     async def _persist_heartbeat(self) -> None:

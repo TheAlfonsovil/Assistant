@@ -104,6 +104,24 @@ Estas medidas no convierten la API en un servicio seguro ni sustituyen un superv
 
 ## Mejoras funcionales aplicadas
 
+### Refuerzos de persistencia y operación 24/7
+
+- SQLite activa `WAL`, `foreign_keys`, `synchronous=NORMAL` y `busy_timeout` para
+  tolerar mejor lecturas concurrentes y bloqueos breves.
+- El esquema conserva una tabla `schema_version` para registrar la versión aplicada
+  y preparar migraciones futuras sin depender únicamente de `create_all`.
+- El contexto API/runtime utiliza sesiones SQLAlchemy aisladas por tarea asíncrona;
+  ya no comparte una única `AsyncSession` entre peticiones HTTP y el worker.
+- `/health` comprueba la conexión, el modo de journaling, integridad rápida y errores
+  del runtime, devolviendo estado degradado cuando corresponde.
+- El mantenimiento periódico elimina memoria expirada y eventos antiguos según
+  `ASSISTANT_EVENT_RETENTION_DAYS`, `ASSISTANT_EVENT_RETENTION_KEEP_RECENT` y
+  `ASSISTANT_MAINTENANCE_INTERVAL`.
+- La escritura de resultados de idempotencia maneja carreras de inserción y reutiliza
+  el resultado ya persistido cuando otra ejecución ganó la carrera.
+- El dashboard expone la salud de la base de datos y el runtime expone la última
+  ejecución y los errores del mantenimiento.
+
 - El ciclo `idle` aplica cooldown y evita reentradas, para no crear mantenimientos duplicados en pasadas consecutivas sin trabajo.
 - `resume` solo reactiva un nodo `WAITING` cuando existe exactamente uno; la entrada dirigida continúa usando `submit_task_input`.
 - Los argumentos se validan contra el esquema declarado por cada herramienta antes de ejecutarla.

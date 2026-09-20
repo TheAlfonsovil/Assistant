@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
+
+from sqlalchemy.ext.asyncio import async_scoped_session
 
 from assistant.application import TaskService
 from assistant.config import Settings, get_settings
@@ -25,7 +28,7 @@ class AssistantContext:
     settings: Settings
 
     async def close(self) -> None:
-        await self.session.close()
+        await self.session.remove()
         if hasattr(self.service.llm, "close"):
             await self.service.llm.close()
         await self.database.close()
@@ -58,7 +61,7 @@ async def create_context(
         )
     )
     startup = await StartupManager(database, resolved_settings, provider).initialize()
-    session = database.sessions()
+    session = async_scoped_session(database.sessions, scopefunc=asyncio.current_task)
     service = TaskService(
         session,
         provider,
@@ -69,5 +72,7 @@ async def create_context(
         default_execution_time=resolved_settings.task_max_execution_time,
         final_response_timeout=resolved_settings.final_response_timeout,
         max_steps=resolved_settings.task_max_steps,
+        event_retention_days=resolved_settings.event_retention_days,
+        event_retention_keep_recent=resolved_settings.event_retention_keep_recent,
     )
     return AssistantContext(database, session, service, startup, resolved_settings)

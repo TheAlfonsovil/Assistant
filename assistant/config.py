@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     final_response_timeout: float = 36000.0
     task_max_steps: int = 1000
     idle_enabled: bool = True
+    event_retention_days: int = 30
+    event_retention_keep_recent: int = 1000
+    maintenance_interval: float = 300.0
     collect_system_facts: bool = True
     persist_system_facts: bool = True
     persist_user_profile: bool = True

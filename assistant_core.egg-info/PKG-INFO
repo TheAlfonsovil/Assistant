@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: assistant-core
-Version: 0.1.16
+Version: 0.2.0
 Summary: Persistent local task engine for Assistant
 Requires-Python: >=3.12
 License-File: LICENSE

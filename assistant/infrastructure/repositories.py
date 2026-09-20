@@ -1,8 +1,9 @@
 import json
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from assistant.domain.models import (
@@ -314,6 +315,37 @@ class TaskRepository:
         result = await self.session.execute(delete(MemoryRow).where(MemoryRow.id == memory_id))
         await self.session.commit()
         return bool(result.rowcount)
+
+    async def purge_old_events(self, retention_days: int = 30, keep_recent: int = 1000) -> int:
+        cutoff = datetime.now(UTC) - timedelta(days=max(1, retention_days))
+        recent_ids = select(EventRow.id).order_by(EventRow.created_at.desc()).limit(max(0, keep_recent))
+        result = await self.session.execute(
+            delete(EventRow).where(
+                EventRow.created_at < cutoff,
+                EventRow.id.not_in(recent_ids),
+            )
+        )
+        await self.session.commit()
+        return int(result.rowcount or 0)
+
+    async def save_idempotency_result(
+        self, idempotency_key: str, result_json: dict
+    ) -> dict:
+        existing = await self.session.get(IdempotencyRow, idempotency_key)
+        if existing is not None:
+            return existing.result_json
+        self.session.add(
+            IdempotencyRow(idempotency_key=idempotency_key, result_json=result_json)
+        )
+        try:
+            await self.session.commit()
+        except IntegrityError:
+            await self.session.rollback()
+            existing = await self.session.get(IdempotencyRow, idempotency_key)
+            if existing is None:
+                raise
+            return existing.result_json
+        return result_json
 
     async def reset_state(self) -> dict[str, int]:
         tables = (

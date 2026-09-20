@@ -32,7 +32,6 @@ _COVERAGE_STOPWORDS = {
 def plan_coverage_warnings(proposal: PlanProposal, goal: str) -> list[str]:
     if proposal.answer is not None or not proposal.nodes:
         return []
-    declared = {item.strip().lower() for item in proposal.coverage if item.strip()}
     descriptions = " ".join(item.description.lower() for item in proposal.nodes)
     terms = {
         term for term in re.findall(r"[a-zA-Z0-9_]{4,}", goal.lower())
