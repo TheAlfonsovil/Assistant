@@ -99,8 +99,18 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.2.1", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
+
+
+@app.middleware("http")
+async def release_request_session(request: Request, call_next):
+    try:
+        return await call_next(request)
+    finally:
+        context = getattr(request.app.state, "context", None)
+        if context is not None:
+            await context.session.remove()
 
 
 def service(request: Request) -> AssistantContext:
