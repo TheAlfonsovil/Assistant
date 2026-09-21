@@ -73,7 +73,7 @@ function renderAnalytics(analytics) {
   $("#analytics-kpis").innerHTML = [[tokenLabel, formatNumber(tokens.total)], ["ÉXITO", `${throughput.success_rate ?? 0}%`], ["PREFILL MEDIO", formatSeconds(latency.prefill_seconds)], ["GENERACIÓN MEDIA", formatSeconds(latency.generation_seconds)], ["TOKENS/S", formatNumber(latency.generation_tokens_per_second)], ["REINTENTOS", throughput.retries ?? 0]].map(([label, value]) => `<div><small>${label}</small><b>${value}</b></div>`).join("");
   const phases = analytics.phase_counts || {};
   const phaseRows = Object.entries(phases).map(([phase, count]) => `<div class="analysis-row"><span>${esc(phase)}</span><b>${count} intercambios</b></div>`).join("");
-  const taskRows = taskUsage.map((item) => `<div class="analysis-row"><span>${esc(item.goal || shortId(item.id))}</span><b>${formatNumber(item.actual_tokens_available ? item.actual_tokens : item.estimated_tokens)} tokens · prefill ${formatSeconds(item.prefill_seconds)} · gen ${formatSeconds(item.generation_seconds)} · reintentos ${item.retry_rate ?? 0}% (${item.retries || 0})</b></div>`).join("");
+  const taskRows = taskUsage.map((item) => `<div class="analysis-row"><span>${esc(item.goal || shortId(item.id))}</span><b>${formatNumber(item.actual_tokens_available ? item.actual_tokens : item.estimated_tokens)} tokens · prefill ${formatSeconds(item.prefill_seconds)} · gen ${formatSeconds(item.generation_seconds)} · reintentos ${item.retry_rate ?? 0}% (${item.retries || 0})</b>${Object.entries(item.phase_usage || {}).map(([role, phase]) => `<small>${esc(role)}: ${formatNumber((phase.prompt_tokens || 0) + (phase.response_tokens || phase.estimated_tokens || 0))} tokens · ${formatSeconds((phase.prefill_seconds || 0) + (phase.generation_seconds || 0))}</small>`).join("")}</div>`).join("");
   $("#llm-analysis").innerHTML = `<div class="timing-split"><div><small>PREFILL / entrada</small><i><b style="width:${timingRatio(latency.prefill_seconds, latency.prefill_seconds + latency.generation_seconds)}%"></b></i></div><div><small>GENERACIÓN / salida</small><i><b class="generation-bar" style="width:${timingRatio(latency.generation_seconds, latency.prefill_seconds + latency.generation_seconds)}%"></b></i></div></div>${taskRows || phaseRows || `<div class="empty">Aún no hay actividad LLM.</div>`}`;
 }
 function renderPerformanceMetrics(data) {
@@ -110,19 +110,21 @@ function renderResources(data) {
   $("#resource-summary").querySelectorAll("[data-resource]").forEach((item) => item.addEventListener("click", () => renderResourceDetail(item.dataset.resource, data)));
 }
 function renderCollections(data) {
-  const card = (item, kind) => `<button class="collection-card" data-resource="${kind}:${esc(item.name || item.id || item.key)}"><div class="collection-card-head"><span class="status-mark status-${esc(item.status || (item.enabled === false ? "PAUSED" : "READY"))}"></span><div><strong>${esc(item.name || item.key || item.id)}</strong><small>${esc(item.platform || item.project_type || item.kind || item.status || "ready")}</small></div></div><p>${esc(item.description || item.path || memoryPreview(item.value) || "Sin descripción")}</p><div class="collection-meta">${kind === "device" ? esc((item.capabilities || []).join(" · ")) : kind === "project" ? `${item.enabled === false ? "Pausado" : "Activo"} · ${esc(item.id)}` : `${esc(item.source || "USER")} · ${date(item.updated_at)}`}</div></button>`;
+  const card = (item, kind) => `<button type="button" class="collection-card" data-resource-kind="${kind}" data-resource-id="${esc(item.name || item.id || item.key)}"><div class="collection-card-head"><span class="status-mark status-${esc(item.status || (item.enabled === false ? "PAUSED" : "READY"))}"></span><div><strong>${esc(item.name || item.key || item.id)}</strong><small>${esc(item.platform || item.project_type || item.kind || item.status || "ready")}</small></div></div><p>${esc(item.description || item.path || memoryPreview(item.value) || "Sin descripción")}</p><div class="collection-meta">${kind === "device" ? esc((item.capabilities || []).join(" · ")) : kind === "project" ? `${item.enabled === false ? "Pausado" : "Activo"} · ${esc(item.id)}` : `${esc(item.source || "USER")} · ${date(item.updated_at)}`}</div></button>`;
   $("#devices-list").innerHTML = (data.devices || []).map((item) => card(item, "device")).join("") || '<div class="empty">Sin dispositivos conectados.</div>';
   $("#projects-list").innerHTML = (data.projects || []).map((item) => card(item, "project")).join("") || '<div class="empty">Sin proyectos registrados.</div>';
   $("#memory-list").innerHTML = (data.memories || []).map((item) => card(item, "memory")).join("") || '<div class="empty">Sin memoria persistida.</div>';
   $("#memory-summary").innerHTML = `<div class="stat"><small>LARGO PLAZO</small><strong>${(data.memories || []).filter((item) => ["LONG_TERM", "FACT", "PREFERENCE"].includes(item.kind)).length}</strong></div><div class="stat"><small>OPERATIVA</small><strong>${(data.memories || []).filter((item) => !["LONG_TERM", "FACT", "PREFERENCE"].includes(item.kind)).length}</strong></div><div class="stat"><small>REGISTROS SQLITE</small><strong>${(data.memories || []).length}</strong></div>`;
-  $("#devices-list").querySelectorAll("[data-resource]").forEach((item) => item.addEventListener("click", () => renderResourceDetail(item.dataset.resource, data, "#devices-detail")));
-  $("#projects-list").querySelectorAll("[data-resource]").forEach((item) => item.addEventListener("click", () => renderResourceDetail(item.dataset.resource, data, "#projects-detail")));
-  $("#memory-list").querySelectorAll("[data-resource]").forEach((item) => item.addEventListener("click", () => renderResourceDetail(item.dataset.resource, data, "#memory-detail")));
+  const bindCollection = (selector, target) => $(selector).querySelectorAll("[data-resource-kind]").forEach((item) => item.addEventListener("click", () => renderResourceDetail({ kind: item.dataset.resourceKind, id: item.dataset.resourceId }, data, target)));
+  bindCollection("#devices-list", "#devices-detail");
+  bindCollection("#projects-list", "#projects-detail");
+  bindCollection("#memory-list", "#memory-detail");
 }
 function memoryPreview(value) { const text = typeof value === "string" ? value : JSON.stringify(value); return text.length > 160 ? `${text.slice(0, 157)}...` : text; }
 function renderResourceDetail(resourceId, data, target = "#resource-detail") {
-  const [kind, id] = resourceId.split(":");
-  const resource = kind === "device" ? (data.devices || []).find((item) => item.name === id) : kind === "project" ? (data.projects || []).find((item) => item.id === id) : (data.memories || []).find((item) => item.id === id);
+  const parsed = typeof resourceId === "string" ? resourceId.match(/^([^:]+):(.*)$/) : null;
+  const { kind, id } = parsed ? { kind: parsed[1], id: parsed[2] } : resourceId;
+  const resource = kind === "device" ? (data.devices || []).find((item) => item.name === id) : kind === "project" ? (data.projects || []).find((item) => item.id === id || item.name === id) : (data.memories || []).find((item) => item.id === id || item.key === id);
   if (!resource) return;
   if (kind === "memory") {
     $(target).className = "resource-detail";
@@ -279,6 +281,34 @@ async function streamChat(body) {
   return text;
 }
 $("#chat-mode").addEventListener("change", (event) => { $("#chat-mode-help").textContent = event.target.value === "agent" ? "Puede operar tareas y la cola" : "Consulta y crea trabajo"; });
-$("#chat-form").addEventListener("submit", async (event) => { event.preventDefault(); const message = $("#chat-message").value.trim(); if (!message) return; try { const [target_type, target_id] = $("#chat-target").value.split(":"); const body = { message, target_type, target_id }; $("#chat-live").textContent = "Enviando…"; if ($("#chat-mode").value === "agent") { const result = await api("/chat/agent", { method: "POST", body: JSON.stringify(body) }); $("#chat-live").textContent = result.message || "Operación completada"; toast(result.message || "Operación completada"); } else { try { await streamChat(body); } catch (_) { await api("/chat", { method: "POST", body: JSON.stringify(body) }); } $("#chat-live").textContent = "Consulta enviada a la cola"; toast("Consulta enviada"); } $("#chat-message").value = ""; await load(); } catch (error) { $("#chat-live").textContent = "No se pudo enviar"; toast(error.message, true); } });
+$("#chat-form").addEventListener("submit", async (event) => { event.preventDefault(); const message = $("#chat-message").value.trim(); if (!message) return; try { const [target_type, target_id] = $("#chat-target").value.split(":"); const body = { message, target_type, target_id }; $("#chat-live").textContent = "Enviando…"; if ($("#chat-mode").value === "agent") { const result = await sendAgentMessage(body); if (!result) return; $("#chat-live").textContent = result.message || "Operación completada"; toast(result.message || "Operación completada"); } else { try { await streamChat(body); } catch (_) { await api("/chat", { method: "POST", body: JSON.stringify(body) }); } $("#chat-live").textContent = "Consulta enviada a la cola"; toast("Consulta enviada"); } $("#chat-message").value = ""; await load(); } catch (error) { $("#chat-live").textContent = "No se pudo enviar"; toast(error.message, true); } });
+async function sendAgentMessage(body) {
+  let result = await api("/chat/agent", { method: "POST", body: JSON.stringify(body) });
+  if (result.action === "confirmation_required") {
+    if (!window.confirm(result.message)) return null;
+    result = await api("/chat/agent", { method: "POST", body: JSON.stringify({ ...body, confirm: true }) });
+  }
+  return result;
+}
+$("#chat-form").addEventListener("submit", async (event) => {
+  if ($("#chat-mode").value !== "agent") return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  const message = $("#chat-message").value.trim();
+  if (!message) return;
+  const [target_type, target_id] = $("#chat-target").value.split(":");
+  try {
+    const result = await sendAgentMessage({ message, target_type, target_id });
+    if (result) {
+      $("#chat-live").textContent = result.message || "Operación completada";
+      toast(result.message || "Operación completada");
+      $("#chat-message").value = "";
+      await load();
+    }
+  } catch (error) {
+    $("#chat-live").textContent = "No se pudo enviar";
+    toast(error.message, true);
+  }
+}, true);
 document.querySelectorAll("[data-reset-memory]").forEach((button) => button.addEventListener("click", () => $("#reset-memory").click()));
 setView("overview"); load(); window.setInterval(load, 60000);

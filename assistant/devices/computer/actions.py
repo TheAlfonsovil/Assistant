@@ -486,6 +486,7 @@ class ProjectTool(Tool):
                 "os": args.get("os", "windows-11"),
                 "files": sorted(files),
                 "containerized": bool(args.get("containerize", True)),
+                "scaffolded": True,
             },
             side_effects=["project.scaffolded"],
         )

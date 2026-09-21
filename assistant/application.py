@@ -2387,6 +2387,17 @@ class TaskService:
                     await self.repository.save_idempotency_result(operation_key, result)
             node.status = NodeStatus.VERIFYING
             task.status = TaskStatus.VERIFYING
+            if (
+                operation.tool == "project"
+                and operation.method == "scaffold"
+                and result.get("success")
+                and isinstance(result.get("output"), dict)
+                and result["output"].get("files")
+                and result["output"].get("path")
+            ):
+                # Older persisted scaffold results predate the explicit
+                # scaffolded marker but already contain durable evidence.
+                result["output"].setdefault("scaffolded", True)
             if not await self.renew_lease(node.id, lease_seconds):
                 await self._fail_node(task, node, "node lease expired before verification")
                 return True

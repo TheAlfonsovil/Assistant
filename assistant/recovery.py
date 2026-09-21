@@ -12,9 +12,9 @@ class RecoveryManager:
 
     async def recover(self) -> int:
         now = datetime.now(UTC)
-        expired_leases = await self.session.execute(
-            delete(LeaseRow).where(LeaseRow.expires_at <= now)
-        )
+        # Startup creates a new worker identity. Every lease from the previous
+        # process is therefore stale, even when its wall-clock expiry is later.
+        expired_leases = await self.session.execute(delete(LeaseRow))
         result = await self.session.execute(
             select(NodeRow).where(
                 NodeRow.status.in_([NodeStatus.RUNNING.value, NodeStatus.VERIFYING.value])
@@ -24,6 +24,11 @@ class RecoveryManager:
         recovered_task_ids = set()
         for row in result.scalars():
             previous_status = row.status
+            # A process restart invalidates ownership even when the old lease
+            # has not reached its wall-clock expiry yet.
+            await self.session.execute(
+                delete(LeaseRow).where(LeaseRow.node_id == row.id)
+            )
             row.status = NodeStatus.READY.value
             row.error = "recovered after process restart"
             row.finished_at = None

@@ -237,6 +237,7 @@ class ChatRequest(BaseModel):
     project_id: str | None = None
     target_type: str | None = None
     target_id: str | None = None
+    confirm: bool = False
 
 
 class ChatFastRequest(ChatRequest):

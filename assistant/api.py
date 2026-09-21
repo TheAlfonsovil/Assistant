@@ -217,6 +217,30 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         )
         task_actual_available = bool(task_actual_prompt or task_actual_response)
         task_measured_total = task_actual_prompt + task_actual_response
+        phase_usage = {}
+        for event in task_task_events:
+            if event.event_type != "LLM_RESPONSE":
+                continue
+            payload = event.payload or {}
+            role = str(payload.get("role") or "unknown")
+            usage = payload.get("usage") or {}
+            bucket = phase_usage.setdefault(
+                role,
+                {
+                    "prompt_tokens": 0,
+                    "response_tokens": 0,
+                    "estimated_tokens": 0,
+                    "prefill_seconds": 0.0,
+                    "generation_seconds": 0.0,
+                    "calls": 0,
+                },
+            )
+            bucket["prompt_tokens"] += int(usage.get("prompt_eval_count", 0) or 0)
+            bucket["response_tokens"] += int(usage.get("eval_count", 0) or 0)
+            bucket["estimated_tokens"] += int((payload.get("response_chars", 0) or 0) / 4)
+            bucket["prefill_seconds"] += float(usage.get("prompt_eval_duration", 0) or 0) / 1_000_000_000
+            bucket["generation_seconds"] += float(usage.get("eval_duration", 0) or 0) / 1_000_000_000
+            bucket["calls"] += 1
         task_prefill_seconds = sum(
             float(((event.payload or {}).get("usage") or {}).get("prompt_eval_duration", 0) or 0) / 1_000_000_000
             for event in task_task_events if event.event_type == "LLM_RESPONSE"
@@ -301,6 +325,7 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             ),
             "prefill_seconds": round(task_prefill_seconds, 2),
             "generation_seconds": round(task_generation_seconds, 2),
+            "phase_usage": phase_usage,
         })
         if task.started_at and task.finished_at:
             durations.append(max(0, (task.finished_at - task.started_at).total_seconds()))
@@ -691,9 +716,22 @@ async def chat_agent_command(request: Request, chat_request: ChatRequest):
     """Execute explicit queue operations from dashboard agent mode."""
     context = service(request)
     message = chat_request.message.strip()
-    command, _, argument = message.partition(" ")
-    command = command.casefold().lstrip("/")
+    normalized = message.casefold().lstrip("/")
+    command, _, argument = normalized.partition(" ")
     argument = argument.strip()
+    if command in {"quiero", "necesito", "puedes", "haz", "hazme"}:
+        for keyword in ("crear ", "crea ", "ejecuta ", "lanza "):
+            if normalized.startswith(keyword):
+                command, argument = "crear", message[len(keyword):].strip()
+                break
+    if command in {"cancela", "cancelar", "detén", "detener", "para"}:
+        command = "cancelar"
+    if command in {"elimina", "eliminar", "borra", "borrar"}:
+        command = "borrar"
+    if command in {"reanuda", "reanudar", "continua", "continuar"}:
+        command = "reanudar"
+    if command in {"replanifica", "replanificar", "reintenta"}:
+        command = "replanificar"
 
     if command in {"listar", "lista", "list"}:
         tasks = await context.service.repository.list_tasks()
@@ -733,6 +771,12 @@ async def chat_agent_command(request: Request, chat_request: ChatRequest):
         task = await context.service.get_task(argument)
         if task is None:
             raise HTTPException(404, "No se encontró esa tarea. Usa el id completo.")
+        if action in {"cancel", "delete"} and not chat_request.confirm:
+            return {
+                "action": "confirmation_required",
+                "message": f"Voy a {('cancelar' if action == 'cancel' else 'borrar')} la tarea {task.id[:8]} ({task.goal}). Confirma la operación.",
+                "task": _task_json(task),
+            }
         try:
             if action == "cancel":
                 task = await context.service.cancel_task(task.id)

@@ -215,6 +215,7 @@ async def test_project_scaffold_creates_vue_spring_boot_and_docker_files(tmp_pat
     assert (project / "run.ps1").is_file()
     assert result.output["device"] == "computer"
     assert result.output["os"] == "windows-11"
+    assert result.output["scaffolded"] is True
 
 
 @pytest.mark.asyncio
@@ -1931,6 +1932,8 @@ async def test_recovery_requeues_parent_task_and_running_node(tmp_path):
         )
         await repository.save_task(task)
         await repository.save_node(node)
+        session.add(LeaseRow(node_id=node.id, owner="dead-worker", expires_at=datetime.now(UTC) + timedelta(hours=1)))
+        await session.commit()
 
         recovered = await RecoveryManager(session).recover()
 
@@ -1938,6 +1941,7 @@ async def test_recovery_requeues_parent_task_and_running_node(tmp_path):
         assert (await repository.get_task(task.id)).status is TaskStatus.READY
         assert (await repository.get_node(node.id)).status is NodeStatus.READY
         assert (await repository.get_node(node.id)).error == "recovered after process restart"
+        assert await session.get(LeaseRow, node.id) is None
         assert any(
             event.event_type == "NODE_RECOVERED"
             for event in await repository.list_events(task.id)
