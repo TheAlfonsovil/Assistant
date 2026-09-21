@@ -114,7 +114,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.2.5", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.2.6", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
 
 
@@ -217,6 +217,14 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         )
         task_actual_available = bool(task_actual_prompt or task_actual_response)
         task_measured_total = task_actual_prompt + task_actual_response
+        task_prefill_seconds = sum(
+            float(((event.payload or {}).get("usage") or {}).get("prompt_eval_duration", 0) or 0) / 1_000_000_000
+            for event in task_task_events if event.event_type == "LLM_RESPONSE"
+        )
+        task_generation_seconds = sum(
+            float(((event.payload or {}).get("usage") or {}).get("eval_duration", 0) or 0) / 1_000_000_000
+            for event in task_task_events if event.event_type == "LLM_RESPONSE"
+        )
         for event in task_task_events:
             if not event.node_id:
                 continue
@@ -225,6 +233,7 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
                 {
                     "llm_calls": 0,
                     "tool_calls": 0,
+                    "retry_count": 0,
                     "estimated_tokens": 0,
                     "actual_tokens": 0,
                     "actual_tokens_available": False,
@@ -244,6 +253,34 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
                 usage["actual_tokens_available"] = bool(measured)
             elif event.event_type == "TOOL_CALLED":
                 usage["tool_calls"] += 1
+            elif event.event_type in {"RETRY_SCHEDULED", "NODE_RETRY"}:
+                usage["retry_count"] += 1
+        node_map = {node.id: node for node in task_nodes.get(task.id, [])}
+        task_retries = task.retry_count + sum(
+            node.retry_count for node in task_nodes.get(task.id, [])
+        )
+        task_duration = (
+            max(0, (task.finished_at - task.started_at).total_seconds())
+            if task.started_at and task.finished_at else 0
+        )
+        for node_id in node_map:
+            if node_id not in node_usage:
+                node_usage[node_id] = {
+                    "llm_calls": 0, "tool_calls": 0, "retry_count": 0,
+                    "estimated_tokens": 0, "actual_tokens": 0,
+                    "actual_tokens_available": False,
+                }
+            node_usage[node_id].update({
+                "task_id": task.id,
+                "label": node_map[node_id].description,
+                "type": node_map[node_id].type.value,
+                "status": node_map[node_id].status.value,
+                "duration_seconds": round(
+                    max(0, (node_map[node_id].finished_at - node_map[node_id].started_at).total_seconds())
+                    if node_map[node_id].started_at and node_map[node_id].finished_at else 0, 2
+                ),
+                "retry_count": max(node_usage[node_id]["retry_count"], node_map[node_id].retry_count),
+            })
         task_usage.append({
             "id": task.id,
             "goal": task.goal,
@@ -251,6 +288,8 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             "nodes": len(task_nodes.get(task.id, [])),
             "llm_calls": sum(1 for event in task_task_events if event.event_type == "LLM_REQUEST"),
             "tool_calls": sum(1 for event in task_task_events if event.event_type == "TOOL_CALLED"),
+            "retries": task_retries,
+            "retry_rate": round(task_retries / max(1, len(task_nodes.get(task.id, []))) * 100, 1),
             "estimated_tokens": task_prompt + task_response,
             "actual_tokens": task_measured_total,
             "actual_tokens_available": task_actual_available,
@@ -260,6 +299,8 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
                 if task.started_at and task.finished_at else 0,
                 2,
             ),
+            "prefill_seconds": round(task_prefill_seconds, 2),
+            "generation_seconds": round(task_generation_seconds, 2),
         })
         if task.started_at and task.finished_at:
             durations.append(max(0, (task.finished_at - task.started_at).total_seconds()))
@@ -328,6 +369,15 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         ][:20],
         "task_usage": task_usage[:50],
         "node_usage": node_usage,
+        "metrics_rows": [
+            {
+                **usage,
+                "task_goal": next(
+                    (task.goal for task in tasks if task.id == usage.get("task_id")), "Tarea"
+                ),
+            }
+            for usage in node_usage.values()
+        ],
     }
 
 
