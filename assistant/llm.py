@@ -209,6 +209,42 @@ class OllamaLLMProvider:
         effort = self.reasoning_policy.get(role, self.reasoning_effort)
         return False if effort == "off" else effort
 
+    def prepare_request(
+        self, role: str, context: dict[str, Any], schema: type[BaseModel]
+    ) -> dict[str, Any]:
+        """Build and retain the exact request before network I/O starts."""
+        prompt_path = Path(__file__).parent / "prompts" / "v1" / f"{role.lower()}.md"
+        instructions = prompt_path.read_text(encoding="utf-8")
+        rendered_instructions = render(instructions, context, schema.model_json_schema())
+        if len(rendered_instructions) > self.effective_prompt_chars:
+            raise ValueError(
+                f"LLM prompt exceeds effective context budget of {self.effective_prompt_chars} characters"
+            )
+        request = {
+            "role": role,
+            "prompt": {
+                "role": role,
+                "instructions": rendered_instructions,
+            },
+            "rendered_instructions": rendered_instructions,
+            "prompt_chars": len(rendered_instructions),
+        }
+        self.last_request = request
+        self._trace(
+            {
+                "phase": "LLM_REQUEST_BUILT",
+                "role": role,
+                "prompt_chars": len(rendered_instructions),
+                "context_chars": len(json.dumps(context, default=str)),
+                "thinking": self._thinking_for_role(role),
+                "sections": [
+                    line for line in rendered_instructions.splitlines() if line and line.isupper()
+                ],
+                "prompt_preview": rendered_instructions[:4000],
+            }
+        )
+        return request
+
     def _record_success(self) -> None:
         self._consecutive_failures = 0
         self._circuit_opened_at = None
@@ -229,36 +265,10 @@ class OllamaLLMProvider:
 
     async def _ask(self, role: str, context: dict[str, Any], schema: type[BaseModel]) -> BaseModel:
         self._ensure_circuit_available()
-        prompt_path = Path(__file__).parent / "prompts" / "v1" / f"{role.lower()}.md"
-        instructions = prompt_path.read_text(encoding="utf-8")
-        rendered_instructions = render(instructions, context, schema.model_json_schema())
-        if len(rendered_instructions) > self.effective_prompt_chars:
-            raise ValueError(
-                f"LLM prompt exceeds effective context budget of {self.effective_prompt_chars} characters"
-            )
-        prompt = {
-            "role": role,
-            "instructions": rendered_instructions,
-        }
+        request = self.prepare_request(role, context, schema)
+        prompt = request["prompt"]
         request_schema = self._request_schema(role, schema)
-        self.last_request = {
-            "role": role,
-            "prompt": prompt,
-            "rendered_instructions": rendered_instructions,
-            "prompt_chars": len(rendered_instructions),
-        }
         started = time.perf_counter()
-        self._trace(
-            {
-                "phase": "LLM_REQUEST_BUILT",
-                "role": role,
-                "prompt_chars": len(rendered_instructions),
-                "context_chars": len(json.dumps(context, default=str)),
-                "thinking": self._thinking_for_role(role),
-                "sections": [line for line in rendered_instructions.splitlines() if line and line.isupper()],
-                "prompt_preview": rendered_instructions[:4000],
-            }
-        )
         try:
             response = await asyncio.wait_for(
                 self.client.post(

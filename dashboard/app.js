@@ -18,9 +18,10 @@ function setView(view) {
   state.view = view;
   document.querySelectorAll("[data-view-panel]").forEach((panel) => panel.classList.toggle("active", panel.dataset.viewPanel === view));
   document.querySelectorAll("[data-view]").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
-  const titles = { overview: "Resumen operativo", tasks: "Tareas persistentes", trace: "Observabilidad", activity: "Actividad reciente", resources: "Recursos conectados", chat: "Chat persistente" };
+  const titles = { overview: "Resumen operativo", tasks: "Tareas persistentes", trace: "Observabilidad", "task-detail": "Detalle de tarea", activity: "Actividad reciente", resources: "Recursos conectados", devices: "Dispositivos", projects: "Proyectos", memory: "Memoria", chat: "Chat rápido" };
   $("#view-title").textContent = titles[view] || "Operations";
   if (view === "trace" && state.selectedTask) renderTrace(state.selectedTask);
+  if (view === "task-detail" && state.selectedTask) renderTaskDetail(state.selectedTask);
 }
 function renderIdle(idle) {
   const enabled = Boolean(idle.enabled);
@@ -39,8 +40,8 @@ function render(data) {
   const displayTokens = data.analytics?.display_tokens || data.analytics?.estimated_tokens || {};
   const tokenLabel = displayTokens.source === "ollama" ? "TOKENS REALES" : displayTokens.source === "ollama_partial" ? "TOKENS REALES*" : "TOKENS EST.";
   $("#stats").innerHTML = [["ACTIVAS", active.length], ["COMPLETADAS", tasks.filter((task) => task.status === "SUCCEEDED").length], ["INCIDENTES", failed.length], [tokenLabel, displayTokens.total ? formatNumber(displayTokens.total) : 0]].map(([label, value]) => `<div class="stat"><small>${label}</small><strong>${value}</strong></div>`).join("");
-  renderMetrics(metrics); renderOperationalHealth(health, runtime); renderChart(data.status_counts || {}); renderAnalytics(data.analytics || {}); renderTasks(tasks); renderEvents(data.events || []); renderResources(data); renderChat(tasks); fillProjects(data.projects || []); renderIdle(runtime.idle || {});
-  if (state.selectedTask) { renderInspector(state.selectedTask); renderTrace(state.selectedTask); }
+  renderMetrics(metrics); renderOperationalHealth(health, runtime); renderChart(data.status_counts || {}); renderAnalytics(data.analytics || {}); renderTasks(tasks); renderEvents(data.events || []); renderResources(data); renderCollections(data); renderChat(tasks); fillProjects(data.projects || []); renderIdle(runtime.idle || {});
+  if (state.selectedTask) { renderInspector(state.selectedTask); renderTrace(state.selectedTask); renderTaskDetail(state.selectedTask); }
 }
 function renderMetrics(metrics) {
   const values = [["Pasadas", metrics.passes], ["Despachos", metrics.tasks_dispatched], ["Errores", metrics.task_errors], ["Pasadas idle", metrics.idle_passes], ["Sin LLM", metrics.not_ready_passes], ["Errores runtime", metrics.runtime_errors]];
@@ -76,12 +77,17 @@ function renderAnalytics(analytics) {
 }
 function renderTasks(tasks) {
   const filter = ($( "#task-filter")?.value || "").toLowerCase().trim();
-  const filtered = tasks.filter((task) => !filter || `${task.goal} ${task.status} ${task.id}`.toLowerCase().includes(filter));
+  const statusFilter = $("#task-status-filter")?.value || "";
+  const activeStatuses = ["QUEUED", "PLANNING", "READY", "RUNNING", "VERIFYING", "FINALIZING"];
+  const filtered = tasks.filter((task) => (!statusFilter || (statusFilter === "active" ? activeStatuses.includes(task.status) : task.status === statusFilter)) && (!filter || `${task.goal} ${task.status} ${task.id}`.toLowerCase().includes(filter)));
+  const active = tasks.filter((task) => activeStatuses.includes(task.status));
+  const next = tasks.filter((task) => ["QUEUED", "READY"].includes(task.status)).sort((a, b) => (b.priority || 0) - (a.priority || 0) || new Date(a.created_at) - new Date(b.created_at))[0];
+  $("#queue-summary").innerHTML = `<span><small>EN CURSO</small><b>${active.length}</b></span><span><small>SIGUIENTE</small><b>${next ? esc(next.goal) : "—"}</b></span><span><small>ACTUALIZACIÓN</small><b>En vivo</b></span>`;
   $("#task-list").innerHTML = filtered.map((task) => `<button class="task-card ${state.selectedTask === task.id ? "selected" : ""}" data-task="${esc(task.id)}"><i class="status-mark status-${esc(task.status)}"></i><span><strong>${esc(task.goal)}</strong><small>${shortId(task.id)} · ${date(task.created_at)}</small></span><em class="status-${esc(task.status)}">${esc(task.status)}</em></button>`).join("") || `<div class="empty">No hay tareas persistidas.</div>`;
   $("#task-list").querySelectorAll("[data-task]").forEach((button) => button.addEventListener("click", () => selectTask(button.dataset.task)));
 }
 function renderEvents(events) {
-  $("#event-stream").innerHTML = events.slice(0, 80).map((event) => `<div class="event"><i></i><div><strong>${esc(event.event_type)}</strong><small>${shortId(event.task_id)}${event.node_id ? ` · nodo ${shortId(event.node_id)}` : ""}</small></div><time>${date(event.created_at)}</time></div>`).join("") || `<div class="empty">Sin eventos.</div>`;
+  $("#event-stream").innerHTML = events.slice(0, 80).map((event) => `<div class="event"><i></i><div><strong>${esc(event.event_type)}</strong></div><div><small>${shortId(event.task_id)}${event.node_id ? ` · nodo ${shortId(event.node_id)}` : ""}</small></div><time>${date(event.created_at)}</time></div>`).join("") || `<div class="empty">Sin eventos.</div>`;
 }
 function renderResources(data) {
   const devices = (data.devices || []).map((device) => `<button class="resource resource-select" data-resource="device:${esc(device.name)}"><strong>${esc(device.name)} / ${esc(device.platform || "generic")}</strong><small>${esc(device.status)} · ${esc(device.transport || "local")}</small><p>${(device.capabilities || []).map(esc).join(" · ") || "Sin adaptador"}</p></button>`).join("");
@@ -89,6 +95,12 @@ function renderResources(data) {
   const memories = (data.memories || []).map((memory) => `<button class="resource resource-select" data-resource="memory:${esc(memory.id)}"><strong>${esc(memory.key)}</strong><small>${esc(memory.kind)} · ${esc(memory.source || "USER")}</small><p>${esc(memoryPreview(memory.value))}</p></button>`).join("");
   $("#resource-summary").innerHTML = `<div class="resource-group"><p class="kicker">DISPOSITIVOS</p>${devices || "<div class=empty>Sin dispositivos.</div>"}</div><div class="resource-group"><p class="kicker">PROYECTOS DE CÓDIGO</p>${projects || "<div class=empty>Sin proyectos.</div>"}</div><div class="resource-group"><p class="kicker">MEMORIA · SQLITE</p><div class="resource-count">${data.memories.length} registros persistidos en la BD</div>${memories || "<div class=empty>Sin memoria persistida.</div>"}</div>`;
   $("#resource-summary").querySelectorAll("[data-resource]").forEach((item) => item.addEventListener("click", () => renderResourceDetail(item.dataset.resource, data)));
+}
+function renderCollections(data) {
+  const card = (item, kind) => `<article class="collection-card"><div class="collection-card-head"><span class="status-mark status-${esc(item.status || (item.enabled === false ? "PAUSED" : "READY"))}"></span><div><strong>${esc(item.name || item.key || item.id)}</strong><small>${esc(item.platform || item.project_type || item.kind || item.status || "ready")}</small></div></div><p>${esc(item.description || item.path || memoryPreview(item.value) || "Sin descripción")}</p><div class="collection-meta">${kind === "device" ? esc((item.capabilities || []).join(" · ")) : kind === "project" ? `${item.enabled === false ? "Pausado" : "Activo"} · ${esc(item.id)}` : `${esc(item.source || "USER")} · ${date(item.updated_at)}`}</div></article>`;
+  $("#devices-list").innerHTML = (data.devices || []).map((item) => card(item, "device")).join("") || '<div class="empty">Sin dispositivos conectados.</div>';
+  $("#projects-list").innerHTML = (data.projects || []).map((item) => card(item, "project")).join("") || '<div class="empty">Sin proyectos registrados.</div>';
+  $("#memory-list").innerHTML = (data.memories || []).map((item) => card(item, "memory")).join("") || '<div class="empty">Sin memoria persistida.</div>';
 }
 function memoryPreview(value) { const text = typeof value === "string" ? value : JSON.stringify(value); return text.length > 160 ? `${text.slice(0, 157)}...` : text; }
 function renderResourceDetail(resourceId, data) {
@@ -104,8 +116,11 @@ function renderResourceDetail(resourceId, data) {
   const tools = (data.tools || []).filter((tool) => toolNames.includes(tool.name));
   $("#resource-detail").className = "resource-detail";
   const facts = kind === "device" ? data.system || {} : { path: resource.path, type: resource.project_type, codegraph: resource.codegraph_version ? `v${resource.codegraph_version}` : "no actualizado", last_audit: date(resource.last_audited_at) };
-  $("#resource-detail").innerHTML = `<div class="resource-detail-head"><p class="kicker">${kind === "device" ? "DISPOSITIVO" : "PROYECTO"}</p><h3>${esc(resource.name)}</h3><small>${esc(resource.description || resource.path || "")}</small></div><div class="resource-facts">${Object.entries(facts).map(([key, value]) => `<span><small>${esc(key)}</small><b>${esc(value)}</b></span>`).join("")}</div>${kind === "project" ? `<button class="button danger project-delete" data-project-id="${esc(resource.id)}">Borrar proyecto y directorio</button>` : ""}<div class="resource-tools"><strong>HERRAMIENTAS DISPONIBLES</strong>${tools.map((tool) => `<div><b>${esc(tool.name)}</b><span>${esc(tool.description)}</span><small>${tool.methods.map(esc).join(" · ")}</small></div>`).join("") || "<span>Sin herramientas registradas.</span>"}</div>`;
+  $("#resource-detail").innerHTML = `<div class="resource-detail-head"><p class="kicker">${kind === "device" ? "DISPOSITIVO" : "PROYECTO"}</p><h3>${esc(resource.name)}</h3><small>${esc(resource.description || resource.path || "")}</small></div><div class="resource-facts">${Object.entries(facts).map(([key, value]) => `<span><small>${esc(key)}</small><b>${esc(value)}</b></span>`).join("")}</div>${kind === "project" ? `<div class="project-actions"><button class="button secondary project-audit">Auditar</button><button class="button secondary project-refresh">Actualizar grafo</button><button class="button danger project-delete" data-project-id="${esc(resource.id)}">Borrar proyecto y directorio</button></div>` : ""}<div class="resource-tools"><strong>HERRAMIENTAS DISPONIBLES</strong>${tools.map((tool) => `<div><b>${esc(tool.name)}</b><span>${esc(tool.description)}</span><small>${tool.methods.map(esc).join(" · ")}</small></div>`).join("") || "<span>Sin herramientas registradas.</span>"}</div>`;
   const deleteButton = $("#resource-detail .project-delete");
+  const projectAction = async (suffix, message) => { try { await api(`/projects/${encodeURIComponent(resource.id)}/${suffix}`, { method: "POST" }); toast(message); await load(); } catch (error) { toast(error.message, true); } };
+  $("#resource-detail .project-audit")?.addEventListener("click", () => projectAction("audit", "Auditoría solicitada"));
+  $("#resource-detail .project-refresh")?.addEventListener("click", () => projectAction("codegraph/refresh", "Actualización del grafo solicitada"));
   if (deleteButton) deleteButton.addEventListener("click", async () => {
     if (!window.confirm(`Borrar ${resource.name}, su directorio y su registro persistido?`)) return;
     try {
@@ -125,7 +140,8 @@ function renderChat(tasks) {
 function fillProjects(projects) {
   const targets = `<option value="device:computer">Ordenador</option>` + projects.filter((project) => project.enabled).map((project) => `<option value="project:${esc(project.id)}">${esc(project.name)}${project.is_default ? " · default" : ""}</option>`).join("");
   [$("#task-target"), $("#chat-target")].forEach((select) => { if (!select) return; const current = select.value; select.innerHTML = targets; select.value = current || "device:computer"; });
-  const trace = $("#trace-task"), current = trace.value; trace.innerHTML = `<option value="">Selecciona una tarea</option>` + (state.data?.tasks || []).map((task) => `<option value="${task.id}">${esc(task.goal)} · ${esc(task.status)}</option>`).join(""); trace.value = current || state.selectedTask || "";
+  const options = `<option value="">Selecciona una tarea</option>` + (state.data?.tasks || []).map((task) => `<option value="${task.id}">${esc(task.goal)} · ${esc(task.status)}</option>`).join("");
+  [$("#trace-task"), $("#detail-task")].forEach((select) => { if (!select) return; const current = select.value; select.innerHTML = options; select.value = current || state.selectedTask || ""; });
 }
 function taskEvents(taskId) { return state.data?.task_events?.[taskId] || (state.data?.events || []).filter((event) => event.task_id === taskId); }
 function traceEvents(taskId) { return taskEvents(taskId); }
@@ -178,7 +194,14 @@ function taskActivity(taskId) {
 function renderTrace(taskId) {
   if (!taskId || !state.data) return;
   const events = traceEvents(taskId);
-  $("#trace-workspace").innerHTML = events.map((event, index) => {
+  const task = state.data.tasks.find((item) => item.id === taskId) || {};
+  const latest = events[events.length - 1] || {};
+  const phase = latest.payload?.phase || task.phase || task.status || "idle";
+  const mode = latest.payload?.mode || task.metadata?.mode || "autonomous";
+  const decision = latest.payload?.decision || latest.payload?.reason || task.failure_reason || "Sin decisión registrada";
+  const timeline = events.slice(-8).map((event) => `<li><time>${date(event.created_at)}</time><strong>${esc(event.event_type)}</strong><span>${esc(event.payload?.decision || event.payload?.reason || "")}</span></li>`).join("");
+  const cards = `<div class="observability-summary"><div><small>FASE ACTUAL</small><strong>${esc(phase)}</strong></div><div><small>MODO</small><strong>${esc(mode)}</strong></div><div><small>DECISIÓN</small><strong>${esc(decision)}</strong></div></div><section class="panel timeline-panel"><header><strong>Línea de tiempo</strong><small>${events.length} eventos</small></header><ol>${timeline || '<li class="empty">Sin eventos.</li>'}</ol></section>`;
+  $("#trace-workspace").innerHTML = cards + events.map((event, index) => {
     const payload = event.payload || {}, isRequest = event.event_type === "LLM_REQUEST", isResponse = event.event_type === "LLM_RESPONSE", isError = ["LLM_ERROR", "LLM_SKIPPED"].includes(event.event_type);
     const request = isRequest ? objectValue(payload.request) : null;
     const response = isResponse ? (payload.response || payload) : payload;
@@ -190,6 +213,17 @@ function renderTrace(taskId) {
     const characterCount = payload.context_chars || payload.response_chars || requestPayload.prompt_chars || renderedPrompt.length || 0;
     return `<article class="llm-card ${isError ? "llm-error" : ""}"><header><span class="trace-number">${String(index + 1).padStart(2, "0")}</span><div><strong>${title}</strong><small>${esc(payload.role || (event.node_id ? `nodo ${shortId(event.node_id)}` : "tarea"))} · ${date(event.created_at)} · ${characterCount} caracteres</small></div><em>${isRequest ? "OUT" : isError ? "ERR" : isResponse ? "IN" : "LOG"}</em></header><div class="trace-meta"><span>${isRequest ? "Prompt efectivo enviado" : isResponse ? "Respuesta validada" : event.event_type}</span><span>${payload.usage ? `${payload.usage.prompt_eval_count || 0} prompt · ${payload.usage.eval_count || 0} response tokens` : "evento persistido"}</span></div>${body}${prompt}</article>`;
   }).join("") || `<div class="empty">Esta tarea aún no tiene intercambios LLM persistidos.</div>`;
+}
+function renderTaskDetail(taskId) {
+  const task = state.data?.tasks.find((item) => item.id === taskId);
+  if (!task) return;
+  const nodes = state.data.task_nodes?.[taskId] || [], edges = state.data.task_edges?.[taskId] || [], events = taskEvents(taskId);
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const graph = nodes.map((node, index) => `<div class="decision-node status-${esc(node.status)}"><span>${String(index + 1).padStart(2, "0")}</span><strong>${esc(node.description || node.type)}</strong><small>${esc(node.type)} · ${esc(node.status)}</small>${edges.filter((edge) => edge.to_node === node.id).map((edge) => `<i>← ${esc(nodeById.get(edge.from_node)?.description || shortId(edge.from_node))}</i>`).join("")}</div>`).join("");
+  const history = events.slice().reverse().map((event) => `<li><time>${date(event.created_at)}</time><strong>${esc(event.event_type)}</strong><span>${esc(event.payload?.decision || event.payload?.reason || event.payload?.error || "")}</span></li>`).join("");
+  $("#task-detail-workspace").innerHTML = `<div class="detail-head panel"><div><p class="kicker">TASK ${shortId(task.id)}</p><h2>${esc(task.goal)}</h2><small>${esc(task.status)} · creado ${date(task.created_at)}</small></div><div class="inspector-actions"><button class="button secondary" data-detail-action="trace">Observabilidad</button><button class="button danger" data-detail-action="cancel">Cancelar</button></div></div><div class="detail-grid"><section class="panel decision-graph"><header><strong>Grafo de decisiones</strong><small>${nodes.length} nodos · ${edges.length} dependencias</small></header><div class="graph-canvas">${graph || '<div class="empty">El grafo aún no está disponible.</div>'}</div></section><section class="panel transition-panel"><header><strong>Historial de transiciones</strong><small>${events.length} eventos persistidos</small></header><ol>${history || '<li class="empty">Sin transiciones.</li>'}</ol></section></div>`;
+  $("#task-detail-workspace").querySelector('[data-detail-action="trace"]')?.addEventListener("click", () => setView("trace"));
+  $("#task-detail-workspace").querySelector('[data-detail-action="cancel"]')?.addEventListener("click", () => taskAction("cancel", task));
 }
 function renderInspector(taskId) {
   const task = state.data?.tasks.find((item) => item.id === taskId); if (!task) return;
@@ -208,11 +242,12 @@ function renderInspector(taskId) {
   const eventRows = events.slice(-12).reverse().map((event) => `<div class="inspector-event"><span>${date(event.created_at)}</span><strong>${esc(event.event_type)}</strong><small>${event.node_id ? `nodo ${shortId(event.node_id)}` : "tarea"}</small></div>`).join("");
   $("#task-inspector").className = "panel inspector";
   const report = finalResponse ? `<section class="final-report"><div class="final-report-head"><p class="kicker">RESPUESTA FINAL</p><span class="badge status-${esc(task.status)}">${esc(finalResponse.response_type || "report")}</span></div><h4>${esc(finalResponse.title || "Resultado de la tarea")}</h4><p>${esc(finalResponse.summary || "")}</p>${Object.entries(finalResponse.sections || {}).map(([title, items]) => `<div class="final-report-section"><strong>${esc(title)}</strong><ul>${(items || []).map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>`).join("")} ${(finalResponse.evidence || []).length ? `<div class="final-report-section"><strong>Evidencia</strong><ul>${finalResponse.evidence.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}${(finalResponse.limitations || []).length ? `<div class="final-report-section report-limitations"><strong>Limitaciones</strong><ul>${finalResponse.limitations.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</section>` : "";
-  $("#task-inspector").innerHTML = `<div class="inspector-head"><div><p class="kicker">TASK INSPECTOR</p><h3>${esc(task.goal)}</h3><small>${shortId(task.id)} · ${esc(task.status)}</small></div><span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div><div class="inspector-activity"><span class="activity-pulse"></span><div><strong>${esc(activity.label)}</strong><small>${esc(activity.detail)}</small></div></div>${recovery}${report}<div class="inspector-actions">${["WAITING", "BLOCKED"].includes(task.status) ? `<button class="button primary" data-action="input">Resolver</button>` : ""}${["BLOCKED", "FAILED"].includes(task.status) ? `<button class="button" data-action="replan">Replanificar</button>` : ""}${task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : ""}${!["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? `<button class="button ghost" data-action="cancel">Cancelar</button>` : ""}<button class="button ghost" data-action="trace">Ver traza</button></div><div class="usage-strip"><span>LLM <b>${usage?.llm_calls || 0}</b></span><span>TOOLS <b>${usage?.tool_calls || 0}</b></span><span>NODOS <b>${nodes.length}</b></span><span>${tokenLabel} <b>${tokenValue}</b></span></div><p class="kicker">RECORRIDO DEL GRAFO · ${edges.length} DEPENDENCIAS</p><div class="node-list">${graphRows || "<div class=empty>Sin nodos planificados.</div>"}</div><p class="kicker inspector-events-title">TRANSICIONES RECIENTES</p><div class="inspector-events">${eventRows || "<div class=empty>Sin eventos.</div>"}</div>`;
-  $("#task-inspector").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => taskAction(button.dataset.action, task)));
+  const approvalNode = nodes.find((node) => ["WAITING_APPROVAL", "APPROVAL_REQUIRED"].includes(node.status)) || null;
+  $("#task-inspector").innerHTML = `<div class="inspector-head"><div><p class="kicker">TASK INSPECTOR</p><h3>${esc(task.goal)}</h3><small>${shortId(task.id)} · ${esc(task.status)}</small></div><span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div><div class="inspector-activity"><span class="activity-pulse"></span><div><strong>${esc(activity.label)}</strong><small>${esc(activity.detail)}</small></div></div>${recovery}${report}<div class="inspector-actions">${approvalNode ? `<button class="button primary" data-action="approval" data-node-id="${esc(approvalNode.id)}">Aprobar nodo</button>` : ""}${["WAITING", "BLOCKED"].includes(task.status) ? `<button class="button primary" data-action="input">Resolver</button>` : ""}${["BLOCKED", "FAILED"].includes(task.status) ? `<button class="button" data-action="replan">Replanificar</button>` : ""}${task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : ""}${!["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? `<button class="button ghost" data-action="cancel">Cancelar</button>` : ""}<button class="button ghost" data-action="trace">Ver traza</button></div><div class="usage-strip"><span>LLM <b>${usage?.llm_calls || 0}</b></span><span>TOOLS <b>${usage?.tool_calls || 0}</b></span><span>NODOS <b>${nodes.length}</b></span><span>${tokenLabel} <b>${tokenValue}</b></span></div><p class="kicker">RECORRIDO DEL GRAFO · ${edges.length} DEPENDENCIAS</p><div class="node-list">${graphRows || "<div class=empty>Sin nodos planificados.</div>"}</div><p class="kicker inspector-events-title">TRANSICIONES RECIENTES</p><div class="inspector-events">${eventRows || "<div class=empty>Sin eventos.</div>"}</div>`;
+  $("#task-inspector").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => taskAction(button.dataset.action, task, button.dataset.nodeId)));
 }
-function selectTask(taskId) { state.selectedTask = taskId; renderTasks(state.data.tasks); renderInspector(taskId); renderTrace(taskId); }
-async function taskAction(action, task) { try { if (action === "cancel") await api(`/tasks/${task.id}/cancel`, { method: "POST" }); if (action === "resume") await api(`/tasks/${task.id}/resume`, { method: "POST" }); if (action === "replan") await api(`/tasks/${task.id}/replan`, { method: "POST" }); if (action === "trace") { setView("trace"); return; } if (action === "input") { const prompt = task.metadata?.clarification?.prompt || "Input JSON para la tarea"; const value = window.prompt(`${prompt}\n\nFormato JSON`, "{}"); if (value === null) return; await api(`/tasks/${task.id}/input`, { method: "POST", body: JSON.stringify({ input: JSON.parse(value) }) }); } toast(action === "replan" ? "Nueva estrategia solicitada" : "Orden actualizada"); await load(); } catch (error) { toast(`No se pudo actualizar: ${error.message}`, true); } }
+function selectTask(taskId) { state.selectedTask = taskId; renderTasks(state.data.tasks); renderInspector(taskId); renderTrace(taskId); renderTaskDetail(taskId); }
+async function taskAction(action, task, nodeId = "") { try { if (action === "cancel") await api(`/tasks/${task.id}/cancel`, { method: "POST" }); if (action === "resume") await api(`/tasks/${task.id}/resume`, { method: "POST" }); if (action === "replan") await api(`/tasks/${task.id}/replan`, { method: "POST" }); if (action === "approval") await api(`/tasks/${task.id}/nodes/${nodeId}/approval`, { method: "POST", body: JSON.stringify({ approved: true }) }); if (action === "trace") { setView("trace"); return; } if (action === "input") { const prompt = task.metadata?.clarification?.prompt || "Input JSON para la tarea"; const value = window.prompt(`${prompt}\n\nFormato JSON`, "{}"); if (value === null) return; await api(`/tasks/${task.id}/input`, { method: "POST", body: JSON.stringify({ input: JSON.parse(value) }) }); } toast(action === "replan" ? "Nueva estrategia solicitada" : "Orden actualizada"); await load(); } catch (error) { toast(`No se pudo actualizar: ${error.message}`, true); } }
 function formatNumber(value) { return new Intl.NumberFormat("es-ES").format(value || 0); }
 function formatSeconds(value) { const seconds = Number(value || 0); return seconds < 60 ? `${seconds.toFixed(1)}s` : `${(seconds / 60).toFixed(1)}m`; }
 function timingRatio(value, total) { return total ? Math.max(4, Number(value || 0) / total * 100) : 4; }
@@ -223,8 +258,21 @@ $("#refresh").addEventListener("click", load);
 $("#idle-toggle").addEventListener("click", async () => { try { const enabled = $("#idle-toggle").getAttribute("aria-pressed") !== "true"; renderIdle(await api("/runtime/idle", { method: "PUT", body: JSON.stringify({ enabled }) })); } catch (error) { toast(error.message, true); } });
 $("#reset-memory").addEventListener("click", async () => { if (!window.confirm("Borrar tareas, grafos, eventos, leases, resultados y memoria? Los proyectos se conservan.")) return; try { const result = await api("/runtime/reset", { method: "POST" }); state.selectedTask = null; toast(`Estado limpio: ${result.total} registros eliminados`); await load(); } catch (error) { toast(error.message, true); } });
 $("#task-filter").addEventListener("input", () => state.data && renderTasks(state.data.tasks));
+$("#task-status-filter").addEventListener("change", () => state.data && renderTasks(state.data.tasks));
 $("#trace-task").addEventListener("change", (event) => { state.selectedTask = event.target.value || null; renderTrace(state.selectedTask); });
+$("#detail-task").addEventListener("change", (event) => { state.selectedTask = event.target.value || null; renderTaskDetail(state.selectedTask); renderInspector(state.selectedTask); });
 $("#new-task").addEventListener("click", () => $("#modal").classList.remove("hidden")); $("#close-modal").addEventListener("click", () => $("#modal").classList.add("hidden"));
 $("#task-form").addEventListener("submit", async (event) => { event.preventDefault(); try { const [target_type, target_id] = $("#task-target").value.split(":"); const body = { goal: $("#goal").value, target_type, target_id, priority: Number($("#priority").value || 0) }; const task = await api("/tasks", { method: "POST", body: JSON.stringify(body) }); $("#modal").classList.add("hidden"); $("#goal").value = ""; await load(); selectTask(task.id); setView("tasks"); } catch (error) { toast(error.message, true); } });
-$("#chat-form").addEventListener("submit", async (event) => { event.preventDefault(); try { const [target_type, target_id] = $("#chat-target").value.split(":"); await api("/chat", { method: "POST", body: JSON.stringify({ message: $("#chat-message").value, target_type, target_id }) }); $("#chat-message").value = ""; toast("Consulta enviada a la cola"); await load(); } catch (error) { toast(error.message, true); } });
+async function streamChat(body) {
+  let response = await fetch("/chat-fast", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!response.ok) response = await fetch("/chat/fast", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!response.ok || !response.body) throw new Error("stream unavailable");
+  const reader = response.body.getReader(), decoder = new TextDecoder();
+  let text = "";
+  while (true) { const chunk = await reader.read(); if (chunk.done) break; text += decoder.decode(chunk.value, { stream: true }); const live = $("#chat-live"); if (live) live.textContent = text.replace(/^data:\s*/gm, "").trim(); }
+  return text;
+}
+$("#chat-mode").addEventListener("change", (event) => { $("#chat-mode-help").textContent = event.target.value === "agent" ? "Puede operar tareas y la cola" : "Consulta y crea trabajo"; });
+$("#chat-form").addEventListener("submit", async (event) => { event.preventDefault(); const message = $("#chat-message").value.trim(); if (!message) return; try { const [target_type, target_id] = $("#chat-target").value.split(":"); const body = { message, target_type, target_id }; $("#chat-live").textContent = "Enviando…"; if ($("#chat-mode").value === "agent") { const result = await api("/chat/agent", { method: "POST", body: JSON.stringify(body) }); $("#chat-live").textContent = result.message || "Operación completada"; toast(result.message || "Operación completada"); } else { try { await streamChat(body); } catch (_) { await api("/chat", { method: "POST", body: JSON.stringify(body) }); } $("#chat-live").textContent = "Consulta enviada a la cola"; toast("Consulta enviada"); } $("#chat-message").value = ""; await load(); } catch (error) { $("#chat-live").textContent = "No se pudo enviar"; toast(error.message, true); } });
+document.querySelectorAll("[data-reset-memory]").forEach((button) => button.addEventListener("click", () => $("#reset-memory").click()));
 setView("overview"); load(); window.setInterval(load, 60000);

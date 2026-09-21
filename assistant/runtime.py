@@ -52,6 +52,7 @@ class TaskRuntime:
         }
         self.worker_id = f"{socket.gethostname()}:{uuid4()}"
         self.started_at = datetime.now(UTC)
+        self._wake_event = asyncio.Event()
 
     def metrics_snapshot(self) -> dict[str, int]:
         return dict(self.metrics)
@@ -153,7 +154,15 @@ class TaskRuntime:
                 logger.exception("Task runtime pass failed")
                 await self._persist_heartbeat()
                 backoff = min(self.max_backoff, max(self.interval, backoff * 2))
-            await asyncio.sleep(backoff)
+            try:
+                await asyncio.wait_for(self._wake_event.wait(), timeout=backoff)
+                self._wake_event.clear()
+            except TimeoutError:
+                pass
 
     def stop(self) -> None:
         self.stop_requested = True
+        self._wake_event.set()
+
+    def wake(self) -> None:
+        self._wake_event.set()

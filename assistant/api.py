@@ -1,15 +1,17 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from httpx import HTTPError
 
 from .devices.registry import DEVICE_BRANCHES
 from .domain.models import (
+    ChatFastRequest,
     ChatRequest,
     IdleConfigurationRequest,
     Operation,
@@ -18,6 +20,7 @@ from .domain.models import (
     TaskInputRequest,
     TaskRedefinitionRequest,
     TaskRequest,
+    TaskStatus,
 )
 from .idle import IdleCycle
 from .llm import AssistantResponse, NodeDecision, PlanProposal
@@ -26,7 +29,7 @@ from .runtime import TaskRuntime
 from .startup.bootstrap import AssistantContext, create_context
 
 
-def _event_json(event) -> dict:
+def _event_json(event, *, include_prompt: bool = False) -> dict:
     payload = event.payload or {}
     if event.event_type == "LLM_REQUEST" and payload.get("role"):
         role = str(payload["role"])
@@ -52,12 +55,24 @@ def _event_json(event) -> dict:
                     "rendered_instructions": rendered,
                 }
                 request["prompt_chars"] = len(request["rendered_instructions"])
-        if request:
-            payload = {**payload, "request": request}
-            payload.pop("context", None)
+        if request and not include_prompt:
+            request = {
+                key: value
+                for key, value in request.items()
+                if key not in {"prompt", "rendered_instructions", "instructions"}
+            }
+        payload = {**payload, "request": request}
+        payload.pop("context", None)
     return {
         **event.model_dump(mode="json"),
         "payload": payload,
+    }
+
+
+def _task_json(task) -> dict:
+    return {
+        **task.model_dump(mode="json"),
+        "final_response": task.metadata.get("final_response"),
     }
 
 
@@ -99,7 +114,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.2.4", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.2.5", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
 
 
@@ -456,6 +471,83 @@ async def dashboard_data(request: Request):
     }
 
 
+@app.get("/dashboard/overview")
+async def dashboard_overview(request: Request):
+    """Small, bounded read model for the dashboard landing view."""
+    context = service(request)
+    repository = context.service.repository
+    runtime = request.app.state.runtime
+    startup = context.startup
+    return {
+        "health": {
+            "status": startup.status,
+            "llm_ready": runtime.readiness_snapshot()
+            if runtime.readiness_snapshot() is not None
+            else startup.llm_ready,
+            "database_ready": startup.database_ready,
+            "unfinished_tasks": startup.unfinished_tasks,
+        },
+        "task_counts": await repository.dashboard_task_counts(),
+        "projects": [
+            {"id": project.id, "name": project.name, "enabled": project.enabled}
+            for project in await repository.list_projects()
+        ],
+        "runtime": {
+            "active_tasks": runtime.last_active_count,
+            "metrics": runtime.metrics_snapshot(),
+            "idle": runtime.idle_snapshot(),
+        },
+    }
+
+
+@app.get("/dashboard/tasks")
+async def dashboard_tasks(
+    request: Request, limit: int = 100, status: str | None = None
+):
+    tasks = await service(request).service.dashboard_tasks(limit=limit, status=status)
+    return {"tasks": [_task_json(task) for task in tasks], "limit": max(1, min(limit, 500))}
+
+
+@app.get("/dashboard/tasks/{task_id}")
+async def dashboard_task_detail(request: Request, task_id: str):
+    detail = await service(request).service.dashboard_task_detail(task_id)
+    if detail is None:
+        raise HTTPException(404, "Task not found")
+    return {
+        "task": _task_json(detail["task"]),
+        "nodes": [node.model_dump(mode="json") for node in detail["nodes"]],
+        "edges": [edge.model_dump(mode="json") for edge in detail["edges"]],
+        "events": [_event_json(event, include_prompt=True) for event in detail["events"]],
+    }
+
+
+@app.get("/dashboard/observability")
+async def dashboard_observability(request: Request, limit: int = 200):
+    context = service(request)
+    runtime = request.app.state.runtime
+    events = await context.service.repository.list_recent_events(limit=limit)
+    return {
+        "events": [_event_json(event) for event in events],
+        "runtime": {
+            "metrics": runtime.metrics_snapshot(),
+            "readiness": runtime.readiness_snapshot(),
+            "last_error": runtime.last_error,
+            "idle": runtime.idle_snapshot(),
+        },
+    }
+
+
+@app.get("/dashboard/resources")
+async def dashboard_resources(request: Request):
+    context = service(request)
+    system_result = await context.service.tools.execute(Operation(tool="system", method="info"))
+    return {
+        "devices": _dashboard_devices(context),
+        "tools": [definition.model_dump(mode="json") for definition in context.service.tools.definitions()],
+        "system": system_result.output if system_result.success else {"error": system_result.error},
+    }
+
+
 @app.get("/dashboard", include_in_schema=False)
 async def dashboard():
     return FileResponse(dashboard_root / "index.html")
@@ -542,6 +634,130 @@ async def create_chat_message(request: Request, chat_request: ChatRequest):
         )
     )
     return task.model_dump(mode="json")
+
+
+@app.post("/chat/agent")
+async def chat_agent_command(request: Request, chat_request: ChatRequest):
+    """Execute explicit queue operations from dashboard agent mode."""
+    context = service(request)
+    message = chat_request.message.strip()
+    command, _, argument = message.partition(" ")
+    command = command.casefold().lstrip("/")
+    argument = argument.strip()
+
+    if command in {"listar", "lista", "list"}:
+        tasks = await context.service.repository.list_tasks()
+        active = [
+            task for task in tasks
+            if task.status not in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+        ]
+        return {
+            "action": "list",
+            "message": f"{len(active)} tareas activas de {len(tasks)} persistidas",
+            "tasks": [_task_json(task) for task in tasks],
+        }
+
+    if command in {"crear", "create"}:
+        if not argument:
+            raise HTTPException(422, "Indica el objetivo después de 'crear'.")
+        task = await context.service.create_task(TaskRequest(
+            goal=argument,
+            source="DASHBOARD_AGENT",
+            project_id=chat_request.project_id,
+            target_type=chat_request.target_type,
+            target_id=chat_request.target_id,
+            metadata={"interaction": "chat", "mode": "agent"},
+        ))
+        return {"action": "create", "message": f"Tarea creada ({task.id[:8]})", "task": _task_json(task)}
+
+    operations = {
+        "cancelar": "cancel", "cancel": "cancel",
+        "borrar": "delete", "delete": "delete",
+        "reanudar": "resume", "resume": "resume",
+        "replanificar": "replan", "replan": "replan",
+    }
+    action = operations.get(command)
+    if action:
+        if not argument:
+            raise HTTPException(422, f"Indica el id después de '{command}'.")
+        task = await context.service.get_task(argument)
+        if task is None:
+            raise HTTPException(404, "No se encontró esa tarea. Usa el id completo.")
+        try:
+            if action == "cancel":
+                task = await context.service.cancel_task(task.id)
+            elif action == "delete":
+                deleted = await context.service.delete_task(task.id)
+                return {"action": action, "message": f"Tarea {task.id[:8]} borrada", "deleted": deleted}
+            elif action == "resume":
+                task = await context.service.resume_task(task.id)
+            else:
+                task = await context.service.replan_task(task.id)
+        except ValueError as error:
+            raise HTTPException(409, str(error)) from error
+        if action == "cancel":
+            request.app.state.runtime.wake()
+        return {"action": action, "message": f"Tarea {task.id[:8]} actualizada: {task.status.value}", "task": _task_json(task)}
+
+    raise HTTPException(422, "Comando no reconocido. Usa crear, cancelar, borrar, reanudar, replanificar o listar.")
+
+
+async def _chat_fast_stream(request: Request, chat_request: ChatFastRequest):
+    """Stream task progress while the persistent runtime owns execution."""
+    try:
+        task = await service(request).service.create_task(
+            TaskRequest(
+                goal=chat_request.message,
+                source="DASHBOARD_CHAT_FAST",
+                project_id=chat_request.project_id,
+                target_type=chat_request.target_type,
+                target_id=chat_request.target_id,
+                metadata={"interaction": "chat", "requested_format": "answer"},
+            )
+        )
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+
+    async def events():
+        terminal = {"SUCCEEDED", "FAILED", "CANCELLED", "BLOCKED"}
+        last_status = None
+        yield f"event: accepted\ndata: {json.dumps({'task_id': task.id, 'status': task.status}, default=str)}\n\n"
+        while True:
+            if await request.is_disconnected():
+                return
+            current = await service(request).service.get_task(task.id)
+            if current is None:
+                yield "event: error\ndata: {\"message\":\"Task disappeared while streaming\"}\n\n"
+                return
+            status = current.status.value
+            if status != last_status:
+                last_status = status
+                payload = {"task_id": current.id, "status": status}
+                if current.failure_reason:
+                    payload["error"] = current.failure_reason
+                yield f"event: status\ndata: {json.dumps(payload, default=str)}\n\n"
+            if status in terminal:
+                result = current.metadata.get("final_response") or current.result_summary
+                if result:
+                    yield (
+                        "event: result\n"
+                        f"data: {json.dumps({'task_id': current.id, 'status': status, 'result': result}, default=str)}\n\n"
+                    )
+                yield f"event: done\ndata: {json.dumps({'task_id': current.id, 'status': status}, default=str)}\n\n"
+                return
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/chat-fast")
+@app.post("/chat/fast")
+async def chat_fast(request: Request, chat_request: ChatFastRequest):
+    return await _chat_fast_stream(request, chat_request)
 
 
 @app.post("/tasks")
@@ -635,6 +851,7 @@ async def cancel_task(request: Request, task_id: str):
     task = await service(request).service.cancel_task(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    request.app.state.runtime.wake()
     return task.model_dump(mode="json")
 
 

@@ -37,7 +37,13 @@ from .domain.models import (
 )
 from .infrastructure.orm import IdempotencyRow, LeaseRow
 from .infrastructure.repositories import TaskRepository
-from .llm import AssistantResponse, LLMProvider, PlanNodeProposal, PlanProposal
+from .llm import (
+    AssistantResponse,
+    LLMProvider,
+    NodeDecision,
+    PlanNodeProposal,
+    PlanProposal,
+)
 from .observability import compact
 from .planning import plan_coverage_warnings, validate_plan_quality
 from .project_analysis import ProjectAnalyzer
@@ -305,6 +311,20 @@ class TaskService:
     async def get_task(self, task_id: str) -> Task | None:
         return await self.repository.get_task(task_id)
 
+    async def dashboard_tasks(self, limit: int = 100, status: str | None = None) -> list[Task]:
+        return await self.repository.list_dashboard_tasks(limit=limit, status=status)
+
+    async def dashboard_task_detail(self, task_id: str) -> dict[str, object] | None:
+        task = await self.repository.get_task(task_id)
+        if task is None:
+            return None
+        return {
+            "task": task,
+            "nodes": await self.repository.list_nodes(task_id),
+            "edges": await self.repository.list_edges(task_id),
+            "events": await self.repository.list_events(task_id),
+        }
+
     async def graph(self, task_id: str) -> TaskGraph:
         return TaskGraph(
             await self.repository.list_nodes(task_id), await self.repository.list_edges(task_id)
@@ -348,24 +368,23 @@ class TaskService:
             return None
         if task.status in {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
             return task
-        if cancellation is not None:
-            task.status = TaskStatus.CANCELLED
-            task.failure_reason = reason
-            task.finished_at = datetime.now(UTC)
-            return task
         task.status = TaskStatus.CANCELLED
         task.failure_reason = reason
         task.finished_at = datetime.now(UTC)
         await self.repository.save_task(task)
         for node in await self.repository.list_nodes(task_id):
-            if node.status in {NodeStatus.CREATED, NodeStatus.READY, NodeStatus.WAITING}:
+            if node.status in {
+                NodeStatus.CREATED,
+                NodeStatus.READY,
+                NodeStatus.WAITING,
+                NodeStatus.RUNNING,
+                NodeStatus.VERIFYING,
+            }:
                 node.status = NodeStatus.CANCELLED
                 await self.repository.save_node(node)
         await self.repository.save_event(
             TaskEvent(task_id=task_id, event_type="TASK_CANCELLED", payload={"reason": reason})
         )
-        if cancellation is None:
-            await self._ensure_final_response(task)
         return task
 
     async def _persist_cancellation(self, task: Task, reason: str = "cancelled by user") -> None:
@@ -785,6 +804,7 @@ class TaskService:
             "Restart only when preserving the current graph would be unsafe."
         )
         try:
+            await self._persist_llm_request(task.id, "REPLANNER", context, NodeDecision, node.id)
             decision = await self._call_llm(self.llm.replan(context), time_remaining)
         except (
             HTTPError,
@@ -1489,6 +1509,27 @@ class TaskService:
             raise TimeoutError("task execution time budget exhausted")
         return await asyncio.wait_for(awaitable, timeout=timeout)
 
+    async def _persist_llm_request(
+        self,
+        task_id: str,
+        role: str,
+        context: dict[str, Any],
+        schema: type,
+        node_id: str | None = None,
+    ) -> None:
+        prepare_request = getattr(self.llm, "prepare_request", None)
+        request = {}
+        if prepare_request is not None:
+            request = prepare_request(role, context, schema)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task_id,
+                node_id=node_id,
+                event_type="LLM_REQUEST",
+                payload={"role": role, "request": request},
+            )
+        )
+
     async def _handle_structural_node(
         self, task: Task, node: TaskNode, graph: TaskGraph
     ) -> bool:
@@ -1688,6 +1729,9 @@ class TaskService:
                     return True
                 planner_context = await self.context_builder.for_planner(task)
                 try:
+                    await self._persist_llm_request(
+                        task_id, "PLANNER", planner_context, PlanProposal
+                    )
                     proposal = await self._call_llm(self.llm.plan(planner_context), time_remaining)
                 except TimeoutError as error:
                     task.status = TaskStatus.BLOCKED
@@ -1705,16 +1749,6 @@ class TaskService:
                 if cancellation.is_set():
                     await self._persist_cancellation(task)
                     return False
-                await self.repository.save_event(
-                    TaskEvent(
-                        task_id=task_id,
-                        event_type="LLM_REQUEST",
-                        payload={
-                            "role": "PLANNER",
-                            "request": getattr(self.llm, "last_request", {}),
-                        },
-                    )
-                )
                 await self.repository.save_event(
                     TaskEvent(
                         task_id=task_id,
@@ -1747,6 +1781,9 @@ class TaskService:
                     retry_context["planner_feedback"] = (
                         "INVALID PLAN: coverage is descriptive only. Return executable nodes "
                         "or subtasks, or provide a direct answer in answer."
+                    )
+                    await self._persist_llm_request(
+                        task_id, "PLANNER", retry_context, PlanProposal
                     )
                     await self.repository.save_event(
                         TaskEvent(
@@ -2055,6 +2092,17 @@ class TaskService:
             return False
         lease_seconds = max(300, int((time_remaining or 300) + 60))
         if not await self.acquire_lease(node.id, seconds=lease_seconds):
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task_id,
+                    node_id=node.id,
+                    event_type="NODE_LEASE_UNAVAILABLE",
+                    payload={
+                        "reason": "another worker still owns the node lease",
+                        "retry": True,
+                    },
+                )
+            )
             return False
         try:
             task.status = TaskStatus.RUNNING
@@ -2077,6 +2125,9 @@ class TaskService:
                 if not await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
                     await self._block_node_for_budget(task, node, "llm_calls")
                     return True
+                await self._persist_llm_request(
+                    task_id, "NODE_RESOLVER", context, NodeDecision, node.id
+                )
                 decision = await self._call_llm(self.llm.decide(context), time_remaining)
             except (HTTPError, ValidationError, ValueError, KeyError, TypeError, TimeoutError, RuntimeError) as error:
                 reason = f"node resolution failed: {error}"
@@ -2102,17 +2153,6 @@ class TaskService:
                 await self.repository.save_node(node)
                 await self._persist_cancellation(task)
                 return True
-            await self.repository.save_event(
-                TaskEvent(
-                    task_id=task_id,
-                    node_id=node.id,
-                    event_type="LLM_REQUEST",
-                    payload={
-                        "role": "NODE_RESOLVER",
-                        "request": getattr(self.llm, "last_request", {}),
-                    },
-                )
-            )
             await self.repository.save_event(
                 TaskEvent(
                     task_id=task_id,
@@ -2439,6 +2479,9 @@ class TaskService:
                     await self._block_node_for_budget(task, node, "llm_calls")
                     return True
                 try:
+                    await self._persist_llm_request(
+                        task.id, "REPLANNER", replanner_context, NodeDecision, node.id
+                    )
                     replanned = await self._call_llm(
                         self.llm.replan(replanner_context), time_remaining
                     )

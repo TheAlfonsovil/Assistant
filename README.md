@@ -71,6 +71,15 @@ visualizar tareas, grafos, eventos, salud, métricas, proyectos y memoria, y par
 crear o intervenir tareas desde el navegador. La guía completa de instalación,
 configuración, órdenes y monitorización está en [INITIALIZE.md](INITIALIZE.md).
 
+El dashboard incluye un resumen operativo, una tabla de tareas filtrable, detalle
+de cada grafo con estados por nodo e histórico completo de transiciones,
+observabilidad del modo/decisión actual, vistas separadas de dispositivos,
+proyectos y memoria, y Chat-fast. Chat-fast confirma la petición inmediatamente
+por SSE y sigue emitiendo el estado de la tarea persistente hasta su resultado;
+si el navegador se desconecta, el runtime continúa ejecutándola y se puede
+retomar desde Tareas. El control de modo idle es independiente de cancelar una
+tarea: pausarlo detiene el mantenimiento automático, no borra ni cancela trabajo.
+
 La ejecución normal muestra el resultado resumido. Para inspeccionar el ciclo completo usa `--fullflow`:
 
 ```text

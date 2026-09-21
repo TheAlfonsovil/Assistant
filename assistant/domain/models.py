@@ -239,6 +239,12 @@ class ChatRequest(BaseModel):
     target_id: str | None = None
 
 
+class ChatFastRequest(ChatRequest):
+    """Request accepted by the dashboard's low-latency SSE entry point."""
+
+    stream_timeout: float = Field(default=2.0, ge=0.0, le=10.0)
+
+
 class IdleConfigurationRequest(BaseModel):
     enabled: bool
 

@@ -2,7 +2,7 @@ import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -129,6 +129,22 @@ class TaskRepository:
     async def list_tasks(self) -> list[Task]:
         result = await self.session.execute(select(TaskRow).order_by(TaskRow.created_at.desc()))
         return [row_to_task(row) for row in result.scalars()]
+
+    async def list_dashboard_tasks(
+        self, limit: int = 100, status: str | None = None
+    ) -> list[Task]:
+        """Read-only, bounded task query used by the dashboard."""
+        query = select(TaskRow).order_by(TaskRow.created_at.desc()).limit(max(1, min(limit, 500)))
+        if status:
+            query = query.where(TaskRow.status == status)
+        result = await self.session.execute(query)
+        return [row_to_task(row) for row in result.scalars()]
+
+    async def dashboard_task_counts(self) -> dict[str, int]:
+        result = await self.session.execute(
+            select(TaskRow.status, func.count(TaskRow.id)).group_by(TaskRow.status)
+        )
+        return {str(status): int(count) for status, count in result.all()}
 
     async def save_worker_heartbeat(
         self,
@@ -449,6 +465,17 @@ class TaskRepository:
         result = await self.session.execute(
             select(EventRow).where(EventRow.task_id == task_id).order_by(EventRow.created_at)
         )
+        return [TaskEvent.model_validate(row.__dict__) for row in result.scalars()]
+
+    async def list_recent_events(
+        self, limit: int = 200, task_id: str | None = None
+    ) -> list[TaskEvent]:
+        query = select(EventRow).order_by(EventRow.created_at.desc()).limit(
+            max(1, min(limit, 1000))
+        )
+        if task_id:
+            query = query.where(EventRow.task_id == task_id)
+        result = await self.session.execute(query)
         return [TaskEvent.model_validate(row.__dict__) for row in result.scalars()]
 
     async def clear_edges(self, task_id: str) -> None:

@@ -1232,6 +1232,10 @@ async def test_cancel_task_cooperatively_discards_active_tool_result(tmp_path):
         running = asyncio.create_task(service.run_task(task.id))
         await started.wait()
         await service.cancel_task(task.id)
+        persisted = await service.repository.get_task(task.id)
+        events = await service.repository.list_events(task.id)
+        assert persisted.status is TaskStatus.CANCELLED
+        assert any(event.event_type == "TASK_CANCELLED" for event in events)
         result = await running
         node = (await service.repository.list_nodes(task.id))[-1]
 
