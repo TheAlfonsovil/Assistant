@@ -99,7 +99,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.2.3", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.2.4", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
 
 

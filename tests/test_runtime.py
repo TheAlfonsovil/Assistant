@@ -1265,6 +1265,36 @@ async def test_context_builder_separates_planner_and_resolver_context():
     assert "available_tools" not in resolver_context
 
 
+def test_project_audit_plan_drops_unverifiable_prose_acceptance():
+    task = Task(goal="audita el proyecto", metadata={"workflow": "project_audit"})
+    proposal = PlanProposal(
+        task_id=task.id,
+        nodes=[
+            PlanNodeProposal(
+                id="audit",
+                description="Auditar el proyecto y reportar hallazgos",
+                type="OPERATION",
+                acceptance={
+                    "contains": ["reporte de auditoría", "hallazgos con evidencia"]
+                },
+                metadata={
+                    "operation_hint": {
+                        "tool": "project",
+                        "method": "audit",
+                        "args": {"run_tests": False},
+                    }
+                },
+            )
+        ],
+    )
+
+    normalized = TaskService._normalize_project_audit_plan(task, proposal)
+
+    assert len(normalized.nodes) == 1
+    assert normalized.nodes[0].acceptance == {}
+    assert normalized.nodes[0].dependencies == []
+
+
 @pytest.mark.asyncio
 async def test_all_llm_contexts_match_their_role_templates_and_stay_bounded():
     class Repository:
@@ -1804,6 +1834,31 @@ async def test_device_target_skips_project_selection_and_is_available_in_context
         assert task.metadata["target"] == {"type": "device", "id": "computer"}
         assert context["execution_target"] == {"type": "device", "id": "computer"}
         assert context["assistant_state"]["projects_root"] == r"C:\Assistant"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_project_audit_gets_dedicated_workflow_metadata(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'audit-workflow.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            ToolRegistry(),
+            workspace_root=str(tmp_path),
+            projects_root=r"C:\Assistant",
+        )
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        project = await service.create_project(Project(name="project", path=str(project_path)))
+
+        task = await service.create_task(
+            TaskRequest(goal="audita el proyecto", project_id=project.id)
+        )
+
+        assert task.metadata["workflow"] == "project_audit"
+        assert task.metadata["run_tests"] is False
     await database.close()
 
 

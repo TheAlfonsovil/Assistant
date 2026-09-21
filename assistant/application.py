@@ -114,6 +114,9 @@ class TaskService:
         task = Task.model_validate(task_data)
         if target:
             task.metadata["target"] = target
+        if project and self._is_project_audit_request(task.goal):
+            task.metadata.setdefault("workflow", "project_audit")
+            task.metadata.setdefault("run_tests", False)
         if self.default_execution_time is not None:
             task.budget.max_execution_time = max(1.0, self.default_execution_time)
         if requires_project_selection:
@@ -152,6 +155,24 @@ class TaskService:
             payload=task.metadata.get("clarification", {}),
         ))
         return task
+
+    @staticmethod
+    def _is_project_audit_request(goal: str) -> bool:
+        normalized = goal.casefold()
+        return any(
+            phrase in normalized
+            for phrase in (
+                "audita el proyecto",
+                "auditar el proyecto",
+                "audita este proyecto",
+                "auditar este proyecto",
+                "audit the project",
+                "audit this project",
+                "revisa el proyecto",
+                "revisar el proyecto",
+                "review the project",
+            )
+        )
 
     @staticmethod
     def _requested_target(request: TaskRequest) -> dict[str, str] | None:
@@ -941,7 +962,10 @@ class TaskService:
         if len(audit_nodes) != 1:
             return proposal
         audit = audit_nodes[0]
-        audit = audit.model_copy(update={"dependencies": []})
+        # The audit tool returns structured findings; prose acceptance phrases
+        # from the planner cannot be matched reliably against that payload and
+        # would cause the same idempotent audit to retry unnecessarily.
+        audit = audit.model_copy(update={"dependencies": [], "acceptance": {}})
         return proposal.model_copy(update={"nodes": [audit]})
 
     @staticmethod
@@ -2215,6 +2239,12 @@ class TaskService:
             operation_hint = node.metadata.get("operation_hint")
             if isinstance(operation_hint, dict):
                 operation = Operation.model_validate(operation_hint)
+            if operation.tool == "project" and operation.method == "audit":
+                # project.audit returns the audit report itself. Its structured
+                # payload is the acceptance evidence; prose contains checks
+                # from older planner prompts are not verifiable.
+                node.metadata.pop("acceptance", None)
+                await self.repository.save_node(node)
             tool_definition = self.tools.definition(operation.tool)
             if tool_definition is not None:
                 await self.renew_lease(
