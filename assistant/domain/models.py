@@ -5,7 +5,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 from .contracts import (
     NodeContract,
@@ -33,6 +33,28 @@ class TaskStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+
+
+class TaskPriority(StrEnum):
+    INMEDIATE = "Inmediate"
+    HIGH = "High"
+    MEDIUM = "Medium"
+    LOW = "Low"
+
+
+TASK_PRIORITY_VALUES = {
+    TaskPriority.LOW: 0,
+    TaskPriority.MEDIUM: 1,
+    TaskPriority.HIGH: 2,
+    TaskPriority.INMEDIATE: 3,
+}
+
+
+def priority_label(priority: int) -> str:
+    return max(
+        TASK_PRIORITY_VALUES,
+        key=lambda label: TASK_PRIORITY_VALUES[label] if TASK_PRIORITY_VALUES[label] <= priority else -1,
+    ).value
 
 
 class NodeType(StrEnum):
@@ -151,7 +173,7 @@ class Task(BaseModel):
     goal: str
     description: str = ""
     status: TaskStatus = TaskStatus.CREATED
-    priority: int = 0
+    priority: int = 1
     created_at: datetime = Field(default_factory=utcnow)
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -178,7 +200,7 @@ class TaskNode(BaseModel):
     type: NodeType = NodeType.TASK
     description: str
     status: NodeStatus = NodeStatus.CREATED
-    priority: int = 0
+    priority: int = 1
     input_data: dict[str, Any] = Field(default_factory=dict)
     output_data: dict[str, Any] = Field(default_factory=dict)
     retry_count: int = 0
@@ -255,9 +277,22 @@ class TaskRequest(BaseModel):
     project_name: str | None = None
     target_type: str | None = None
     target_id: str | None = None
-    priority: int = 0
+    priority: int = 1
     deadline: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def normalize_priority(cls, value: Any) -> int:
+        if value is None:
+            return TASK_PRIORITY_VALUES[TaskPriority.MEDIUM]
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            for label, numeric_value in TASK_PRIORITY_VALUES.items():
+                if normalized == label.value.casefold():
+                    return numeric_value
+            raise ValueError("priority must be Inmediate, High, Medium, or Low")
+        return value
 
 
 class ChatRequest(BaseModel):

@@ -82,11 +82,10 @@ CONTRACT
   required constraint. If no registered action can satisfy it, use WAIT rather
   than silently creating an   empty directory or substituting an unrelated stack.
 - For a new project request, first classify the requested deliverable. Use
-  `project.initialize` for stack-neutral workspaces (books, chemistry,
-  research, datasets, content, automation, API integrations, or mixed
-  artifacts), passing a meaningful `kind`, description, directories, and
-  initial artifacts. Use `project.scaffold` only when the user explicitly
-  requests a supported application stack and deployment shape.
+  `project.initialize` for all new projects, passing a meaningful `kind`,
+  objective, directories, and initial artifacts. Do not impose a framework,
+  frontend, backend, container, or deployment shape that the user did not
+  request.
 - For a feature request against an existing project, use the project workflow:
   `project.analyze` to inventory all artifact types and relevant files,
   `project.read` to load only the selected text/data artifacts, then
@@ -94,9 +93,8 @@ CONTRACT
   operations, and optional deletions. Prefer artifact-level edits over
   rewriting unrelated files.
   Use `commands` only for requested or necessary post-change validation.
-  `project.modify` remains accepted for compatibility, but new plans should
-  prefer `project.edit`. Never report a feature as implemented when no files
-  were changed.
+  Use `project.edit` for changes. Never report a feature as implemented when
+  no files were changed.
 - When `RESOLVED PROJECT` is present, it is authoritative evidence of the
   project's framework, runtime, and path. Do not ask the user to identify
   those details again. For requests containing implementation verbs such as
@@ -111,10 +109,11 @@ that runs relevant build/tests/syntax checks and validates Docker Compose when
 present. Add `deployment.verify` as well when a running endpoint or UI is
 required. A structural VERIFY node alone is not sufficient. If verification
 fails, the runtime must be able to retry or replan rather than report success.
-- If a registered project's codegraph is available, use it as initial
+- If a registered project's codegraph summary is available, use it as initial
   structural evidence to select files and dependencies. It is an index, not
   source-of-truth: refresh it with `codegraph.build` after edits or when its
-  version/evidence is stale or insufficient.
+version/evidence is stale or insufficient. Use `codegraph.query` when the
+summary does not identify the relevant files or symbols.
   Missing non-critical implementation details must be resolved from the
   registered project's evidence and safe defaults, not converted into a
   direct-answer question.

@@ -61,6 +61,7 @@ class Database:
                     "(version INTEGER NOT NULL, applied_at DATETIME NOT NULL)"
                 )
             )
+            await connection.run_sync(self._migrate_schema)
             await connection.run_sync(self._validate_schema)
             current = await connection.scalar(text("SELECT MAX(version) FROM schema_version"))
             if current is not None and current != self.CURRENT_SCHEMA_VERSION:
@@ -77,6 +78,59 @@ class Database:
                     ),
                     {"version": self.CURRENT_SCHEMA_VERSION},
                 )
+
+    @staticmethod
+    def _migrate_schema(connection) -> None:
+        """Migrate the original metadata-based schema to schema 5 in place."""
+        version = connection.execute(text("SELECT MAX(version) FROM schema_version")).scalar()
+        if version != 1:
+            return
+
+        def columns(table: str) -> set[str]:
+            return {column["name"] for column in inspect(connection).get_columns(table)}
+
+        def add_column(table: str, name: str) -> None:
+            if name not in columns(table):
+                connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} JSON"))
+
+        task_columns = columns("tasks")
+        node_columns = columns("task_nodes")
+        if "metadata_json" not in task_columns or "metadata_json" not in node_columns:
+            raise RuntimeError(
+                "Cannot migrate schema 1: expected metadata_json on tasks and task_nodes"
+            )
+
+        for name in ("contract_json", "working_memory_json", "runtime_json", "extensions_json"):
+            add_column("tasks", name)
+        for name in ("contract_json", "runtime_json", "extensions_json"):
+            add_column("task_nodes", name)
+
+        connection.execute(
+            text(
+                "UPDATE tasks SET "
+                "contract_json = COALESCE(contract_json, '{}'), "
+                "working_memory_json = COALESCE(working_memory_json, '{}'), "
+                "runtime_json = COALESCE(runtime_json, '{}'), "
+                "extensions_json = COALESCE(extensions_json, metadata_json, '{}')"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE task_nodes SET "
+                "contract_json = COALESCE(contract_json, '{}'), "
+                "runtime_json = COALESCE(runtime_json, '{}'), "
+                "extensions_json = COALESCE(extensions_json, metadata_json, '{}')"
+            )
+        )
+        connection.execute(text("ALTER TABLE tasks DROP COLUMN metadata_json"))
+        connection.execute(text("ALTER TABLE task_nodes DROP COLUMN metadata_json"))
+        connection.execute(text("DELETE FROM schema_version"))
+        connection.execute(
+            text(
+                "INSERT INTO schema_version(version, applied_at) "
+                "VALUES (5, CURRENT_TIMESTAMP)"
+            )
+        )
 
     @staticmethod
     def _validate_schema(connection) -> None:

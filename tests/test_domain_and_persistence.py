@@ -32,6 +32,8 @@ from assistant.domain.models import (
     Task,
     TaskEvent,
     TaskNode,
+    TaskPriority,
+    TaskRequest,
     TaskStatus,
 )
 from assistant.domain.state import InvalidStateTransition
@@ -64,6 +66,14 @@ def test_graph_resolves_dependencies_and_rejects_cycles():
                 GraphEdge(from_node=second.id, to_node=first.id),
             ],
         )
+
+
+def test_task_priority_labels_default_to_medium_and_normalize_to_scheduler_values():
+    assert TaskRequest(goal="default").priority == 1
+    assert TaskRequest(goal="explicit default", priority=None).priority == 1
+    assert TaskRequest(goal="urgent", priority=TaskPriority.INMEDIATE).priority == 3
+    assert TaskRequest(goal="important", priority="High").priority == 2
+    assert TaskRequest(goal="later", priority="Low").priority == 0
 
 
 def test_graph_allows_success_dependency_for_skipped_branch():
@@ -246,6 +256,82 @@ async def test_database_rejects_legacy_task_columns(tmp_path):
     with pytest.raises(RuntimeError, match="legacy"):
         await database.create_all()
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_database_migrates_schema_one_to_schema_five(tmp_path):
+    path = tmp_path / "schema-one.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE schema_version (
+            version INTEGER NOT NULL,
+            applied_at DATETIME NOT NULL
+        );
+        INSERT INTO schema_version(version, applied_at)
+        VALUES (1, CURRENT_TIMESTAMP);
+        CREATE TABLE tasks (
+            id VARCHAR(36) PRIMARY KEY,
+            parent_task_id VARCHAR(36),
+            root_task_id VARCHAR(36) NOT NULL,
+            source VARCHAR(32) NOT NULL,
+            goal TEXT NOT NULL,
+            description TEXT NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            priority INTEGER NOT NULL,
+            created_at DATETIME NOT NULL,
+            started_at DATETIME,
+            finished_at DATETIME,
+            deadline DATETIME,
+            retry_count INTEGER NOT NULL,
+            max_retries INTEGER NOT NULL,
+            metadata_json JSON NOT NULL,
+            result_summary TEXT,
+            failure_reason TEXT,
+            budget_json JSON NOT NULL,
+            project_id VARCHAR(36)
+        );
+        CREATE TABLE task_nodes (
+            id VARCHAR(36) PRIMARY KEY,
+            task_id VARCHAR(36) NOT NULL,
+            parent_node_id VARCHAR(36),
+            type VARCHAR(32) NOT NULL,
+            description TEXT NOT NULL,
+            status VARCHAR(32) NOT NULL,
+            priority INTEGER NOT NULL,
+            input_data JSON NOT NULL,
+            output_data JSON NOT NULL,
+            retry_count INTEGER NOT NULL,
+            max_retries INTEGER NOT NULL,
+            created_at DATETIME NOT NULL,
+            started_at DATETIME,
+            finished_at DATETIME,
+            error TEXT,
+            metadata_json JSON NOT NULL
+        );
+        INSERT INTO tasks VALUES
+        ('task-1', NULL, 'task-1', 'USER', 'keep me', '', 'QUEUED', 1,
+         CURRENT_TIMESTAMP, NULL, NULL, NULL, 0, 3, '{"legacy": true}', NULL, NULL, '{}', NULL);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    database = Database(f"sqlite:///{path}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        task = await repository.get_task("task-1")
+        assert task is not None
+        assert task.metadata == {"legacy": True}
+    await database.close()
+
+    connection = sqlite3.connect(path)
+    assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 5
+    assert "metadata_json" not in {
+        column[1] for column in connection.execute("PRAGMA table_info(tasks)")
+    }
+    connection.close()
 
 
 @pytest.mark.asyncio

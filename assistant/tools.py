@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
@@ -198,8 +198,22 @@ class ToolRegistry:
         )
 
 
-# Compatibility exports for callers that used the original flat module.
-from .devices.computer.actions import FilesystemTool, GitTool, ProjectTool, ShellTool
+if TYPE_CHECKING:
+    from .devices.computer.actions import FilesystemTool, GitTool, ProjectTool, ShellTool
+
+
+def __getattr__(name: str):
+    """Resolve legacy action exports without importing the action package eagerly."""
+    if name in {"FilesystemTool", "GitTool", "ProjectTool", "ShellTool"}:
+        from .devices.computer.actions import FilesystemTool, GitTool, ProjectTool, ShellTool
+
+        return {
+            "FilesystemTool": FilesystemTool,
+            "GitTool": GitTool,
+            "ProjectTool": ProjectTool,
+            "ShellTool": ShellTool,
+        }[name]
+    raise AttributeError(name)
 
 __all__ = [
     "FilesystemTool",

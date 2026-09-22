@@ -56,4 +56,6 @@ def render(template: str, context: dict[str, Any], output_schema: dict[str, Any]
 def _format(value: Any) -> str:
     if isinstance(value, str):
         return value
-    return json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    # Context objects are already schema-bounded. Compact serialization keeps
+    # prompts readable while avoiding indentation tokens that add no meaning.
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)

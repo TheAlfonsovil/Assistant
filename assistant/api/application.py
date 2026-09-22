@@ -9,8 +9,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from httpx import HTTPError
 
-from .devices.registry import DEVICE_BRANCHES
-from .domain.models import (
+from ..devices.registry import DEVICE_BRANCHES
+from ..domain.models import (
     ChatFastRequest,
     ChatRequest,
     IdleConfigurationRequest,
@@ -21,12 +21,13 @@ from .domain.models import (
     TaskRedefinitionRequest,
     TaskRequest,
     TaskStatus,
+    priority_label,
 )
-from .idle import IdleCycle
-from .llm import AssistantResponse, NodeDecision, PlanProposal
-from .prompts.v1.template import render
-from .runtime import TaskRuntime
-from .startup.bootstrap import AssistantContext, create_context
+from ..idle import IdleCycle
+from ..llm import AssistantResponse, NodeDecision, PlanProposal
+from ..prompts.v1.template import render
+from ..runtime import TaskRuntime
+from ..startup.bootstrap import AssistantContext, create_context
 
 
 def _event_json(event, *, include_prompt: bool = False) -> dict:
@@ -72,6 +73,7 @@ def _event_json(event, *, include_prompt: bool = False) -> dict:
 def _task_json(task) -> dict:
     return {
         **task.model_dump(mode="json"),
+        "priority_label": priority_label(task.priority),
         "final_response": task.runtime.final_response,
     }
 
@@ -114,8 +116,8 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.3.0", lifespan=lifespan)
-dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
+app = FastAPI(title="Assistant Core", version="0.3.1", lifespan=lifespan)
+dashboard_root = Path(__file__).resolve().parents[2] / "dashboard"
 
 
 @app.middleware("http")

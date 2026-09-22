@@ -52,7 +52,7 @@ class PlanNodeProposal(BaseModel):
     type: str = "OPERATION"
     dependencies: list[str] = Field(default_factory=list)
     dependency_types: dict[str, DependencyType] = Field(default_factory=dict)
-    priority: int = 0
+    priority: int = 1
     acceptance: dict[str, Any] = Field(default_factory=dict)
     inputs: list[InputRef] = Field(default_factory=list)
     outputs: list[OutputSpec] = Field(default_factory=list)

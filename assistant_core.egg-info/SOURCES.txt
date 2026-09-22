@@ -38,6 +38,7 @@ assistant/devices/home/__init__.py
 assistant/devices/mobile/__init__.py
 assistant/devices/robot/__init__.py
 assistant/domain/__init__.py
+assistant/domain/contracts.py
 assistant/domain/errors.py
 assistant/domain/graph.py
 assistant/domain/models.py

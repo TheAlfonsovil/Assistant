@@ -216,78 +216,6 @@ async def test_project_edit_rolls_back_when_validation_fails(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_project_scaffold_creates_vue_spring_boot_and_docker_files(tmp_path):
-    result = await build_tool_registry().execute(
-        Operation(
-            tool="project",
-            method="scaffold",
-            args={
-                "root": str(tmp_path),
-                "name": "test_zone",
-                "frontend": {"framework": "vue"},
-                "backend": {"language": "java", "java_version": "25", "framework": "spring-boot"},
-                "containerize": True,
-                "device": "computer",
-                "os": "windows-11",
-            },
-        )
-    )
-
-    assert result.success is True
-    project = tmp_path / "test_zone"
-    assert (project / "frontend" / "package.json").is_file()
-    assert (project / "backend" / "pom.xml").is_file()
-    assert (project / "docker-compose.yml").is_file()
-    assert (project / "run.ps1").is_file()
-    assert result.output["device"] == "computer"
-    assert result.output["os"] == "windows-11"
-    assert result.output["scaffolded"] is True
-
-
-@pytest.mark.asyncio
-async def test_project_scaffold_can_skip_container_files_and_reject_duplicates(tmp_path):
-    registry = build_tool_registry()
-    args = {
-        "root": str(tmp_path),
-        "name": "plain-app",
-        "frontend": {"framework": "vue"},
-        "backend": {"language": "java", "java_version": "25", "framework": "spring-boot"},
-        "containerize": False,
-    }
-    created = await registry.execute(Operation(tool="project", method="scaffold", args=args))
-    duplicate = await registry.execute(Operation(tool="project", method="scaffold", args=args))
-
-    assert created.success is True
-    assert not (tmp_path / "plain-app" / "docker-compose.yml").exists()
-    assert duplicate.success is False
-
-
-@pytest.mark.asyncio
-async def test_project_scaffold_supports_python_fastapi_static_frontend(tmp_path):
-    result = await build_tool_registry().execute(
-        Operation(
-            tool="project",
-            method="scaffold",
-            args={
-                "root": str(tmp_path),
-                "name": "sp500-app",
-                "frontend": {"framework": "static"},
-                "backend": {"language": "python", "framework": "fastapi"},
-                "containerize": True,
-            },
-        )
-    )
-
-    project = tmp_path / "sp500-app"
-    assert result.success is True
-    assert (project / "main.py").is_file()
-    assert (project / "static" / "index.html").is_file()
-    assert (project / "requirements.txt").is_file()
-    assert (project / "Dockerfile").is_file()
-    assert (project / "docker-compose.yml").is_file()
-
-
-@pytest.mark.asyncio
 async def test_project_initialize_supports_stack_neutral_artifact_workspaces(tmp_path):
     result = await build_tool_registry().execute(
         Operation(
@@ -364,11 +292,11 @@ async def test_project_edit_supports_append_and_json_merge_artifacts(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_project_modify_applies_bounded_feature_changes_and_validation(tmp_path):
+async def test_project_edit_applies_bounded_feature_changes_and_validation(tmp_path):
     result = await build_tool_registry().execute(
         Operation(
             tool="project",
-            method="modify",
+            method="edit",
             args={
                 "root": str(tmp_path),
                 "feature": "health endpoint",
@@ -385,19 +313,19 @@ async def test_project_modify_applies_bounded_feature_changes_and_validation(tmp
 
 
 @pytest.mark.asyncio
-async def test_project_modify_rejects_escape_and_reports_failed_validation(tmp_path):
+async def test_project_edit_rejects_escape_and_reports_failed_validation(tmp_path):
     registry = build_tool_registry()
     escaped = await registry.execute(
         Operation(
             tool="project",
-            method="modify",
+            method="edit",
             args={"root": str(tmp_path), "feature": "bad", "changes": [{"path": "../bad", "content": "x"}]},
         )
     )
     failed = await registry.execute(
         Operation(
             tool="project",
-            method="modify",
+            method="edit",
             args={"root": str(tmp_path), "feature": "bad validation", "changes": [{"path": "x", "content": "x"}], "commands": ["exit 1"]},
         )
     )
@@ -602,6 +530,24 @@ async def test_codegraph_builds_system_relationships_and_prompt_context(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_codegraph_query_returns_only_matching_nodes(tmp_path):
+    (tmp_path / "main.py").write_text("def target():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "other.py").write_text("def unrelated():\n    return 2\n", encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="codegraph",
+            method="query",
+            args={"root": str(tmp_path), "query": "target", "kind": "symbol", "limit": 10},
+        )
+    )
+
+    assert result.success is True
+    assert [node["name"] for node in result.output["nodes"]] == ["target"]
+    assert all(node["kind"] == "symbol" for node in result.output["nodes"])
+
+
+@pytest.mark.asyncio
 async def test_planner_context_includes_registered_codegraph_as_bounded_evidence(tmp_path):
     repository = TaskRepository.__new__(TaskRepository)
     project = Project(
@@ -630,7 +576,8 @@ async def test_planner_context_includes_registered_codegraph_as_bounded_evidence
     planner_context = await context.for_planner(Task(goal="añade autenticación", project_id=project.id))
 
     assert planner_context["project"]["codegraph_version"] == 4
-    assert planner_context["project"]["codegraph"]["graph"]["nodes"][0]["id"] == "src/main.js"
+    assert planner_context["project"]["codegraph"]["modules"][0]["id"] == "src/main.js"
+    assert "query_hint" in planner_context["project"]["codegraph"]
 
 
 @pytest.mark.asyncio
@@ -2006,6 +1953,40 @@ async def test_empty_planner_creation_fallback_creates_requested_project(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_empty_planner_generic_project_creation_stays_stack_neutral(tmp_path):
+    class EmptyPlanner(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal()
+
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'generic-creation.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            EmptyPlanner(),
+            build_tool_registry(),
+            projects_root=str(projects_root),
+        )
+        goal = "Crea un nuevo proyecto llamado recipe_archive para organizar recetas familiares"
+        task = await service.create_task(TaskRequest(goal=goal))
+
+        result = await service.run_task(task.id)
+
+        project = projects_root / "recipe_archive"
+        assert result.status is TaskStatus.SUCCEEDED
+        assert (project / "README.md").is_file()
+        assert (project / ".assistant" / "project.json").is_file()
+        assert not (project / "frontend").exists()
+        assert not (project / "backend").exists()
+        manifest = json.loads((project / ".assistant" / "project.json").read_text())
+        assert manifest["objective"] == goal
+        assert not any("scaffold" in node.description.casefold() for node in await service.repository.list_nodes(task.id))
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_empty_planner_non_audit_request_is_not_replaced_with_audit(tmp_path):
     class EmptyPlanner(MockLLMProvider):
         async def plan(self, context):
@@ -3099,8 +3080,8 @@ async def test_project_operations_persist_graph_and_audit_metadata(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_project_scaffold_registers_created_project(tmp_path):
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-scaffold.db'}")
+async def test_project_initialize_registers_created_project(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-initialize.db'}")
     await database.create_all()
     async with database.sessions() as session:
         service = TaskService(
@@ -3115,10 +3096,15 @@ async def test_project_scaffold_registers_created_project(tmp_path):
 
         await service._persist_project_operation_result(
             task,
-            Operation(tool="project", method="scaffold"),
+            Operation(tool="project", method="initialize"),
             {
                 "success": True,
-                "output": {"path": str(project_path), "name": "test_zone"},
+                "output": {
+                    "path": str(project_path),
+                    "name": "test_zone",
+                    "kind": "workspace",
+                    "manifest": {"description": "test objective"},
+                },
             },
         )
 
@@ -3135,12 +3121,10 @@ async def test_project_scaffold_registers_created_project(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_list_projects_recovers_previous_scaffold(tmp_path):
+async def test_list_projects_recovers_previous_workspace(tmp_path):
     project_path = tmp_path / "legacy_zone"
-    (project_path / "frontend").mkdir(parents=True)
-    (project_path / "backend").mkdir()
-    for marker in ("docker-compose.yml", "frontend/package.json", "backend/pom.xml"):
-        (project_path / marker).write_text("{}", encoding="utf-8")
+    (project_path / ".assistant").mkdir(parents=True)
+    (project_path / ".assistant" / "project.json").write_text("{}", encoding="utf-8")
 
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-recovery.db'}")
     await database.create_all()

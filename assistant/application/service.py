@@ -18,15 +18,15 @@ from pydantic import ValidationError
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
-from .context import ContextBuilder
-from .domain.contracts import (
+from ..context import ContextBuilder
+from ..domain.contracts import (
     ArtifactKind,
     ArtifactRef,
     NodeContract,
     OperationHint,
 )
-from .domain.graph import TaskGraph
-from .domain.models import (
+from ..domain.graph import TaskGraph
+from ..domain.models import (
     DependencyType,
     ErrorType,
     GraphEdge,
@@ -42,21 +42,21 @@ from .domain.models import (
     TaskRequest,
     TaskStatus,
 )
-from .infrastructure.orm import IdempotencyRow, LeaseRow
-from .infrastructure.repositories import TaskRepository
-from .llm import (
+from ..infrastructure.orm import IdempotencyRow, LeaseRow
+from ..infrastructure.repositories import TaskRepository
+from ..llm import (
     AssistantResponse,
     LLMProvider,
     NodeDecision,
     PlanNodeProposal,
     PlanProposal,
 )
-from .observability import compact
-from .planning import plan_coverage_warnings, validate_plan_quality
-from .project_analysis import ProjectAnalyzer
-from .scheduler import NodeScheduler
-from .tools import ToolRegistry
-from .verifier import DeterministicVerifier
+from ..observability import compact
+from ..planning import plan_coverage_warnings, validate_plan_quality
+from ..project_analysis import ProjectAnalyzer
+from ..scheduler import NodeScheduler
+from ..tools import ToolRegistry
+from ..verifier import DeterministicVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -265,11 +265,11 @@ class TaskService:
         return await self.repository.get_project(project_id)
 
     async def list_projects(self) -> list[Project]:
-        await self.reconcile_scaffold_projects()
+        await self.reconcile_workspace_projects()
         return await self.repository.list_projects()
 
-    async def reconcile_scaffold_projects(self) -> int:
-        """Recover scaffold projects created before automatic registration existed."""
+    async def reconcile_workspace_projects(self) -> int:
+        """Recover initialized workspaces created before automatic registration."""
         root = Path(self.projects_root).expanduser()
         if not root.is_dir():
             return 0
@@ -280,12 +280,8 @@ class TaskService:
         for candidate in root.iterdir():
             if not candidate.is_dir():
                 continue
-            is_scaffold = all(
-                (candidate / marker).is_file()
-                for marker in ("docker-compose.yml", "frontend/package.json", "backend/pom.xml")
-            )
             is_workspace = (candidate / ".assistant" / "project.json").is_file()
-            if not (is_scaffold or is_workspace):
+            if not is_workspace:
                 continue
             resolved = str(candidate.resolve())
             if resolved.casefold() in known_paths or candidate.name.casefold() in known_names:
@@ -294,8 +290,8 @@ class TaskService:
                 Project(
                     name=candidate.name,
                     path=resolved,
-                    description="Scaffold project recovered from the configured projects root",
-                    project_type="workspace" if is_workspace and not is_scaffold else "code",
+                    description="Workspace recovered from the configured projects root",
+                    project_type="workspace",
                 )
             )
             known_paths.add(resolved.casefold())
@@ -1210,7 +1206,7 @@ class TaskService:
         """Guarantee that project mutations have executable validation evidence."""
         if proposal.answer is not None or not proposal.nodes:
             return proposal
-        mutation_methods = {"create", "scaffold", "modify", "edit"}
+        mutation_methods = {"create", "edit"}
         mutation_nodes = []
         validation_present = False
         project_root = None
@@ -1220,11 +1216,8 @@ class TaskService:
             if method in mutation_methods:
                 mutation_nodes.append(node)
                 args = hint.get("args", {})
-                if isinstance(args, dict):
-                    if method == "scaffold" and args.get("root") and args.get("name"):
-                        project_root = str(Path(args["root"]) / str(args["name"]))
-                    elif args.get("root"):
-                        project_root = str(args["root"])
+                if isinstance(args, dict) and args.get("root"):
+                    project_root = str(args["root"])
             if method == "validate":
                 validation_present = True
         if not mutation_nodes or validation_present:
@@ -1344,46 +1337,6 @@ class TaskService:
                     ],
                 )
             project_name = creation_match.group(1)
-            scaffold_requested = any(
-                term in goal
-                for term in (
-                    "vue", "spring boot", "springboot", "docker", "frontend",
-                    "backend", "python", "fastapi", "flask", "sp500", "s&p",
-                )
-            )
-            if scaffold_requested:
-                python_stack = any(
-                    term in goal for term in ("python", "fastapi", "flask", "sp500", "s&p")
-                )
-                return PlanProposal(
-                    task_id=task.id,
-                    coverage=["scaffold the requested application stack and validate its generated structure"],
-                    nodes=[
-                        PlanNodeProposal(
-                            id="fallback-project-scaffold",
-                            description=f"Crear el scaffold funcional de {project_name} con frontend, backend y contenedores",
-                            type="OPERATION",
-                            acceptance={"fields": {"name": project_name, "scaffolded": True}},
-                            operation_hint=OperationHint(
-                                tool="project",
-                                method="scaffold",
-                                args={
-                                    "name": project_name,
-                                    "frontend": {"framework": "static" if python_stack else "vue"},
-                                    "backend": (
-                                        {"language": "python", "framework": "fastapi"}
-                                        if python_stack
-                                        else {"language": "java", "java_version": "25", "framework": "spring-boot"}
-                                    ),
-                                    "containerize": True,
-                                    "device": "computer",
-                                    "os": "windows-11",
-                                },
-                                timeout=300,
-                            ),
-                        )
-                    ],
-                )
             kind = "workspace"
             if any(term in goal for term in ("libro", "novela", "book", "writing", "manuscrito")):
                 kind = "book"
@@ -1409,7 +1362,7 @@ class TaskService:
                                 "name": project_name,
                                 "kind": kind,
                                 "description": task.goal,
-                                "directories": ["notes", "data", "artifacts"],
+                                "directories": [],
                             },
                             timeout=300,
                         ),
@@ -1738,7 +1691,7 @@ class TaskService:
         if not isinstance(result.get("output"), dict):
             return
         output = result["output"]
-        if operation.tool == "project" and operation.method == "scaffold":
+        if operation.tool == "project" and operation.method == "initialize":
             path = output.get("path")
             name = output.get("name")
             if not isinstance(path, str) or not isinstance(name, str) or not Path(path).is_dir():
@@ -1755,8 +1708,8 @@ class TaskService:
             project = existing or Project(
                 name=name,
                 path=path,
-                description=f"Scaffold generated by task {task.id}",
-                project_type="code",
+                description=str(output.get("manifest", {}).get("description") or f"Project initialized by task {task.id}"),
+                project_type=str(output.get("kind") or "workspace"),
             )
             if existing is None:
                 project = await self.repository.create_project(project)
@@ -1791,7 +1744,7 @@ class TaskService:
         if operation.tool == "project" and operation.method == "audit" and output.get("audit") is not None:
             project.last_audited_at = datetime.now(UTC)
             event_type = "PROJECT_AUDITED"
-        if operation.tool == "project" and operation.method in {"edit", "modify"}:
+        if operation.tool == "project" and operation.method == "edit":
             # Source edits invalidate the persisted structural index. Keeping a
             # stale graph would make the next planner select obsolete files.
             project.codegraph = None
@@ -2699,17 +2652,13 @@ class TaskService:
             project = await self.repository.get_project(task.project_id) if task.project_id else None
             if operation.tool == "project" and operation.method == "create":
                 operation.args.setdefault("root", self.projects_root)
-            elif operation.tool == "project" and operation.method == "scaffold":
-                # scaffold owns the final child path: it creates <root>/<name>.
-                # Never let an LLM-provided root duplicate the project name.
-                operation.args["root"] = self.projects_root
             elif operation.tool == "project" and operation.method == "initialize":
                 operation.args["root"] = self.projects_root
-            elif operation.tool == "project" and operation.method in {"analyze", "read", "audit", "edit", "modify", "build", "system"}:
+            elif operation.tool == "project" and operation.method in {"analyze", "read", "audit", "edit", "build", "system"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
             elif operation.tool == "project" and operation.method == "validate":
                 operation.args["root"] = project.path if project else operation.args.get("root", self.context_builder.workspace_root)
-            elif operation.tool == "codegraph" and operation.method in {"analyze", "audit", "build", "system"}:
+            elif operation.tool == "codegraph" and operation.method in {"analyze", "audit", "build", "system", "query"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
             operation_key = operation.idempotency_key or self._operation_key(
                 task.id, node.id, operation
@@ -2808,17 +2757,6 @@ class TaskService:
                     await self.repository.save_idempotency_result(operation_key, result)
             node.status = NodeStatus.VERIFYING
             task.status = TaskStatus.VERIFYING
-            if (
-                operation.tool == "project"
-                and operation.method == "scaffold"
-                and result.get("success")
-                and isinstance(result.get("output"), dict)
-                and result["output"].get("files")
-                and result["output"].get("path")
-            ):
-                # Older persisted scaffold results predate the explicit
-                # scaffolded marker but already contain durable evidence.
-                result["output"].setdefault("scaffolded", True)
             if not await self.renew_lease(node.id, lease_seconds):
                 await self._fail_node(task, node, "node lease expired before verification")
                 return True

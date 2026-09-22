@@ -10,12 +10,12 @@ The project is organized by responsibility first and by device second:
 startup/   load, LLM readiness, recovery
 devices/   computer, mobile, home, robot
 tools.py   stable action contract and dispatch
-application.py / runtime.py   task graph and scheduler
+application/ / runtime.py   task graph, lifecycle and scheduler
 domain/ + infrastructure/    rules and persistence
 ```
 
 The computer branch is the real branch in V1. Its actions live in
-`assistant/devices/computer/actions.py`; mobile, home and robot are explicit
+`assistant/devices/computer/actions/`; mobile, home and robot are explicit
 mock branches. To add an action, implement `Tool`, define its permissions and
 register it in `register_actions`. To add a device, create its package and add
 one `DeviceBranch` in `assistant/devices/registry.py`. See

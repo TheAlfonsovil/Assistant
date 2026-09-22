@@ -372,12 +372,11 @@ class ProjectTool(Tool):
             "Inspect, read, audit, create, or edit a local project. Read/edit are "
             "bounded to the registered project root."
         ),
-        methods=["analyze", "read", "audit", "validate", "create", "initialize", "scaffold", "modify", "edit"],
+        methods=["analyze", "read", "audit", "validate", "create", "initialize", "edit"],
         evidence={
             "analyze": {"success_fields": ["root", "files_analyzed", "file_count", "languages"]},
             "read": {"success_fields": ["root", "files"]},
             "edit": {"success_fields": ["feature", "files", "deleted", "validation"]},
-            "modify": {"success_fields": ["feature", "files", "validation"]},
             "validate": {"success_fields": ["root", "checks", "validation_status"]},
             "initialize": {"success_fields": ["path", "name", "kind", "manifest", "files"]},
         },
@@ -404,13 +403,11 @@ class ProjectTool(Tool):
                 "type": "string",
                 "description": "Workspace kind, for example book, chemistry, research, automation, data, or app.",
             },
-            "description": {"type": "string"},
+            "description": {
+                "type": "string",
+                "description": "The requested project objective; stored in the manifest and README.",
+            },
             "directories": {"type": "array"},
-            "frontend": {"type": "object", "description": "Frontend stack, for example {framework: 'vue'}."},
-            "backend": {"type": "object", "description": "Backend stack, for example {language: 'java', framework: 'spring-boot'}."},
-            "containerize": {"type": "boolean", "default": True},
-            "device": {"type": "string", "description": "Target device, for example computer."},
-            "os": {"type": "string", "description": "Target operating system, for example windows-11."},
             "feature": {"type": "string", "description": "Feature to add or modify."},
             "changes": {"type": "array", "description": "Files to write, each with path and content."},
             "edit_operations": {
@@ -420,7 +417,7 @@ class ProjectTool(Tool):
             "deletions": {"type": "array", "description": "Relative files to delete, bounded by the project root."},
             "commands": {"type": "array", "description": "Optional validation commands to run after modification."},
         },
-        permissions=["filesystem.read", "filesystem.write", "project.analysis", "project.modify"],
+        permissions=["filesystem.read", "filesystem.write", "project.analysis", "project.edit"],
     )
 
     async def execute(self, method: str, args: dict[str, Any], timeout: float) -> OperationResult:
@@ -448,10 +445,8 @@ class ProjectTool(Tool):
                 return OperationResult(success=False, error=str(error), error_type=ErrorType.TOOL_FAILURE)
         if method == "initialize":
             return await self._initialize(args)
-        if method == "scaffold":
-            return await self._scaffold(args)
-        if method in {"modify", "edit"}:
-            return await self._modify(args, timeout)
+        if method == "edit":
+            return await self._edit(args, timeout)
         if not isinstance(args.get("root"), str):
             return OperationResult(success=False, error="project requires a root directory", error_type=ErrorType.INVALID_ARGUMENT)
         analyzer = ProjectAnalyzer()
@@ -537,6 +532,7 @@ class ProjectTool(Tool):
             "name": name.strip(),
             "kind": kind or "workspace",
             "description": description,
+            "objective": description,
             "created_by": "assistant.project.initialize",
             "artifacts": [item["path"] for item in files],
         }
@@ -618,94 +614,8 @@ class ProjectTool(Tool):
             )
         return OperationResult(success=True, output={"root": str(project_root), "files": contents})
 
-    async def _scaffold(self, args: dict[str, Any]) -> OperationResult:
-        root = args.get("root")
-        name = args.get("name")
-        frontend = args.get("frontend") or {}
-        backend = args.get("backend") or {}
-        if not isinstance(root, str) or not isinstance(name, str) or not name.strip():
-            return OperationResult(success=False, error="project.scaffold requires root and name", error_type=ErrorType.INVALID_ARGUMENT)
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name.strip()):
-            return OperationResult(success=False, error="project name contains unsupported path characters", error_type=ErrorType.INVALID_ARGUMENT)
-        if not isinstance(frontend, dict) or not isinstance(backend, dict):
-            return OperationResult(success=False, error="frontend and backend must be objects", error_type=ErrorType.INVALID_ARGUMENT)
-        project_root = (Path(root).resolve() / name.strip()).resolve()
-        if project_root.parent != Path(root).resolve():
-            return OperationResult(success=False, error="project name must create a direct child of root", error_type=ErrorType.INVALID_ARGUMENT)
-        if project_root.exists():
-            return OperationResult(success=False, error=f"project already exists: {project_root}", error_type=ErrorType.CONFLICT)
-        frontend_framework = str(frontend.get("framework", "")).casefold()
-        backend_framework = str(backend.get("framework", "")).casefold()
-        supported_frontends = {"vue", "vue3", "static", "html", "vanilla", "none"}
-        supported_backends = {"spring-boot", "springboot", "fastapi", "flask", "python"}
-        if frontend_framework not in supported_frontends or backend_framework not in supported_backends:
-            return OperationResult(
-                success=False,
-                error=(
-                    "unsupported scaffold stack; supported frontend frameworks are "
-                    "vue, static/html, or none and backend frameworks are "
-                    "spring-boot, fastapi, or flask"
-                ),
-                error_type=ErrorType.INVALID_ARGUMENT,
-            )
-        backend_language = str(backend.get("language", "")).casefold()
-        if backend_language == "java" and str(backend.get("java_version", "25")) != "25":
-            return OperationResult(
-                success=False,
-                error="project.scaffold currently requires backend.language=java and backend.java_version=25",
-                error_type=ErrorType.INVALID_ARGUMENT,
-            )
-        if backend_language not in {"java", "python"}:
-            return OperationResult(
-                success=False,
-                error="project.scaffold supports backend.language=java or python",
-                error_type=ErrorType.INVALID_ARGUMENT,
-            )
-        containerize = args.get("containerize", True)
-        if not isinstance(containerize, bool):
-            return OperationResult(success=False, error="containerize must be a boolean", error_type=ErrorType.INVALID_ARGUMENT)
-        if backend_language == "python":
-            files = self._python_static_files(name.strip(), frontend, backend, args)
-        else:
-            files = self._vue_spring_files(name.strip(), frontend, backend, args)
-        if not containerize:
-            files = {
-                path: content
-                for path, content in files.items()
-                if path not in {
-                    "docker-compose.yml", "backend/Dockerfile", "frontend/Dockerfile",
-                    "frontend/nginx.conf", "Dockerfile", "run.ps1",
-                }
-            }
-        try:
-            for relative, content in files.items():
-                path = (project_root / relative).resolve()
-                if project_root not in path.parents:
-                    raise ValueError(f"scaffold path escapes project: {relative}")
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
-        except (OSError, ValueError) as error:
-            if project_root.exists():
-                shutil.rmtree(project_root, ignore_errors=True)
-            return OperationResult(success=False, error=str(error), error_type=ErrorType.TOOL_FAILURE)
-        return OperationResult(
-            success=True,
-            output={
-                "path": str(project_root),
-                "name": name.strip(),
-                "frontend": frontend,
-                "backend": backend,
-                "device": args.get("device", "computer"),
-                "os": args.get("os", "windows-11"),
-                "files": sorted(files),
-                "containerized": bool(args.get("containerize", True)),
-                "scaffolded": True,
-            },
-            side_effects=["project.scaffolded"],
-        )
-
     async def _validate(self, args: dict[str, Any], timeout: float) -> OperationResult:
-        """Run safe, stack-aware checks after a project mutation or scaffold."""
+        """Run safe, stack-aware checks after a project mutation."""
         root = Path(args["root"]).resolve()
         if not root.is_dir():
             return OperationResult(
@@ -808,7 +718,7 @@ class ProjectTool(Tool):
             retryable=False,
         )
 
-    async def _modify(self, args: dict[str, Any], timeout: float) -> OperationResult:
+    async def _edit(self, args: dict[str, Any], timeout: float) -> OperationResult:
         root = args.get("root")
         feature = args.get("feature")
         changes = args.get("changes", [])
@@ -917,71 +827,6 @@ class ProjectTool(Tool):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content)
 
-    @staticmethod
-    def _vue_spring_files(name: str, frontend: dict[str, Any], backend: dict[str, Any], args: dict[str, Any]) -> dict[str, str]:
-        java_package = re.sub(r"[^a-z0-9]+", ".", name.casefold()).strip(".") or "app"
-        package_path = java_package.replace(".", "/")
-        artifact_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-") or "app"
-        return {
-            "README.md": f"# {name}\n\nVue frontend and Java 25 Spring Boot backend.\n\nTarget device: {args.get('device', 'computer')}.\nTarget OS: {args.get('os', 'windows-11')}.\n\nRun with `docker compose up --build` or the platform script.\n",
-            "frontend/package.json": json.dumps({"name": f"{name}-frontend", "private": True, "type": "module", "scripts": {"dev": "vite", "build": "vite build", "test": "node -e \"console.log('No frontend tests configured')\""}, "dependencies": {"vue": "^3.5.0"}, "devDependencies": {"@vitejs/plugin-vue": "^5.2.0", "vite": "^6.0.0"}}, indent=2) + "\n",
-            "frontend/index.html": "<div id=\"app\"></div><script type=\"module\" src=\"/src/main.js\"></script>\n",
-            "frontend/src/main.js": "import { createApp } from 'vue';\nimport './style.css';\n\ncreateApp({ template: '<main><h1>Application ready</h1><p>Vue frontend connected to the project scaffold.</p></main>' }).mount('#app');\n",
-            "frontend/src/style.css": "body { font-family: sans-serif; margin: 2rem; }\n",
-            "frontend/vite.config.js": "import { defineConfig } from 'vite';\nimport vue from '@vitejs/plugin-vue';\nexport default defineConfig({ plugins: [vue()], server: { host: '0.0.0.0', port: 5173 } });\n",
-            "backend/pom.xml": f"""<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion><parent><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-parent</artifactId><version>4.0.0</version><relativePath/></parent><groupId>com.example</groupId><artifactId>{artifact_id}</artifactId><version>0.0.1-SNAPSHOT</version><properties><java.version>25</java.version></properties><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency></dependencies><build><plugins><plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId></plugin></plugins></build></project>\n""",
-            f"backend/src/main/java/{package_path}/Application.java": f"package {java_package};\n\nimport org.springframework.boot.SpringApplication;\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n\n@SpringBootApplication\npublic class Application {{ public static void main(String[] args) {{ SpringApplication.run(Application.class, args); }} }}\n",
-            "backend/src/main/resources/application.properties": "server.port=8080\n",
-            f"backend/src/test/java/{package_path}/ApplicationTest.java": f"package {java_package};\n\nimport org.junit.jupiter.api.Test;\nimport static org.junit.jupiter.api.Assertions.assertTrue;\n\nclass ApplicationTest {{ @Test void scaffoldIsHealthy() {{ assertTrue(true); }} }}\n",
-            "docker-compose.yml": "services:\n  backend:\n    build: ./backend\n    expose: ['8080']\n  frontend:\n    build: ./frontend\n    ports: ['8080:80']\n    depends_on: [backend]\n",
-            "backend/Dockerfile": "FROM maven:3.9-eclipse-temurin-25 AS build\nWORKDIR /app\nCOPY pom.xml .\nRUN mvn -q -DskipTests dependency:go-offline\nCOPY src src\nRUN mvn -q package -DskipTests\nFROM eclipse-temurin:25-jre\nCOPY --from=build /app/target/*.jar /app/app.jar\nENTRYPOINT [\"java\", \"-jar\", \"/app/app.jar\"]\n",
-            "frontend/Dockerfile": "FROM node:22-alpine AS build\nWORKDIR /app\nCOPY package*.json ./\nRUN npm install\nCOPY . .\nRUN npm run build\nFROM nginx:alpine\nCOPY --from=build /app/dist /usr/share/nginx/html\nCOPY nginx.conf /etc/nginx/conf.d/default.conf\n",
-            "frontend/nginx.conf": "server { listen 80; root /usr/share/nginx/html; index index.html; location /api/ { proxy_pass http://backend:8080; } location / { try_files $uri $uri/ /index.html; } }\n",
-            "run.ps1": "docker compose up --build\n",
-        }
-
-    @staticmethod
-    def _python_static_files(name: str, frontend: dict[str, Any], backend: dict[str, Any], args: dict[str, Any]) -> dict[str, str]:
-        return {
-            "README.md": f"# {name}\n\nFastAPI backend with a static frontend.\n\nRun locally with `python -m uvicorn main:app --reload` or `docker compose up --build`.\n",
-            "requirements.txt": "fastapi\nuvicorn[standard]\nyfinance\n",
-            "main.py": (
-                "from pathlib import Path\n"
-                "from fastapi import FastAPI\n"
-                "from fastapi.staticfiles import StaticFiles\n"
-                "import yfinance as yf\n\n"
-                "app = FastAPI(title='S&P 500 data')\n"
-                "BASE = Path(__file__).parent\n\n"
-                "@app.get('/api/sp500')\n"
-                "def sp500():\n"
-                "    frame = yf.download('^GSPC', period='1mo', interval='1d', auto_adjust=False, progress=False)\n"
-                "    if frame.empty:\n"
-                "        return []\n"
-                "    frame = frame.reset_index()\n"
-                "    return frame.to_dict(orient='records')\n\n"
-                "app.mount('/', StaticFiles(directory=BASE / 'static', html=True), name='static')\n"
-            ),
-            "static/index.html": (
-                "<!doctype html><html lang='en'><head><meta charset='UTF-8'>"
-                "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-                "<title>S&P 500</title></head><body><main><h1>S&amp;P 500</h1>"
-                "<p id='status'>Loading…</p><pre id='data'></pre></main>"
-                "<script type='module' src='/app.js'></script></body></html>"
-            ),
-            "static/app.js": (
-                "const status = document.querySelector('#status');\n"
-                "const data = document.querySelector('#data');\n"
-                "fetch('/api/sp500').then(response => { if (!response.ok) throw new Error(`HTTP ${response.status}`); return response.json(); })\n"
-                ".then(rows => { status.textContent = `${rows.length} daily records`; data.textContent = JSON.stringify(rows, null, 2); })\n"
-                ".catch(error => { status.textContent = `Unable to load data: ${error.message}`; });\n"
-            ),
-            "tests/test_app.py": "from fastapi.testclient import TestClient\nfrom main import app\n\n\ndef test_app_is_reachable():\n    assert TestClient(app).get('/').status_code == 200\n",
-            "Dockerfile": "FROM python:3.12-slim\nWORKDIR /app\nCOPY requirements.txt .\nRUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\nEXPOSE 8000\nCMD [\"uvicorn\", \"main:app\", \"--host\", \"0.0.0.0\", \"--port\", \"8000\"]\n",
-            "docker-compose.yml": "services:\n  app:\n    build: .\n    ports: ['8000:8000']\n",
-            "run.ps1": "docker compose up --build\n",
-        }
-
-
 class DeploymentTool(ShellTool):
     definition = ToolDefinition(
         name="deployment",
@@ -1017,10 +862,10 @@ class DeploymentTool(ShellTool):
 
 def register_actions(registry) -> None:
     """Register every real computer action in one discoverable place."""
-    from .browser import BrowserTool
-    from .codegraph import CodeGraphTool
-    from .system import SystemInfoTool
-    from .web import WebTool
+    from ..browser import BrowserTool
+    from ..codegraph import CodeGraphTool
+    from ..system import SystemInfoTool
+    from ..web import WebTool
 
     for action in (
         FilesystemTool(),

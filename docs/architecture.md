@@ -37,19 +37,26 @@ assistant/
 |   |-- base.py               DeviceBranch contract
 |   |-- registry.py           branch composition and mock adapters
 |   |-- computer/
-|   |   |-- actions.py        filesystem, shell, git and project actions
+|   |       |-- actions/          filesystem, shell, git and project actions
+|   |       |   |-- __init__.py   stable computer-action exports
+|   |       |   `-- core.py       current action implementations
 |   |   `-- registry.py       computer facade
 |   |-- mobile/               mock branch
 |   |-- home/                 mock branch
 |   `-- robot/                mock branch
 |-- tools.py                 Tool contract, dispatch and normalized results
 |-- capabilities/            user-facing abilities built from tools
-|-- application.py            task lifecycle and graph execution
+|-- application/              task lifecycle and graph execution
+|   |-- __init__.py            stable TaskService export
+|   `-- service.py             task lifecycle, leases and graph execution
 |-- runtime.py                persistent scheduler loop
 |-- domain/                   models and graph rules
 |-- infrastructure/           SQLite and repositories
 |-- llm.py                    provider contract and Ollama/mock providers
-`-- api.py / cli.py           entry points using startup.bootstrap
+`-- api/                      FastAPI entry points using startup.bootstrap
+|   |-- __init__.py            stable app export
+|   `-- application.py         HTTP routes and lifecycle
+`-- cli.py                    command-line entry point
 ```
 
 ## Startup sequence
@@ -73,12 +80,15 @@ The optional `ASSISTANT_USER_*` settings create one structured `user_profile` me
 
 ## Add an action to the computer
 
-1. Implement a `Tool` in `assistant/devices/computer/actions.py` (or split that module into an `actions/` package when it grows).
+1. Implement a `Tool` in `assistant/devices/computer/actions/core.py` (or split
+   the package into focused modules such as `filesystem.py`, `processes.py`,
+   `project.py` and `git.py` as each area grows).
 2. Give it a unique `ToolDefinition` name, methods, argument schema and permissions.
 3. Add an instance to `register_actions`.
 4. Add a focused test for success and invalid arguments.
 
-The planner will receive the definition automatically. Do not modify `application.py` for a normal device action.
+The planner will receive the definition automatically. Do not modify
+`application/service.py` for a normal device action.
 
 The final LLM phase is `FINAL_RESPONSE`, not a mandatory report. It chooses an appropriate response type (`answer`, `report`, `plan`, `clarification`, `blocked` or `action_proposal`) from the original request and execution evidence.
 
