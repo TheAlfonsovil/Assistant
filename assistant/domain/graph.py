@@ -67,7 +67,7 @@ class TaskGraph:
                 and dependency.status is not NodeStatus.SUCCEEDED
                 and not (
                     dependency.status is NodeStatus.CANCELLED
-                    and dependency.metadata.get("branch_skipped") is True
+                    and dependency.runtime.branch_skipped
                 )
             ):
                 return False

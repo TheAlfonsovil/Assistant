@@ -5,12 +5,25 @@ import copy
 import json
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
 import httpx
 from pydantic import BaseModel, Field
 
+from .domain.contracts import (
+    AcceptanceCriterion,
+    BranchConfig,
+    CriterionResult,
+    Diagnostic,
+    FailurePolicy,
+    IdempotencyPolicy,
+    InputRef,
+    OperationHint,
+    OutputSpec,
+    RetryPolicy,
+)
 from .domain.models import DependencyType, Operation, VerificationDecision
 from .prompts.v1.template import render
 
@@ -41,7 +54,18 @@ class PlanNodeProposal(BaseModel):
     dependency_types: dict[str, DependencyType] = Field(default_factory=dict)
     priority: int = 0
     acceptance: dict[str, Any] = Field(default_factory=dict)
+    inputs: list[InputRef] = Field(default_factory=list)
+    outputs: list[OutputSpec] = Field(default_factory=list)
+    acceptance_criteria: list[str | AcceptanceCriterion] = Field(default_factory=list)
+    deadline: datetime | None = None
+    allowed_tools: list[str] = Field(default_factory=list)
+    retry_policy: RetryPolicy = Field(default_factory=RetryPolicy)
+    idempotency_policy: IdempotencyPolicy = Field(default_factory=IdempotencyPolicy)
+    failure_policy: FailurePolicy = Field(default_factory=FailurePolicy)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    operation_hint: OperationHint | None = None
+    branch_config: BranchConfig = Field(default_factory=BranchConfig)
+
 
 
 class PlanProposal(BaseModel):
@@ -55,6 +79,9 @@ class PlanProposal(BaseModel):
 class VerificationResult(BaseModel):
     decision: VerificationDecision
     reason: str = ""
+    criteria_results: list[CriterionResult] = Field(default_factory=list)
+    diagnostics: list[Diagnostic] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
 
 
 class AssistantResponse(BaseModel):

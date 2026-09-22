@@ -13,6 +13,7 @@ from assistant.context import ContextBuilder
 from assistant.devices.computer.browser import BrowserTool
 from assistant.devices.computer.web import WebTool
 from assistant.devices.registry import DEVICE_BRANCHES, build_tool_registry
+from assistant.domain.contracts import BranchConfig, InputRef, OperationHint
 from assistant.domain.graph import TaskGraph
 from assistant.domain.models import (
     DependencyType,
@@ -34,7 +35,6 @@ from assistant.idle import IdleCycle
 from assistant.infrastructure.db import Database
 from assistant.infrastructure.orm import LeaseRow
 from assistant.infrastructure.repositories import TaskRepository
-from assistant.verifier import DeterministicVerifier
 from assistant.llm import (
     ActionProposal,
     AssistantResponse,
@@ -53,6 +53,7 @@ from assistant.recovery import RecoveryManager
 from assistant.runtime import TaskRuntime
 from assistant.startup.manager import StartupManager
 from assistant.tools import MockTool, NotificationTool, Tool, ToolDefinition, ToolRegistry
+from assistant.verifier import DeterministicVerifier
 
 
 def test_device_registry_exposes_four_branches_and_computer_actions():
@@ -517,7 +518,9 @@ async def test_decision_node_evaluates_without_calling_resolver(tmp_path):
                         id="decision",
                         description="evaluate decision",
                         type="DECISION",
-                        metadata={"value": True, "operator": "truthy", "skip_on_true": ["skip"]},
+                        branch_config=BranchConfig(
+                            value=True, operator="truthy", skip_on_true=["skip"]
+                        ),
                     ),
                     PlanNodeProposal(id="skip", description="skipped branch"),
                 ]
@@ -780,13 +783,13 @@ def test_empty_plan_fallback_preserves_codegraph_intent():
         "fallback-project-inspection",
     ]
     assert proposal.nodes[1].dependencies == ["fallback-codegraph-build"]
-    assert proposal.nodes[0].metadata["operation_hint"] == {
-        "tool": "codegraph",
-        "method": "build",
-        "args": {"max_files": 500},
-        "timeout": 300,
-    }
-    assert proposal.nodes[1].metadata["operation_hint"]["method"] == "audit"
+    assert proposal.nodes[0].operation_hint == OperationHint(
+        tool="codegraph",
+        method="build",
+        args={"max_files": 500},
+        timeout=300,
+    )
+    assert proposal.nodes[1].operation_hint.method == "audit"
 
 
 def test_plan_reports_missing_goal_coverage():
@@ -814,15 +817,15 @@ def test_empty_plan_fallback_opens_youtube_in_default_browser():
 
     assert proposal is not None
     assert [node.id for node in proposal.nodes] == ["fallback-browser-open"]
-    assert proposal.nodes[0].metadata["operation_hint"] == {
-        "tool": "browser",
-        "method": "open",
-        "args": {
+    assert proposal.nodes[0].operation_hint == OperationHint(
+        tool="browser",
+        method="open",
+        args={
             "url": "https://www.youtube.com",
             "origin": f"{proposal.task_id}/fallback-browser-open",
         },
-        "timeout": 60,
-    }
+        timeout=60,
+    )
 
 
 def test_browser_intent_replaces_direct_answer_with_open_operation():
@@ -832,7 +835,7 @@ def test_browser_intent_replaces_direct_answer_with_open_operation():
     normalized = TaskService._normalize_browser_intent(task, proposal)
 
     assert normalized.answer is None
-    assert normalized.nodes[0].metadata["operation_hint"]["method"] == "open"
+    assert normalized.nodes[0].operation_hint.method == "open"
 
 
 @pytest.mark.asyncio
@@ -854,8 +857,8 @@ async def test_registered_project_modification_cannot_become_direct_answer(tmp_p
             PlanProposal(answer="¿Qué framework usa el backend?"),
         )
         assert proposal.answer is None
-        assert proposal.nodes[0].metadata["operation_hint"]["method"] == "analyze"
-        assert proposal.nodes[0].metadata["operation_hint"]["args"]["root"] == project.path
+        assert proposal.nodes[0].operation_hint.method == "analyze"
+        assert proposal.nodes[0].operation_hint.args["root"] == project.path
     await database.close()
 
 
@@ -877,13 +880,11 @@ async def test_project_mutation_gets_real_validation_operation(tmp_path):
                     id="edit",
                     description="Edit project files",
                     type="OPERATION",
-                    metadata={
-                        "operation_hint": {
-                            "tool": "project",
-                            "method": "edit",
-                            "args": {"root": str(project_path), "feature": "feature", "changes": []},
-                        }
-                    },
+                    operation_hint=OperationHint(
+                        tool="project",
+                        method="edit",
+                        args={"root": str(project_path), "feature": "feature", "changes": []},
+                    ),
                 ),
                 PlanNodeProposal(
                     id="verify",
@@ -896,7 +897,7 @@ async def test_project_mutation_gets_real_validation_operation(tmp_path):
         normalized = await service._ensure_project_validation(task, proposal)
         validation = normalized.nodes[-1]
         assert validation.type == "OPERATION"
-        assert validation.metadata["operation_hint"]["method"] == "validate"
+        assert validation.operation_hint.method == "validate"
         assert validation.dependencies == ["edit", "verify"]
     await database.close()
 
@@ -904,15 +905,16 @@ async def test_project_mutation_gets_real_validation_operation(tmp_path):
 def test_project_audit_plan_removes_generic_verification_node():
     task = Task(
         goal="audita el proyecto",
-        metadata={"workflow": "project_audit", "run_tests": False},
     )
+    task.runtime.workflow = "project_audit"
+    task.runtime.run_tests = False
     proposal = PlanProposal(
         nodes=[
             PlanNodeProposal(
                 id="audit",
                 description="Auditar el proyecto",
                 type="OPERATION",
-                metadata={"action": "project.audit"},
+                operation_hint=OperationHint(tool="project", method="audit"),
             ),
             PlanNodeProposal(
                 id="verify",
@@ -972,7 +974,7 @@ async def test_create_action_proposal_waits_for_review(tmp_path, monkeypatch):
         assert result.status is TaskStatus.WAITING
         node = (await service.repository.list_nodes(task.id))[-1]
         assert (tmp_path / "data" / "generated_actions" / "inspect.py").exists()
-        assert node.metadata["review_required"] is True
+        assert node.runtime.review_required is True
         approved = await service.approve_action(task.id, node.id, True)
         assert approved.status is TaskStatus.READY
         assert any(
@@ -1002,7 +1004,7 @@ async def test_condition_node_skips_false_branch(tmp_path):
                         id="gate",
                         description="check gate",
                         type="CONDITION",
-                        metadata={"value": False, "skip_on_false": ["skip"]},
+                        branch_config=BranchConfig(value=False, skip_on_false=["skip"]),
                     ),
                     PlanNodeProposal(
                         id="skip",
@@ -1048,7 +1050,7 @@ async def test_condition_skip_preserves_valid_converging_branch(tmp_path):
                         id="gate",
                         description="evaluate gate",
                         type="CONDITION",
-                        metadata={"value": True, "skip_on_true": ["optional"]},
+                        branch_config=BranchConfig(value=True, skip_on_true=["optional"]),
                     ),
                     PlanNodeProposal(
                         id="optional", description="optional branch", dependencies=["gate"]
@@ -1155,7 +1157,7 @@ async def test_complex_graph_combines_condition_and_mixed_dependencies(tmp_path)
                         id="gate",
                         description="evaluate gate",
                         type="CONDITION",
-                        metadata={"value": True, "skip_on_true": ["optional"]},
+                        branch_config=BranchConfig(value=True, skip_on_true=["optional"]),
                     ),
                     PlanNodeProposal(
                         id="work", description="run work", dependencies=["gate"]
@@ -1550,7 +1552,8 @@ async def test_context_builder_separates_planner_and_resolver_context():
 
 
 def test_project_audit_plan_drops_unverifiable_prose_acceptance():
-    task = Task(goal="audita el proyecto", metadata={"workflow": "project_audit"})
+    task = Task(goal="audita el proyecto")
+    task.runtime.workflow = "project_audit"
     proposal = PlanProposal(
         task_id=task.id,
         nodes=[
@@ -1561,13 +1564,11 @@ def test_project_audit_plan_drops_unverifiable_prose_acceptance():
                 acceptance={
                     "contains": ["reporte de auditoría", "hallazgos con evidencia"]
                 },
-                metadata={
-                    "operation_hint": {
-                        "tool": "project",
-                        "method": "audit",
-                        "args": {"run_tests": False},
-                    }
-                },
+                operation_hint=OperationHint(
+                    tool="project",
+                    method="audit",
+                    args={"run_tests": False},
+                ),
             )
         ],
     )
@@ -1777,9 +1778,9 @@ async def test_final_response_consumes_llm_budget_without_changing_terminal_stat
         result = await service.run_task(task.id)
 
         assert result.status is TaskStatus.SUCCEEDED
-        assert result.metadata["llm_calls"] == 3
+        assert result.runtime.llm_calls == 3
         assert provider.responses == 1
-        assert result.metadata["final_response"]
+        assert result.runtime.final_response
     await database.close()
 
 
@@ -1864,7 +1865,7 @@ async def test_llm_timeout_blocks_task_and_generates_final_response(tmp_path):
         persisted = await service.get_task(task.id)
 
         assert result.status is TaskStatus.BLOCKED
-        assert persisted.metadata["final_response"]["summary"]
+        assert persisted.runtime.final_response["summary"]
         assert any(
             event.event_type == "TASK_BUDGET_EXHAUSTED"
             for event in await service.repository.list_events(task.id)
@@ -2115,7 +2116,7 @@ async def test_device_target_skips_project_selection_and_is_available_in_context
 
         assert task.status is TaskStatus.QUEUED
         assert task.project_id is None
-        assert task.metadata["target"] == {"type": "device", "id": "computer"}
+        assert task.runtime.target == {"type": "device", "id": "computer"}
         assert context["execution_target"] == {"type": "device", "id": "computer"}
         assert context["assistant_state"]["projects_root"] == r"C:\Assistant"
     await database.close()
@@ -2141,8 +2142,8 @@ async def test_chat_project_audit_gets_dedicated_workflow_metadata(tmp_path):
             TaskRequest(goal="audita el proyecto", project_id=project.id)
         )
 
-        assert task.metadata["workflow"] == "project_audit"
-        assert task.metadata["run_tests"] is False
+        assert task.runtime.workflow == "project_audit"
+        assert task.runtime.run_tests is False
     await database.close()
 
 
@@ -2175,7 +2176,7 @@ async def test_planner_acceptance_evidence_is_persisted_and_checked(tmp_path):
 
         assert result.status is TaskStatus.SUCCEEDED
         checked = next(node for node in nodes if node.description == "checked operation")
-        assert checked.metadata["acceptance"] == {"contains": ["ok"]}
+        assert checked.contract.acceptance == {"contains": ["ok"]}
         assert "checked operation" in result.result_summary
     await database.close()
 
@@ -2297,7 +2298,7 @@ async def test_direct_answer_persists_exact_user_facing_response(tmp_path):
 
         assert result.status is TaskStatus.SUCCEEDED
         assert result.result_summary == "4"
-        assert result.metadata["final_response"]["summary"] == "4"
+        assert result.runtime.final_response["summary"] == "4"
     await database.close()
 
 
@@ -2384,6 +2385,52 @@ async def test_planner_preserves_typed_dependency_edges(tmp_path):
 
         assert len(edges) == 1
         assert edges[0].dependency_type is DependencyType.ALWAYS
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_required_missing_input_blocks_before_tool_execution(tmp_path):
+    class MissingInputProvider(MockLLMProvider):
+        async def plan(self, context):
+            return PlanProposal(
+                nodes=[
+                    PlanNodeProposal(
+                        id="consumer",
+                        description="consume published report",
+                        inputs=[
+                            InputRef(
+                                kind="report",
+                                ref="artifact:not-published",
+                                required=True,
+                            )
+                        ],
+                    )
+                ]
+            )
+
+        async def decide(self, context):
+            raise AssertionError("resolver must not run when a required input is missing")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'missing-input.db'}")
+    await database.create_all()
+    tool = MockTool("must_not_run")
+    async with database.sessions() as session:
+        service = TaskService(session, MissingInputProvider(), ToolRegistry([tool]))
+        task = await service.create_task(TaskRequest(goal="require a published report"))
+
+        result = await service.run_task(task.id)
+        nodes = await service.repository.list_nodes(task.id)
+        events = await service.repository.list_events(task.id)
+
+        assert result.status is TaskStatus.BLOCKED
+        consumer = next(node for node in nodes if node.description == "consume published report")
+        assert consumer.status is NodeStatus.BLOCKED
+        assert consumer.error == "required inputs are missing"
+        assert consumer.metadata["missing_inputs"][0]["requested"]["ref"] == (
+            "artifact:not-published"
+        )
+        assert tool.calls == 0
+        assert any(event.event_type == "INPUTS_MISSING" for event in events)
     await database.close()
 
 
@@ -2909,7 +2956,8 @@ async def test_redefine_task_resets_graph_and_keeps_identity(tmp_path):
         await service.repository.save_node(child)
         await service.repository.save_edge(task.id, GraphEdge(from_node=root.id, to_node=child.id))
         task.status = TaskStatus.BLOCKED
-        task.metadata = {"llm_calls": 4, "final_response": {"summary": "old"}}
+        task.runtime.llm_calls = 4
+        task.runtime.final_response = {"summary": "old"}
         await service.repository.save_task(task)
 
         redefined = await service.redefine_task(
@@ -2921,6 +2969,8 @@ async def test_redefine_task_resets_graph_and_keeps_identity(tmp_path):
         assert redefined.status is TaskStatus.QUEUED
         assert redefined.goal == "new goal"
         assert redefined.metadata == {"source": "user"}
+        assert redefined.runtime.llm_calls == 0
+        assert redefined.runtime.final_response is None
         assert len(nodes) == 1
         assert nodes[0].id == root.id
         assert nodes[0].status is NodeStatus.READY
@@ -2980,7 +3030,7 @@ async def test_expired_node_deadline_is_terminal(tmp_path):
             description="expired operation",
             status=NodeStatus.READY,
         )
-        node.metadata["deadline"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+        node.contract.deadline = datetime.now(UTC) - timedelta(seconds=1)
         await service.repository.save_node(node)
         task.status = TaskStatus.READY
         await service.repository.save_task(task)
@@ -3008,7 +3058,7 @@ async def test_terminal_task_persists_one_final_response(tmp_path):
         persisted = await service.get_task(task.id)
 
         assert result.status is TaskStatus.SUCCEEDED
-        assert persisted.metadata["final_response"]["summary"]
+        assert persisted.runtime.final_response["summary"]
         assert "final_response_pending" not in persisted.metadata
         assert any(
             event.event_type == "FINAL_RESPONSE_READY"

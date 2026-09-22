@@ -19,6 +19,12 @@ from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .context import ContextBuilder
+from .domain.contracts import (
+    ArtifactKind,
+    ArtifactRef,
+    NodeContract,
+    OperationHint,
+)
 from .domain.graph import TaskGraph
 from .domain.models import (
     DependencyType,
@@ -29,6 +35,7 @@ from .domain.models import (
     Operation,
     OperationResult,
     Project,
+    RecoveryExpansion,
     Task,
     TaskEvent,
     TaskNode,
@@ -91,6 +98,59 @@ class TaskService:
         self.owner = f"{socket.gethostname()}:{id(self)}"
         self._cancellation_events: dict[str, asyncio.Event] = {}
 
+    async def _publish_operation_artifacts(
+        self,
+        task_id: str,
+        node_id: str,
+        artifacts: list[Any],
+        output_specs: list[dict[str, Any]] | None = None,
+    ) -> None:
+        save_artifact = getattr(self.repository, "save_artifact", None)
+        if not save_artifact or not isinstance(artifacts, list):
+            return
+        unnamed_specs = [
+            item for item in (output_specs or [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+        published: list[ArtifactRef] = []
+        for raw in artifacts:
+            if isinstance(raw, ArtifactRef):
+                artifact = raw.model_copy(update={"producer_node_id": node_id})
+            elif isinstance(raw, dict):
+                kind_value = raw.get("kind", ArtifactKind.FILE)
+                try:
+                    kind = ArtifactKind(kind_value)
+                except ValueError:
+                    kind = ArtifactKind.FILE
+                metadata = {
+                    **raw.get("metadata", {}),
+                    **({"name": raw["name"]} if raw.get("name") else {}),
+                }
+                if not raw.get("name") and len(artifacts) == 1 and len(unnamed_specs) == 1:
+                    metadata["name"] = unnamed_specs[0]["name"]
+                artifact = ArtifactRef(
+                    id=raw.get("id", str(uuid4())),
+                    kind=kind,
+                    description=raw.get("description") or raw.get("path") or "tool output",
+                    producer_node_id=node_id,
+                    path=raw.get("path"),
+                    checksum=raw.get("checksum"),
+                    version=raw.get("version", 1),
+                    metadata=metadata,
+                )
+            else:
+                continue
+            await save_artifact(task_id, artifact)
+            published.append(artifact)
+        if published and hasattr(self.repository, "get_task"):
+            task = await self.repository.get_task(task_id)
+            if task is not None:
+                known = {item.id for item in task.working_memory.artifact_refs}
+                task.working_memory.artifact_refs.extend(
+                    artifact for artifact in published if artifact.id not in known
+                )
+                await self.repository.save_task(task)
+
     async def create_task(self, request: TaskRequest) -> Task:
         enabled_projects = await self.repository.list_projects(enabled_only=True)
         target = self._requested_target(request)
@@ -119,14 +179,14 @@ class TaskService:
         task_data["project_id"] = project.id if project else None
         task = Task.model_validate(task_data)
         if target:
-            task.metadata["target"] = target
+            task.runtime.target = target
         if project and self._is_project_audit_request(task.goal):
-            task.metadata.setdefault("workflow", "project_audit")
-            task.metadata.setdefault("run_tests", False)
+            task.runtime.workflow = "project_audit"
+            task.runtime.run_tests = False
         if self.default_execution_time is not None:
             task.budget.max_execution_time = max(1.0, self.default_execution_time)
         if requires_project_selection:
-            task.metadata["clarification"] = {
+            task.runtime.clarification = {
                 "kind": "project_selection",
                 "options": [
                     {"type": "project", "id": item.id, "name": item.name}
@@ -158,7 +218,7 @@ class TaskService:
             task_id=task.id,
             node_id=root.id,
             event_type="NODE_WAITING" if requires_project_selection else "NODE_READY",
-            payload=task.metadata.get("clarification", {}),
+            payload=task.runtime.clarification,
         ))
         return task
 
@@ -298,17 +358,17 @@ class TaskService:
             goal = (
                 f"{goal.rstrip('.')} Report detected tests without executing them."
             )
-        return await self.create_task(
+        task = await self.create_task(
             TaskRequest(
                 goal=goal,
                 project_id=project.id,
-                metadata={
-                    "workflow": "project_audit",
-                    "project_name": project.name,
-                    "run_tests": run_tests,
-                },
+                metadata={"project_name": project.name},
             )
         )
+        task.runtime.workflow = "project_audit"
+        task.runtime.run_tests = run_tests
+        await self.repository.save_task(task)
+        return task
 
     async def get_task(self, task_id: str) -> Task | None:
         return await self.repository.get_task(task_id)
@@ -443,9 +503,9 @@ class TaskService:
         task.result_summary = None
         task.started_at = None
         task.finished_at = None
-        task.metadata.pop("final_response", None)
-        task.metadata.pop("llm_calls", None)
-        task.metadata.pop("tool_calls", None)
+        task.runtime.final_response = None
+        task.runtime.llm_calls = 0
+        task.runtime.tool_calls = 0
         cancellation = self._cancellation_events.pop(task_id, None)
         if cancellation is not None:
             cancellation.clear()
@@ -494,17 +554,17 @@ class TaskService:
             return None
         if task.status is not TaskStatus.WAITING or node.status is not NodeStatus.WAITING:
             raise ValueError("task node is not waiting for action review")
-        if not node.metadata.get("review_required"):
+        if not node.runtime.review_required:
             raise ValueError("node does not contain a reviewable action")
         if approved:
-            node.metadata["review_status"] = "APPROVED"
+            node.runtime.review_status = "APPROVED"
             node.input_data["approved"] = True
             node.status = NodeStatus.READY
             task.status = TaskStatus.READY
             event_type = "ACTION_APPROVED"
             reason = None
         else:
-            node.metadata["review_status"] = "REJECTED"
+            node.runtime.review_status = "REJECTED"
             node.status = NodeStatus.BLOCKED
             node.error = "generated action rejected by user"
             task.status = TaskStatus.BLOCKED
@@ -514,9 +574,10 @@ class TaskService:
             reason = node.error
         if approved:
             task.finished_at = None
-        task.metadata.pop("final_response", None)
+        task.runtime.final_response = None
         await self.repository.save_node(node)
         await self.repository.save_task(task)
+        await self._mark_recovery_expansion_failed(node, node.error)
         await self.repository.save_event(
             TaskEvent(
                 task_id=task_id,
@@ -532,7 +593,7 @@ class TaskService:
         if task and task.status is TaskStatus.BLOCKED:
             raise ValueError("blocked tasks require a solution or redefinition")
         if task and task.status is TaskStatus.WAITING:
-            if task.metadata.get("clarification", {}).get("kind") == "project_selection":
+            if task.runtime.clarification.get("kind") == "project_selection":
                 raise ValueError("project selection is required before resuming")
             waiting_nodes = [
                 node
@@ -556,7 +617,7 @@ class TaskService:
             return None
         if task.status not in {TaskStatus.WAITING, TaskStatus.BLOCKED}:
             raise ValueError("task is not waiting for user input or blocked")
-        clarification = task.metadata.get("clarification", {})
+        clarification = task.runtime.clarification
         selecting_project = clarification.get("kind") == "project_selection"
         selected_target = None
         if selecting_project:
@@ -578,8 +639,8 @@ class TaskService:
                 selected.last_used_at = datetime.now(UTC)
                 await self.repository.update_project(selected)
                 selected_target = {"type": "project", "id": selected.id}
-            task.metadata["target"] = selected_target
-            task.metadata.pop("clarification", None)
+            task.runtime.target = selected_target
+            task.runtime.clarification = {}
         candidate_status = (
             NodeStatus.WAITING if task.status is TaskStatus.WAITING else NodeStatus.BLOCKED
         )
@@ -600,7 +661,7 @@ class TaskService:
         task.status = TaskStatus.QUEUED if selecting_project else TaskStatus.READY
         task.failure_reason = None
         task.finished_at = None
-        task.metadata.pop("final_response", None)
+        task.runtime.final_response = None
         await self.repository.save_node(node)
         await self.repository.save_task(task)
         await self.repository.save_event(
@@ -721,7 +782,7 @@ class TaskService:
         await self.session.commit()
 
     async def _consume_budget(self, task: Task, key: str, limit: int) -> bool:
-        used = int(task.metadata.get(key, 0))
+        used = int(getattr(task.runtime, key, 0))
         if used >= limit:
             task.status = TaskStatus.BLOCKED
             task.failure_reason = f"{key} budget exhausted"
@@ -731,7 +792,7 @@ class TaskService:
             )
             return False
 
-        task.metadata[key] = used + 1
+        setattr(task.runtime, key, used + 1)
         await self.repository.save_task(task)
         return True
 
@@ -755,18 +816,46 @@ class TaskService:
         await self.repository.save_event(
             TaskEvent(task_id=task.id, node_id=node.id, event_type=event_type, payload={"error": reason})
         )
+        await self._mark_recovery_expansion_failed(node, reason)
+
+    async def _mark_recovery_expansion_failed(self, node: TaskNode, reason: str) -> None:
+        expansion_id = node.runtime.recovery_expansion_id
+        if not expansion_id:
+            return
+        expansion = await self.repository.get_recovery_expansion_by_id(str(expansion_id))
+        if expansion is None or expansion.status in {"FAILED", "SUCCEEDED"}:
+            return
+        expansion.status = "FAILED"
+        expansion.reason = reason
+        expansion.finished_at = datetime.now(UTC)
+        await self.repository.save_recovery_expansion(expansion)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=node.task_id,
+                node_id=node.id,
+                event_type="RECOVERY_EXPANSION_FAILED",
+                payload={"expansion_id": expansion.id, "reason": reason},
+            )
+        )
 
     async def _resume_recovery_target(self, task: Task, node: TaskNode) -> None:
-        target_id = node.metadata.get("recovery_target_id")
-        if not node.metadata.get("recovery_finalize") or not target_id:
+        target_id = node.runtime.recovery_target_id
+        if not node.runtime.recovery_finalize or not target_id:
             return
         target = await self.repository.get_node(target_id)
         if target is None or target.status is not NodeStatus.FAILED:
             return
+        expansion_id = node.runtime.recovery_expansion_id
+        if expansion_id:
+            expansion = await self.repository.get_recovery_expansion_by_id(expansion_id)
+            if expansion is not None:
+                expansion.status = "SUCCEEDED"
+                expansion.finished_at = datetime.now(UTC)
+                await self.repository.save_recovery_expansion(expansion)
         target.status = NodeStatus.READY
         target.retry_count += 1
         target.error = None
-        target.metadata.pop("recovery_pending", None)
+        target.runtime.recovery_pending = False
         await self.repository.save_node(target)
         task.status = TaskStatus.READY
         task.failure_reason = None
@@ -780,6 +869,85 @@ class TaskService:
             )
         )
 
+    async def _expand_recovery_graph(
+        self,
+        task: Task,
+        target: TaskNode,
+        subtasks: list[str],
+        attempt: int,
+        branch_name: str | None = None,
+        reason: str = "",
+    ) -> RecoveryExpansion:
+        """Create one idempotent and traceable recovery branch."""
+        existing = await self.repository.get_recovery_expansion(task.id, target.id, attempt)
+        if existing is not None:
+            return existing
+        if not subtasks:
+            raise ValueError("recovery expansion requires at least one subtask")
+        existing_nodes = await self.repository.list_nodes(task.id)
+        if len(existing_nodes) + len(subtasks) > task.budget.max_plan_nodes:
+            raise ValueError(
+                "recovery expansion exceeds the task max_plan_nodes budget"
+            )
+        expansion = RecoveryExpansion(
+            task_id=task.id,
+            target_node_id=target.id,
+            attempt=attempt,
+            strategy="FIX",
+            status="RUNNING",
+            branch_name=branch_name,
+            reason=reason,
+        )
+        await self.repository.save_recovery_expansion(expansion)
+        previous_id = None
+        for index, description in enumerate(subtasks):
+            recovery_node = TaskNode(
+                task_id=task.id,
+                parent_node_id=target.id,
+                type=NodeType.SUBTASK,
+                description=description,
+                status=NodeStatus.READY,
+                metadata={"recovery_branch": branch_name},
+                runtime={
+                    "recovery_target_id": target.id,
+                    "recovery_expansion_id": expansion.id,
+                    "recovery_finalize": index == len(subtasks) - 1,
+                    "recovery_attempt": attempt,
+                },
+            )
+            await self.repository.save_node(recovery_node)
+            expansion.node_ids.append(recovery_node.id)
+            if previous_id:
+                await self.repository.save_edge(
+                    task.id,
+                    GraphEdge(
+                        from_node=previous_id,
+                        to_node=recovery_node.id,
+                        condition=f"recovery_expansion:{expansion.id}",
+                    ),
+                )
+            previous_id = recovery_node.id
+        expansion.final_node_id = previous_id
+        await self.repository.save_recovery_expansion(expansion)
+        target.runtime.recovery_pending = True
+        target.runtime.recovery_expansion_id = expansion.id
+        await self.repository.save_node(target)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                node_id=target.id,
+                event_type="GRAPH_EXPANDED",
+                payload={
+                    "expansion_id": expansion.id,
+                    "strategy": expansion.strategy,
+                    "attempt": attempt,
+                    "created_node_ids": expansion.node_ids,
+                    "final_node_id": expansion.final_node_id,
+                },
+            )
+        )
+        return expansion
+
     async def _attempt_recovery(
         self,
         task: Task,
@@ -788,12 +956,12 @@ class TaskService:
         graph: TaskGraph,
         time_remaining: float | None = None,
     ) -> bool:
-        attempts = int(task.metadata.get("recovery_attempts", 0))
+        attempts = task.runtime.recovery_attempts
         if attempts >= task.budget.max_recovery_attempts:
             return False
         if not await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
             return False
-        task.metadata["recovery_attempts"] = attempts + 1
+        task.runtime.recovery_attempts = attempts + 1
         await self.repository.save_task(task)
         failure = OperationResult(success=False, error=reason, error_type=ErrorType.UNKNOWN)
         context = await self.context_builder.for_replanner(task, node, graph, failure)
@@ -870,38 +1038,40 @@ class TaskService:
             )
             return True
         if decision.action == "FIX" and decision.subtasks:
-            previous_id = None
-            for index, description in enumerate(decision.subtasks):
-                recovery_node = TaskNode(
-                    task_id=task.id,
-                    type=NodeType.SUBTASK,
-                    description=description,
-                    status=NodeStatus.READY,
-                    metadata={
-                        "recovery_target_id": node.id,
-                        "recovery_finalize": index == len(decision.subtasks) - 1,
-                        "recovery_attempt": attempts + 1,
-                        "recovery_branch": branch_name,
-                    },
+            try:
+                expansion = await self._expand_recovery_graph(
+                    task,
+                    node,
+                    decision.subtasks,
+                    attempts + 1,
+                    branch_name=branch_name,
+                    reason=reason,
                 )
-                await self.repository.save_node(recovery_node)
-                if previous_id:
-                    await self.repository.save_edge(
-                        task.id,
-                        GraphEdge(from_node=previous_id, to_node=recovery_node.id),
+            except ValueError as error:
+                node.status = NodeStatus.BLOCKED
+                node.error = str(error)
+                task.status = TaskStatus.BLOCKED
+                task.failure_reason = str(error)
+                await self.repository.save_node(node)
+                await self.repository.save_task(task)
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task.id,
+                        node_id=node.id,
+                        event_type="RECOVERY_EXPANSION_BLOCKED",
+                        payload={"reason": str(error)},
                     )
-                previous_id = recovery_node.id
-            node.metadata["recovery_pending"] = True
+                )
+                return True
             task.status = TaskStatus.READY
             task.failure_reason = reason
-            await self.repository.save_node(node)
             await self.repository.save_task(task)
             await self.repository.save_event(
                 TaskEvent(
                     task_id=task.id,
                     node_id=node.id,
                     event_type="RECOVERY_FIX_BRANCH_CREATED",
-                    payload={"steps": len(decision.subtasks)},
+                    payload={"steps": len(decision.subtasks), "expansion_id": expansion.id},
                 )
             )
             return True
@@ -911,7 +1081,7 @@ class TaskService:
             task.status = TaskStatus.WAITING
             task.failure_reason = node.error
             task.finished_at = None
-            task.metadata["clarification"] = {
+            task.runtime.clarification = {
                 "kind": "recovery_input",
                 "reason": node.error,
                 "node_id": node.id,
@@ -924,7 +1094,7 @@ class TaskService:
                     task_id=task.id,
                     node_id=node.id,
                     event_type="USER_INPUT_REQUIRED",
-                    payload=task.metadata["clarification"],
+                    payload=task.runtime.clarification,
                 )
             )
             return True
@@ -969,14 +1139,14 @@ class TaskService:
     @staticmethod
     def _normalize_project_audit_plan(task: Task, proposal: PlanProposal) -> PlanProposal:
         """Keep the dedicated audit workflow focused on its single audit operation."""
-        if task.metadata.get("workflow") != "project_audit":
+        if task.runtime.workflow != "project_audit":
             return proposal
         audit_nodes = [
             node for node in proposal.nodes
-            if node.metadata.get("action") == "project.audit"
-            or (
-                node.metadata.get("operation_hint", {}).get("tool") == "project"
-                and node.metadata.get("operation_hint", {}).get("method") == "audit"
+            if (
+                node.operation_hint is not None
+                and node.operation_hint.tool == "project"
+                and node.operation_hint.method == "audit"
             )
             or "auditar el proyecto" in node.description.casefold()
             or "audit the project" in node.description.casefold()
@@ -998,7 +1168,7 @@ class TaskService:
         fallback = TaskService._fallback_plan(task)
         if fallback is None or not fallback.nodes:
             return proposal
-        if fallback.nodes[0].metadata.get("operation_hint", {}).get("tool") != "browser":
+        if fallback.nodes[0].operation_hint is None or fallback.nodes[0].operation_hint.tool != "browser":
             return proposal
         return fallback
 
@@ -1026,14 +1196,12 @@ class TaskService:
                     description=f"Inspeccionar la estructura del proyecto {project.name} para preparar el cambio solicitado",
                     type="OPERATION",
                     acceptance={"fields": {"root": project.path}},
-                    metadata={
-                        "operation_hint": {
-                            "tool": "project",
-                            "method": "analyze",
-                            "args": {"root": project.path, "max_files": 500},
-                            "timeout": 120,
-                        }
-                    },
+                    operation_hint=OperationHint(
+                        tool="project",
+                        method="analyze",
+                        args={"root": project.path, "max_files": 500},
+                        timeout=120,
+                    ),
                 )
             ],
         )
@@ -1047,12 +1215,8 @@ class TaskService:
         validation_present = False
         project_root = None
         for node in proposal.nodes:
-            hint = node.metadata.get("operation_hint", {})
-            method = hint.get("method") if isinstance(hint, dict) else None
-            if not method:
-                action = node.metadata.get("action")
-                if isinstance(action, str) and action.startswith("project."):
-                    method = action.split(".", 1)[1]
+            hint = node.operation_hint.model_dump(mode="python") if node.operation_hint else {}
+            method = hint.get("method")
             if method in mutation_methods:
                 mutation_nodes.append(node)
                 args = hint.get("args", {})
@@ -1084,21 +1248,19 @@ class TaskService:
                     "validation_status": "PASS",
                 }
             },
-            metadata={
-                "operation_hint": {
-                    "tool": "project",
-                    "method": "validate",
-                    "args": {"root": project_root},
-                    "timeout": 300,
-                }
-            },
+            operation_hint=OperationHint(
+                tool="project",
+                method="validate",
+                args={"root": project_root},
+                timeout=300,
+            ),
         )
         structural_verify = next(
             (
                 node
                 for node in proposal.nodes
                 if node.type == "VERIFY"
-                and not isinstance(node.metadata.get("operation_hint"), dict)
+                and node.operation_hint is None
             ),
             None,
         )
@@ -1109,7 +1271,7 @@ class TaskService:
                     "type": validation.type,
                     "dependencies": validation.dependencies,
                     "acceptance": validation.acceptance,
-                    "metadata": validation.metadata,
+                    "operation_hint": validation.operation_hint,
                 }
             )
             return proposal.model_copy(
@@ -1142,17 +1304,15 @@ class TaskService:
                         id="fallback-browser-open",
                         description=f"Abrir {browser_url} en el navegador predeterminado",
                         type="OPERATION",
-                        metadata={
-                            "operation_hint": {
-                                "tool": "browser",
-                                "method": "open",
-                                "args": {
-                                    "url": browser_url,
-                                    "origin": f"{task.id}/fallback-browser-open",
-                                },
-                                "timeout": 60,
-                            }
-                        },
+                        operation_hint=OperationHint(
+                            tool="browser",
+                            method="open",
+                            args={
+                                "url": browser_url,
+                                "origin": f"{task.id}/fallback-browser-open",
+                            },
+                            timeout=60,
+                        ),
                     )
                 ],
             )
@@ -1204,25 +1364,23 @@ class TaskService:
                             description=f"Crear el scaffold funcional de {project_name} con frontend, backend y contenedores",
                             type="OPERATION",
                             acceptance={"fields": {"name": project_name, "scaffolded": True}},
-                            metadata={
-                                "operation_hint": {
-                                    "tool": "project",
-                                    "method": "scaffold",
-                                    "args": {
-                                        "name": project_name,
-                                        "frontend": {"framework": "static" if python_stack else "vue"},
-                                        "backend": (
-                                            {"language": "python", "framework": "fastapi"}
-                                            if python_stack
-                                            else {"language": "java", "java_version": "25", "framework": "spring-boot"}
-                                        ),
-                                        "containerize": True,
-                                        "device": "computer",
-                                        "os": "windows-11",
-                                    },
-                                    "timeout": 300,
-                                }
-                            },
+                            operation_hint=OperationHint(
+                                tool="project",
+                                method="scaffold",
+                                args={
+                                    "name": project_name,
+                                    "frontend": {"framework": "static" if python_stack else "vue"},
+                                    "backend": (
+                                        {"language": "python", "framework": "fastapi"}
+                                        if python_stack
+                                        else {"language": "java", "java_version": "25", "framework": "spring-boot"}
+                                    ),
+                                    "containerize": True,
+                                    "device": "computer",
+                                    "os": "windows-11",
+                                },
+                                timeout=300,
+                            ),
                         )
                     ],
                 )
@@ -1244,19 +1402,17 @@ class TaskService:
                         description=f"Inicializar el workspace {project_name} como proyecto de tipo {kind}",
                         type="OPERATION",
                         acceptance={"fields": {"name": project_name, "kind": kind}},
-                        metadata={
-                            "operation_hint": {
-                                "tool": "project",
-                                "method": "initialize",
-                                "args": {
-                                    "name": project_name,
-                                    "kind": kind,
-                                    "description": task.goal,
-                                    "directories": ["notes", "data", "artifacts"],
-                                },
-                                "timeout": 300,
-                            }
-                        },
+                        operation_hint=OperationHint(
+                            tool="project",
+                            method="initialize",
+                            args={
+                                "name": project_name,
+                                "kind": kind,
+                                "description": task.goal,
+                                "directories": ["notes", "data", "artifacts"],
+                            },
+                            timeout=300,
+                        ),
                     )
                 ],
             )
@@ -1299,14 +1455,12 @@ class TaskService:
                     id="fallback-codegraph-build",
                     description="Actualizar el codegraph del proyecto y conservar sus relaciones estructurales",
                     type="OPERATION",
-                    metadata={
-                        "operation_hint": {
-                            "tool": "codegraph",
-                            "method": "build",
-                            "args": {"max_files": 500},
-                            "timeout": 300,
-                        }
-                    },
+                    operation_hint=OperationHint(
+                        tool="codegraph",
+                        method="build",
+                        args={"max_files": 500},
+                        timeout=300,
+                    ),
                 )
             )
         nodes.append(
@@ -1317,14 +1471,12 @@ class TaskService:
                 ),
                 type="OPERATION",
                 dependencies=["fallback-codegraph-build"] if wants_graph else [],
-                metadata={
-                    "operation_hint": {
-                        "tool": "project",
-                        "method": "audit",
-                        "args": {"max_files": 500, "run_tests": tests_requested},
-                        "timeout": 300,
-                    }
-                },
+                operation_hint=OperationHint(
+                    tool="project",
+                    method="audit",
+                    args={"max_files": 500, "run_tests": tests_requested},
+                    timeout=300,
+                ),
             )
         )
         return PlanProposal(
@@ -1340,7 +1492,7 @@ class TaskService:
         root_node.status = NodeStatus.SUCCEEDED
         root_node.output_data = {"answer": answer}
         await self.repository.save_node(root_node)
-        task.metadata["final_response"] = AssistantResponse(
+        task.runtime.final_response = AssistantResponse(
             response_type="answer",
             title="Respuesta",
             summary=answer,
@@ -1378,13 +1530,13 @@ class TaskService:
             TaskStatus.BLOCKED,
             TaskStatus.CANCELLED,
         } or (
-            task.metadata.get("final_response") is not None
-            and not task.metadata.get("final_response_pending")
+            task.runtime.final_response is not None
+            and not task.runtime.final_response_pending
         ):
             return
         final_status = task.status
-        task.metadata["_final_status"] = final_status.value
-        task.metadata["_final_finished_at"] = task.finished_at.isoformat() if task.finished_at else None
+        task.runtime.final_status = final_status.value
+        task.runtime.final_finished_at = task.finished_at
         task.status = TaskStatus.FINALIZING
         task.finished_at = None
         await self.repository.save_task(task)
@@ -1393,7 +1545,7 @@ class TaskService:
             await self._save_fallback_response(task, "final response provider unavailable")
             await self._restore_final_status(task)
             return
-        used_llm_calls = int(task.metadata.get("llm_calls", 0))
+        used_llm_calls = task.runtime.llm_calls
         if used_llm_calls >= task.budget.max_llm_calls:
             await self.repository.save_event(
                 TaskEvent(
@@ -1405,9 +1557,9 @@ class TaskService:
             await self._save_fallback_response(task, "final response budget exhausted")
             await self._restore_final_status(task)
             return
-        task.metadata["llm_calls"] = used_llm_calls + 1
+        task.runtime.llm_calls = used_llm_calls + 1
         nodes = await self.repository.list_nodes(task.id)
-        task.metadata["final_response"] = AssistantResponse(
+        task.runtime.final_response = AssistantResponse(
             response_type="report",
             title="Resultado de la tarea",
             summary=task.result_summary or task.failure_reason or "La tarea terminó; el informe LLM está en curso.",
@@ -1419,7 +1571,7 @@ class TaskService:
             limitations=["El informe final del LLM todavía está generándose."],
             confidence="low",
         ).model_dump(mode="json")
-        task.metadata["final_response_pending"] = True
+        task.runtime.final_response_pending = True
         await self.repository.save_task(task)
         await self.repository.save_event(
             TaskEvent(
@@ -1463,10 +1615,10 @@ class TaskService:
                     max(1.0, task.budget.max_execution_time),
                 ),
             )
-            task.metadata["final_response"] = response.model_dump(mode="json")
-            task.metadata.pop("final_response_pending", None)
+            task.runtime.final_response = response.model_dump(mode="json")
+            task.runtime.final_response_pending = False
             if task.result_summary:
-                task.metadata["final_response"]["summary"] = task.result_summary
+                task.runtime.final_response["summary"] = task.result_summary
             else:
                 task.result_summary = response.summary
             await self.repository.save_task(task)
@@ -1515,18 +1667,26 @@ class TaskService:
             await self._restore_final_status(task)
 
     async def _restore_final_status(self, task: Task) -> None:
-        status = task.metadata.pop("_final_status", None)
-        finished_at = task.metadata.pop("_final_finished_at", None)
+        status = task.runtime.final_status
+        finished_at = task.runtime.final_finished_at
+        task.runtime.final_status = None
+        task.runtime.final_finished_at = None
         if status is None:
             return
         task.status = TaskStatus(status)
-        task.finished_at = datetime.fromisoformat(finished_at) if finished_at else datetime.now(UTC)
+        task.finished_at = (
+            finished_at
+            if isinstance(finished_at, datetime)
+            else datetime.fromisoformat(finished_at)
+            if finished_at
+            else datetime.now(UTC)
+        )
         await self.repository.save_task(task)
 
     async def _save_fallback_response(self, task: Task, reason: str) -> None:
-        if task.metadata.get("final_response") is not None and not task.metadata.get("final_response_pending"):
+        if task.runtime.final_response is not None and not task.runtime.final_response_pending:
             return
-        task.metadata.pop("final_response_pending", None)
+        task.runtime.final_response_pending = False
         nodes = await self.repository.list_nodes(task.id)
         evidence = [
             f"{node.description}: {node.status.value}"
@@ -1534,8 +1694,8 @@ class TaskService:
             if node.status in {NodeStatus.SUCCEEDED, NodeStatus.FAILED, NodeStatus.BLOCKED}
         ]
         summary = task.result_summary or task.failure_reason or "Task finished without a generated report"
-        task.metadata["final_response"] = AssistantResponse(
-            response_type="blocked" if task.metadata.get("_final_status") == TaskStatus.BLOCKED.value or task.status is TaskStatus.BLOCKED else "report",
+        task.runtime.final_response = AssistantResponse(
+            response_type="blocked" if task.runtime.final_status == TaskStatus.BLOCKED.value or task.status is TaskStatus.BLOCKED else "report",
             title="Task result",
             summary=summary,
             evidence=evidence[:20],
@@ -1601,7 +1761,7 @@ class TaskService:
             if existing is None:
                 project = await self.repository.create_project(project)
             task.project_id = project.id
-            task.metadata["created_project"] = {
+            task.runtime.created_project = {
                 "project_id": project.id,
                 "name": project.name,
                 "path": project.path,
@@ -1713,11 +1873,14 @@ class TaskService:
                     task_id=task.id,
                     node_id=node.id,
                     event_type="DECISION_EVALUATED" if node.type is NodeType.DECISION else "CONDITION_EVALUATED",
-                    payload={"result": result, "operator": node.metadata.get("operator", "truthy")},
+                    payload={
+                        "result": result,
+                        "operator": node.runtime.branch_config.get("operator", "truthy"),
+                    },
                 )
             )
             branch_key = "skip_on_true" if result else "skip_on_false"
-            for target_id in node.metadata.get(branch_key, []):
+            for target_id in node.runtime.branch_config.get(branch_key, []):
                 await self._cancel_branch(task, graph, target_id, node.id)
             task.status = TaskStatus.READY
             await self.repository.save_task(task)
@@ -1790,15 +1953,15 @@ class TaskService:
         return current
 
     def _evaluate_condition(self, node: TaskNode, graph: TaskGraph) -> bool:
-        metadata = node.metadata
-        if isinstance(metadata.get("value"), bool):
-            left = metadata["value"]
+        config = node.runtime.branch_config
+        if isinstance(config.get("value"), bool):
+            left = config["value"]
         else:
-            source = graph.nodes.get(metadata.get("source_node_id"))
+            source = graph.nodes.get(config.get("source_node_id"))
             container = source.output_data if source else node.input_data
-            left = self._read_path(container, metadata.get("field"))
-        operator = metadata.get("operator", "truthy")
-        right = metadata.get("right")
+            left = self._read_path(container, config.get("field"))
+        operator = config.get("operator", "truthy")
+        right = config.get("right")
         if operator == "truthy":
             return bool(left)
         if operator == "falsy":
@@ -1839,7 +2002,7 @@ class TaskService:
             if current.status in {NodeStatus.CREATED, NodeStatus.READY, NodeStatus.WAITING}:
                 current.status = NodeStatus.CANCELLED
                 current.error = "branch skipped by condition"
-                current.metadata["branch_skipped"] = True
+                current.runtime.branch_skipped = True
                 await self.repository.save_node(current)
                 await self.repository.save_event(
                     TaskEvent(
@@ -2075,19 +2238,81 @@ class TaskService:
                         status=NodeStatus.READY,
                         priority=proposed.priority,
                         metadata={
-                            **proposed.metadata,
-                            **({"acceptance": proposed.acceptance} if proposed.acceptance else {}),
+                            "logical_id": proposed.id,
+                            **{
+                                key: value
+                                for key, value in proposed.metadata.items()
+                                if key not in {
+                                    "logical_id",
+                                    "acceptance",
+                                    "inputs",
+                                    "outputs",
+                                    "acceptance_criteria",
+                                    "allowed_tools",
+                                    "retry_policy",
+                                    "idempotency_policy",
+                                    "failure_policy",
+                                    "deadline",
+                                    "next_retry_at",
+                                    "review_required",
+                                    "review_status",
+                                    "recovery_pending",
+                                    "recovery_expansion_id",
+                                    "recovery_target_id",
+                                    "recovery_finalize",
+                                    "recovery_attempt",
+                                    "branch_skipped",
+                                }
+                            },
                         },
-                        max_retries=task.budget.max_retries,
+                        contract=NodeContract(
+                            logical_id=proposed.id,
+                            acceptance=proposed.acceptance,
+                            inputs=proposed.inputs,
+                            outputs=proposed.outputs,
+                            acceptance_criteria=[
+                                item
+                                if hasattr(item, "model_dump")
+                                else {
+                                    "id": f"criterion-{index}",
+                                    "description": item,
+                                    "required": True,
+                                }
+                                for index, item in enumerate(
+                                    proposed.acceptance_criteria, start=1
+                                )
+                            ],
+                            allowed_tools=proposed.allowed_tools,
+                            retry_policy=proposed.retry_policy,
+                            idempotency_policy=proposed.idempotency_policy,
+                            failure_policy=proposed.failure_policy,
+                            deadline=proposed.deadline,
+                        ),
+                        max_retries=min(
+                            task.budget.max_retries,
+                            proposed.retry_policy.max_retries,
+                        ),
                     )
                     for proposed in proposal.nodes
                 ]
                 for proposed, planned in zip(proposal.nodes, planned_models):
+                    if proposed.operation_hint is not None:
+                        planned.runtime.operation_hint = proposed.operation_hint.model_dump(
+                            mode="json", exclude_none=True
+                        )
+                    planned.runtime.branch_config.update(
+                        {
+                            "operator": proposed.branch_config.operator,
+                            "value": proposed.branch_config.value,
+                            "source_node_id": proposed.branch_config.source_node_id,
+                        }
+                    )
                     for key in ("skip_on_false", "skip_on_true"):
-                        if key in proposed.metadata:
-                            planned.metadata[key] = [
+                        targets = getattr(proposed.branch_config, key)
+                        if targets:
+                            planned.runtime.branch_config[key] = [
                                 node_ids.get(target, target)
-                                for target in proposed.metadata[key]
+                                for target in targets
                             ]
                 planned_edges = []
                 for proposed in proposal.nodes:
@@ -2166,11 +2391,11 @@ class TaskService:
             now = datetime.now(UTC)
             expired = []
             for candidate in ready:
-                deadline = candidate.metadata.get("deadline")
+                deadline = candidate.contract.deadline
                 if not deadline:
                     continue
                 try:
-                    deadline_at = datetime.fromisoformat(deadline)
+                    deadline_at = deadline
                     if deadline_at.tzinfo is None:
                         deadline_at = deadline_at.replace(tzinfo=UTC)
                 except (TypeError, ValueError):
@@ -2276,6 +2501,28 @@ class TaskService:
             if await self._handle_structural_node(task, node, graph):
                 return True
             context = await self.context_builder.for_resolver(task, node, graph)
+            missing_inputs = await self.context_builder.missing_required_inputs(
+                task, node, graph
+            )
+            if missing_inputs:
+                reason = "required inputs are missing"
+                node.status = NodeStatus.BLOCKED
+                node.error = reason
+                node.metadata["missing_inputs"] = missing_inputs
+                task.status = TaskStatus.BLOCKED
+                task.failure_reason = reason
+                task.finished_at = datetime.now(UTC)
+                await self.repository.save_node(node)
+                await self.repository.save_task(task)
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task_id,
+                        node_id=node.id,
+                        event_type="INPUTS_MISSING",
+                        payload={"inputs": missing_inputs, "reason": reason},
+                    )
+                )
+                return True
             try:
                 if not await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
                     await self._block_node_for_budget(task, node, "llm_calls")
@@ -2400,7 +2647,7 @@ class TaskService:
                     "artifact": str(artifact_path),
                     "review_required": True,
                 }
-                node.metadata["review_required"] = True
+                node.runtime.review_required = True
                 task.status = TaskStatus.WAITING
                 await self.repository.save_node(node)
                 await self.repository.save_task(task)
@@ -2421,6 +2668,7 @@ class TaskService:
                 task.finished_at = datetime.now(UTC)
                 await self.repository.save_node(node)
                 await self.repository.save_task(task)
+                await self._mark_recovery_expansion_failed(node, node.error)
                 await self.repository.save_event(
                     TaskEvent(
                         task_id=task_id,
@@ -2431,21 +2679,21 @@ class TaskService:
                 )
                 return True
             operation = decision.operation
-            operation_hint = node.metadata.get("operation_hint")
-            if isinstance(operation_hint, dict):
+            operation_hint = node.runtime.operation_hint
+            if operation_hint:
                 operation = Operation.model_validate(operation_hint)
             if operation.tool == "project" and operation.method == "audit":
                 # project.audit returns the audit report itself. Its structured
                 # payload is the acceptance evidence; prose contains checks
                 # from older planner prompts are not verifiable.
-                node.metadata.pop("acceptance", None)
+                node.contract.acceptance = {}
                 await self.repository.save_node(node)
             tool_definition = self.tools.definition(operation.tool)
             if tool_definition is not None:
                 await self.renew_lease(
                     node.id, seconds=max(300, int(operation.timeout) + 60)
                 )
-            acceptance = node.metadata.get("acceptance")
+            acceptance = node.contract.acceptance
             if acceptance:
                 operation.metadata.setdefault("expected", acceptance)
             project = await self.repository.get_project(task.project_id) if task.project_id else None
@@ -2508,6 +2756,12 @@ class TaskService:
                 if cancellation.is_set():
                     node.status = NodeStatus.CANCELLED
                     node.output_data = operation_result.model_dump(mode="json")
+                    await self._publish_operation_artifacts(
+                        task.id,
+                        node.id,
+                        operation_result.artifacts,
+                        [item.model_dump(mode="json") for item in node.contract.outputs],
+                    )
                     task.status = TaskStatus.CANCELLED
                     task.failure_reason = "cancelled by user"
                     task.finished_at = datetime.now(UTC)
@@ -2527,6 +2781,12 @@ class TaskService:
                         "non-idempotent operation requires an explicit idempotency key"
                     )
                 await self._persist_project_operation_result(task, operation, result)
+                await self._publish_operation_artifacts(
+                    task.id,
+                    node.id,
+                    result.get("artifacts", []),
+                    [item.model_dump(mode="json") for item in node.contract.outputs],
+                )
                 await self.repository.save_event(
                     TaskEvent(
                         task_id=task_id,
@@ -2568,9 +2828,18 @@ class TaskService:
                 TaskEvent(task_id=task_id, node_id=node.id, event_type="NODE_VERIFYING")
             )
             verification_result = OperationResult.model_validate(result)
-            acceptance = node.metadata.get("acceptance")
+            acceptance = node.contract.acceptance
             if acceptance:
                 verification_result.metadata["expected"] = acceptance
+            acceptance_criteria = [
+                item.model_dump(mode="json")
+                for item in node.contract.acceptance_criteria
+            ]
+            if acceptance_criteria:
+                verification_result.metadata["acceptance_criteria"] = acceptance_criteria
+            missing_outputs = await self.context_builder.missing_required_outputs(task, node)
+            if missing_outputs:
+                verification_result.metadata["missing_required_outputs"] = missing_outputs
             if tool_definition is not None:
                 evidence = tool_definition.evidence.get(operation.method, {})
                 if evidence:
@@ -2590,7 +2859,19 @@ class TaskService:
                     task_id=task_id,
                     node_id=node.id,
                     event_type="NODE_VERIFIED",
-                    payload={"decision": verification.decision.value, "reason": verification.reason},
+                    payload={
+                        "decision": verification.decision.value,
+                        "reason": verification.reason,
+                        "criteria_results": [
+                            item.model_dump(mode="json")
+                            for item in verification.criteria_results
+                        ],
+                        "diagnostics": [
+                            item.model_dump(mode="json")
+                            for item in verification.diagnostics
+                        ],
+                        "missing_evidence": verification.missing_evidence,
+                    },
                 )
             )
             if verification.decision.value == "SUCCESS":
@@ -2603,14 +2884,16 @@ class TaskService:
                 await self.repository.save_event(
                     TaskEvent(task_id=task_id, node_id=node.id, event_type="NODE_COMPLETED", payload={"status": node.status})
                 )
-            elif verification.decision.value == "RETRY" and node.retry_count < node.max_retries:
+            elif (
+                verification.decision.value == "RETRY"
+                and self.scheduler.retry_allowed(node, verification_result)
+                and node.retry_count < node.max_retries
+            ):
                 node.retry_count += 1
                 node.status = NodeStatus.READY
                 node.error = result.get("error")
-                delay = min(300, 2 ** node.retry_count)
-                node.metadata["next_retry_at"] = (
-                    datetime.now(UTC) + timedelta(seconds=delay)
-                ).isoformat()
+                delay = self.scheduler.retry_delay(node)
+                node.runtime.next_retry_at = datetime.now(UTC) + timedelta(seconds=delay)
                 await self.repository.save_node(node)
                 task.status = TaskStatus.READY
                 await self.repository.save_task(task)
@@ -2623,7 +2906,11 @@ class TaskService:
                     )
                 )
             elif verification.decision.value == "RETRY":
-                reason = result.get("error") or "retry limit exhausted"
+                reason = result.get("error") or (
+                    "retry policy does not allow this failure"
+                    if not self.scheduler.retry_allowed(node, verification_result)
+                    else "retry limit exhausted"
+                )
                 await self._fail_node(task, node, reason)
                 await self._attempt_recovery(task, node, reason, graph, time_remaining)
             elif verification.decision.value == "WAIT_USER":
@@ -2744,33 +3031,30 @@ class TaskService:
             task.finished_at = None
             await self.repository.save_node(root)
         elif decision.action == "FIX" and decision.subtasks:
-            previous_id = None
-            for index, description in enumerate(decision.subtasks):
-                recovery_node = TaskNode(
-                    task_id=task.id,
-                    type=NodeType.SUBTASK,
-                    description=description,
-                    status=NodeStatus.READY,
-                    metadata={
-                        "recovery_target_id": node.id,
-                        "recovery_finalize": index == len(decision.subtasks) - 1,
-                    },
+            attempt = node.runtime.recovery_attempt + 1
+            try:
+                await self._expand_recovery_graph(
+                    task,
+                    node,
+                    decision.subtasks,
+                    attempt,
+                    branch_name=f"assistant/recovery/{task.id[:8]}-{attempt}",
+                    reason=decision.reason or "",
                 )
-                await self.repository.save_node(recovery_node)
-                if previous_id:
-                    await self.repository.save_edge(
-                        task.id, GraphEdge(from_node=previous_id, to_node=recovery_node.id)
-                    )
-                previous_id = recovery_node.id
-            node.metadata["recovery_pending"] = True
-            task.status = TaskStatus.READY
+            except ValueError as error:
+                node.status = NodeStatus.BLOCKED
+                node.error = str(error)
+                task.status = TaskStatus.BLOCKED
+                task.failure_reason = str(error)
+            else:
+                task.status = TaskStatus.READY
         elif decision.action == "BLOCK" and decision.user_input_required:
             node.status = NodeStatus.WAITING
             node.error = decision.reason or "additional user information is required"
             task.status = TaskStatus.WAITING
             task.failure_reason = node.error
             task.finished_at = None
-            task.metadata["clarification"] = {
+            task.runtime.clarification = {
                 "kind": "recovery_input",
                 "reason": node.error,
                 "node_id": node.id,
@@ -2781,7 +3065,7 @@ class TaskService:
                     task_id=task.id,
                     node_id=node.id,
                     event_type="USER_INPUT_REQUIRED",
-                    payload=task.metadata["clarification"],
+                    payload=task.runtime.clarification,
                 )
             )
         else:
@@ -2790,6 +3074,8 @@ class TaskService:
             task.status = TaskStatus.BLOCKED
             task.failure_reason = node.error
             task.finished_at = datetime.now(UTC)
+        if node.status is NodeStatus.BLOCKED:
+            await self._mark_recovery_expansion_failed(node, node.error or "recovery node blocked")
         await self.repository.save_node(node)
         await self.repository.save_task(task)
         return True
@@ -2851,12 +3137,12 @@ class TaskService:
             task = await self.repository.get_task(task_id)
             if not progressed and wait_for_retry and task is not None:
                 retry_times = [
-                    node.metadata.get("next_retry_at")
+                    node.runtime.next_retry_at
                     for node in await self.repository.list_nodes(task_id)
-                    if node.status is NodeStatus.READY and node.metadata.get("next_retry_at")
+                    if node.status is NodeStatus.READY and node.runtime.next_retry_at
                 ]
                 if retry_times:
-                    retry_at = datetime.fromisoformat(min(retry_times))
+                    retry_at = min(retry_times)
                     if retry_at.tzinfo is None:
                         retry_at = retry_at.replace(tzinfo=UTC)
                     delay = max(0.0, (retry_at - datetime.now(UTC)).total_seconds())

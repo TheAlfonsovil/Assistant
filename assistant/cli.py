@@ -110,8 +110,8 @@ def task(
         result = None
         try:
             result = await service.run_task(created.id)
-            if result and result.metadata.get("final_response"):
-                response = AssistantResponse.model_validate(result.metadata["final_response"])
+            if result and result.runtime.final_response:
+                response = AssistantResponse.model_validate(result.runtime.final_response)
                 typer.echo(f"[Assistant] Respuesta ({response.response_type}): {response.title}")
                 typer.echo(response.summary)
                 for section, items in response.sections.items():

@@ -6,11 +6,13 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from assistant.domain.contracts import ArtifactKind, ArtifactRef, TaskContract
 from assistant.domain.models import (
     GraphEdge,
     MemoryRecord,
     NodeStatus,
     Project,
+    RecoveryExpansion,
     Task,
     TaskEvent,
     TaskNode,
@@ -19,6 +21,7 @@ from assistant.domain.models import (
 from assistant.domain.state import validate_node_transition, validate_task_transition
 
 from .orm import (
+    ArtifactRow,
     EdgeRow,
     EventRow,
     IdempotencyRow,
@@ -26,6 +29,7 @@ from .orm import (
     MemoryRow,
     NodeRow,
     ProjectRow,
+    RecoveryExpansionRow,
     TaskRow,
     WorkerHeartbeatRow,
 )
@@ -33,8 +37,14 @@ from .orm import (
 
 def task_to_row(task: Task) -> TaskRow:
     return TaskRow(
-        **task.model_dump(mode="python", exclude={"metadata", "budget"}),
-        metadata_json=task.metadata,
+        **task.model_dump(
+            mode="python",
+            exclude={"metadata", "budget", "contract", "working_memory", "runtime"},
+        ),
+        contract_json=(task.contract or TaskContract(objective=task.goal)).model_dump(mode="json"),
+        working_memory_json=task.working_memory.model_dump(mode="json"),
+        runtime_json=task.runtime.model_dump(mode="json"),
+        extensions_json=task.metadata,
         budget_json=task.budget.model_dump(),
     )
 
@@ -64,15 +74,23 @@ def row_to_task(row: TaskRow) -> Task:
                 )
             },
             "status": row.status,
-            "metadata": row.metadata_json or {},
+            "metadata": row.extensions_json or {},
             "budget": row.budget_json or {},
+            "contract": row.contract_json or None,
+            "working_memory": row.working_memory_json or {},
+            "runtime": row.runtime_json or {},
         }
     )
 
 
 def node_to_row(node: TaskNode) -> NodeRow:
     return NodeRow(
-        **node.model_dump(mode="python", exclude={"metadata"}), metadata_json=node.metadata
+        **node.model_dump(
+            mode="python", exclude={"metadata", "contract", "runtime"}
+        ),
+        contract_json=node.contract.model_dump(mode="json"),
+        runtime_json=node.runtime.model_dump(mode="json"),
+        extensions_json=node.metadata,
     )
 
 
@@ -99,7 +117,9 @@ def row_to_node(row: NodeRow) -> TaskNode:
             },
             "type": row.type,
             "status": row.status,
-            "metadata": row.metadata_json or {},
+            "metadata": row.extensions_json or {},
+            "contract": row.contract_json or {},
+            "runtime": row.runtime_json or {},
         }
     )
 
@@ -372,6 +392,7 @@ class TaskRepository:
             (EventRow, "events"),
             (EdgeRow, "edges"),
             (NodeRow, "nodes"),
+            (ArtifactRow, "artifacts"),
             (IdempotencyRow, "operation_results"),
             (TaskRow, "tasks"),
             (MemoryRow, "memories"),
@@ -383,6 +404,75 @@ class TaskRepository:
             deleted[name] = int(result.rowcount or 0)
         await self.session.commit()
         return deleted
+
+    async def save_artifact(self, task_id: str, artifact: ArtifactRef) -> ArtifactRef:
+        existing = await self.session.get(ArtifactRow, artifact.id)
+        values = {
+            "id": artifact.id,
+            "task_id": task_id,
+            "node_id": artifact.producer_node_id,
+            "kind": artifact.kind.value,
+            "description": artifact.description,
+            "path": artifact.path,
+            "checksum": artifact.checksum,
+            "version": artifact.version,
+            "metadata_json": artifact.metadata,
+        }
+        if existing is None:
+            self.session.add(ArtifactRow(created_at=datetime.now(UTC), **values))
+        else:
+            current = {
+                key: getattr(existing, key)
+                for key in values
+                if key != "metadata_json"
+            }
+            expected = {key: value for key, value in values.items() if key != "metadata_json"}
+            if current != expected or (existing.metadata_json or {}) != artifact.metadata:
+                raise ValueError(f"artifact {artifact.id} is immutable")
+        await self.session.commit()
+        return artifact
+
+    async def list_artifacts(
+        self, task_id: str, node_id: str | None = None
+    ) -> list[ArtifactRef]:
+        query = select(ArtifactRow).where(ArtifactRow.task_id == task_id)
+        if node_id is not None:
+            query = query.where(ArtifactRow.node_id == node_id)
+        query = query.order_by(ArtifactRow.created_at)
+        result = await self.session.execute(query)
+        return [
+            ArtifactRef(
+                id=row.id,
+                kind=ArtifactKind(row.kind),
+                description=row.description,
+                producer_node_id=row.node_id,
+                path=row.path,
+                checksum=row.checksum,
+                version=row.version,
+                metadata=row.metadata_json or {},
+            )
+            for row in result.scalars()
+        ]
+
+    async def get_artifact(self, task_id: str, artifact_id: str) -> ArtifactRef | None:
+        row = await self.session.scalar(
+            select(ArtifactRow).where(
+                ArtifactRow.task_id == task_id,
+                ArtifactRow.id == artifact_id,
+            )
+        )
+        if row is None:
+            return None
+        return ArtifactRef(
+            id=row.id,
+            kind=ArtifactKind(row.kind),
+            description=row.description,
+            producer_node_id=row.node_id,
+            path=row.path,
+            checksum=row.checksum,
+            version=row.version,
+            metadata=row.metadata_json or {},
+        )
 
     async def reset_memory(self) -> int:
         """Backward-compatible memory-only reset for internal callers."""
@@ -455,6 +545,73 @@ class TaskRepository:
             for row in result.scalars()
         ]
 
+    async def get_recovery_expansion(
+        self, task_id: str, target_node_id: str, attempt: int
+    ) -> RecoveryExpansion | None:
+        result = await self.session.execute(
+            select(RecoveryExpansionRow).where(
+                RecoveryExpansionRow.task_id == task_id,
+                RecoveryExpansionRow.target_node_id == target_node_id,
+                RecoveryExpansionRow.attempt == attempt,
+            )
+        )
+        row = result.scalar_one_or_none()
+        return self._row_to_recovery_expansion(row) if row else None
+
+    async def get_recovery_expansion_by_id(self, expansion_id: str) -> RecoveryExpansion | None:
+        row = await self.session.get(RecoveryExpansionRow, expansion_id)
+        return self._row_to_recovery_expansion(row) if row else None
+
+    async def save_recovery_expansion(self, expansion: RecoveryExpansion) -> None:
+        row = await self.session.get(RecoveryExpansionRow, expansion.id)
+        values = {
+            "id": expansion.id,
+            "task_id": expansion.task_id,
+            "target_node_id": expansion.target_node_id,
+            "attempt": expansion.attempt,
+            "strategy": expansion.strategy,
+            "status": expansion.status,
+            "branch_name": expansion.branch_name,
+            "node_ids": expansion.node_ids,
+            "final_node_id": expansion.final_node_id,
+            "reason": expansion.reason,
+            "created_at": expansion.created_at,
+            "finished_at": expansion.finished_at,
+        }
+        if row is None:
+            self.session.add(RecoveryExpansionRow(**values))
+        else:
+            for key, value in values.items():
+                setattr(row, key, value)
+        await self.session.commit()
+
+    async def list_recovery_expansions(self, task_id: str) -> list[RecoveryExpansion]:
+        result = await self.session.execute(
+            select(RecoveryExpansionRow)
+            .where(RecoveryExpansionRow.task_id == task_id)
+            .order_by(RecoveryExpansionRow.created_at)
+        )
+        return [self._row_to_recovery_expansion(row) for row in result.scalars()]
+
+    @staticmethod
+    def _row_to_recovery_expansion(row: RecoveryExpansionRow) -> RecoveryExpansion:
+        return RecoveryExpansion.model_validate(
+            {
+                "id": row.id,
+                "task_id": row.task_id,
+                "target_node_id": row.target_node_id,
+                "attempt": row.attempt,
+                "strategy": row.strategy,
+                "status": row.status,
+                "branch_name": row.branch_name,
+                "node_ids": row.node_ids or [],
+                "final_node_id": row.final_node_id,
+                "reason": row.reason,
+                "created_at": row.created_at,
+                "finished_at": row.finished_at,
+            }
+        )
+
     async def save_event(self, event: TaskEvent) -> None:
         self.session.add(EventRow(**event.model_dump()))
         await self.session.commit()
@@ -489,6 +646,9 @@ class TaskRepository:
         child_ids = list(node_ids.scalars())
         if child_ids:
             await self.session.execute(delete(LeaseRow).where(LeaseRow.node_id.in_(child_ids)))
+            await self.session.execute(
+                delete(ArtifactRow).where(ArtifactRow.node_id.in_(child_ids))
+            )
         await self.session.execute(delete(EdgeRow).where(EdgeRow.task_id == task_id))
         await self.session.execute(
             delete(NodeRow).where(NodeRow.task_id == task_id, NodeRow.id != root_node_id)
@@ -503,6 +663,7 @@ class TaskRepository:
         if ids:
             await self.session.execute(delete(LeaseRow).where(LeaseRow.node_id.in_(ids)))
         await self.session.execute(delete(EventRow).where(EventRow.task_id == task_id))
+        await self.session.execute(delete(ArtifactRow).where(ArtifactRow.task_id == task_id))
         await self.session.execute(delete(EdgeRow).where(EdgeRow.task_id == task_id))
         await self.session.execute(delete(NodeRow).where(NodeRow.task_id == task_id))
         result = await self.session.execute(delete(TaskRow).where(TaskRow.id == task_id))

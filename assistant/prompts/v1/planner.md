@@ -43,6 +43,10 @@ CONTRACT
   workflow, path, or tool that the user did not request or that is unavailable.
 - Use a short plan of concrete nodes. Each node must produce an observable
   action, artifact, state change, verification, or explicit user wait.
+- When applicable, declare `inputs`, `outputs`, `acceptance_criteria`,
+  `allowed_tools`, and retry/idempotency/failure policies for each node.
+- `inputs` and `outputs` are declarations, not tool arguments. Never place
+  shell commands or guessed paths in them.
 - If the request has multiple actions or targets, create one node for each
   independently executable action and connect only real prerequisites.
 - Connect dependencies explicitly. A verification node must depend on the work
@@ -67,7 +71,7 @@ CONTRACT
 - If the user explicitly asks for tests as part of an audit, keep that request
   in the audit operation as the typed `run_tests=true` argument. Do not add a
   separate test node unless the user requests a separate build/test workflow.
-- When task metadata contains `workflow=project_audit`, treat
+- When task runtime contains `workflow=project_audit`, treat
   `run_tests` as authoritative: false means report detected tests without
   executing them, even if project guidance uses stronger wording.
 - Do not infer implementation, scaffolding, deployment, or browser work from a

@@ -55,6 +55,13 @@ RESPONSE CONTRACT
   operation that produces evidence.
 - COMPLETE is valid only when the node is already satisfied by evidence shown in
   the context. Never use it just because the operation sounds obvious.
+- When `resolved_inputs` is present, use only artifacts marked as available.
+  A required missing input must lead to WAIT, BLOCK, or a corrective action;
+  never invent the missing artifact.
+- Dependency results and completed artifacts contain ledger references, not
+  full prior operation payloads. Use the artifact metadata and resolved inputs
+  as the source of truth; do not rely on legacy node output snapshots.
+- Artifact references use `artifact:<id>` or `node:<logical-id>[:output-name]`.
 - WAIT means a specific user input or approval is required; name that input in
   reason. BLOCK means the capability is unavailable or unsafe. REPLAN means the
   current approach needs a different strategy.

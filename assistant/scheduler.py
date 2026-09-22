@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 from .domain.graph import TaskGraph
-from .domain.models import NodeStatus, TaskNode, TaskStatus
+from .domain.models import NodeStatus, OperationResult, TaskNode, TaskStatus
 
 
 class NodeScheduler:
@@ -26,11 +26,11 @@ class NodeScheduler:
         for node in graph.ready_nodes():
             if node.status is not NodeStatus.READY:
                 continue
-            node_deadline = self._parse_timestamp(node.metadata.get("deadline"))
+            node_deadline = node.contract.deadline
             deadlines = [deadline for deadline in (task_deadline, node_deadline) if deadline]
             if deadlines and min(deadlines) <= now:
                 continue
-            if self._timestamp_is_after(node.metadata.get("next_retry_at"), now):
+            if self._timestamp_is_after(node.runtime.next_retry_at, now):
                 continue
             return node
         return None
@@ -57,3 +57,20 @@ class NodeScheduler:
     def _timestamp_is_at_or_before(value, now: datetime) -> bool:
         timestamp = NodeScheduler._parse_timestamp(value)
         return timestamp is not None and timestamp <= now
+
+    @staticmethod
+    def retry_delay(node: TaskNode) -> float:
+        """Return the configured exponential delay for the next retry."""
+        policy = node.contract.retry_policy
+        base = max(0.0, policy.backoff_seconds)
+        maximum = max(0.0, policy.max_backoff_seconds)
+        return min(maximum, base * (2 ** max(0, node.retry_count)))
+
+    @staticmethod
+    def retry_allowed(node: TaskNode, result: OperationResult) -> bool:
+        """Apply an explicit retry-on filter when a node declares one."""
+        retry_on = node.contract.retry_policy.retry_on
+        if not retry_on:
+            return True
+        error_type = result.error_type.value if result.error_type else None
+        return bool(error_type and error_type in retry_on)

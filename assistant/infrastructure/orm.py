@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
@@ -28,7 +28,10 @@ class TaskRow(Base):
     deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     max_retries: Mapped[int] = mapped_column(Integer, default=3)
-    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    contract_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    working_memory_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    runtime_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    extensions_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     result_summary: Mapped[str | None] = mapped_column(Text)
     failure_reason: Mapped[str | None] = mapped_column(Text)
     budget_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
@@ -52,7 +55,9 @@ class NodeRow(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error: Mapped[str | None] = mapped_column(Text)
-    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    contract_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    runtime_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    extensions_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 class EdgeRow(Base):
@@ -64,6 +69,26 @@ class EdgeRow(Base):
     to_node: Mapped[str] = mapped_column(String(36), nullable=False)
     dependency_type: Mapped[str] = mapped_column(String(32), nullable=False)
     condition: Mapped[str | None] = mapped_column(Text)
+
+
+class RecoveryExpansionRow(Base):
+    __tablename__ = "recovery_expansions"
+    __table_args__ = (
+        UniqueConstraint("task_id", "target_node_id", "attempt", name="uq_recovery_expansion_attempt"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    target_node_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    strategy: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    branch_name: Mapped[str | None] = mapped_column(String(255))
+    node_ids: Mapped[list[str]] = mapped_column(JSON, default=list)
+    final_node_id: Mapped[str | None] = mapped_column(String(36))
+    reason: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class EventRow(Base):
@@ -103,6 +128,23 @@ class IdempotencyRow(Base):
 
     idempotency_key: Mapped[str] = mapped_column(String(255), primary_key=True)
     result_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+
+
+class ArtifactRow(Base):
+    __tablename__ = "artifacts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    node_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    path: Mapped[str | None] = mapped_column(Text)
+    checksum: Mapped[str | None] = mapped_column(String(128))
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
 
 
 class MemoryRow(Base):

@@ -17,6 +17,14 @@ the already-resolved path.
 
 The task engine does not contain Windows, Android, home or robot details. A device branch owns its platform adapters, transport and actions; the registry only composes them.
 
+Node execution contracts and mutable runtime state are persisted separately.
+This keeps retries, review and recovery from being confused with the immutable
+node contract. Task and node control metadata columns are removed; only evidence metadata on
+operations and artifacts remains intentionally open-ended. Databases older
+than schema 5 are rejected at startup and must be recreated or exported.
+The recorded schema version must also match schema 5 exactly; the runtime does
+not silently reinterpret or upgrade an older database.
+
 ## Folder map
 
 ```text
@@ -95,6 +103,14 @@ Mobile, home and robot intentionally expose mock status tools today. They establ
 - `assistant.project_analysis`: bounded project inventory with Python symbols and import edges.
 
 SQLite stores tasks, nodes, edges, events, leases and idempotency results. Important transitions are events for audit and later UI/debugging work.
+
+The next runtime boundary is documented in
+[memory-context-performance.md](memory-context-performance.md). It defines the
+typed distinction between hard and soft constraints, recovery graph expansion,
+task/node/durable memory scopes, Ledger-first context construction, Windows
+project-tool selection and the limits of KV-cache reuse through the current
+Ollama integration. It is an implementation plan; it does not claim that
+physical KV handles are currently reusable.
 
 ## Project workflow
 

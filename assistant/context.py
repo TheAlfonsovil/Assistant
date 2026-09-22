@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .domain.contracts import InputRef, OutputSpec, ResolvedInput
 from .domain.graph import TaskGraph
 from .domain.models import Operation, OperationResult, Task, TaskNode
 from .observability import compact
@@ -16,6 +17,25 @@ class ContextBuilder:
         self.workspace_root = workspace_root
         self.projects_root = projects_root
 
+    @staticmethod
+    def _typed_task_context(task: Task) -> dict[str, Any]:
+        context: dict[str, Any] = {}
+        if task.contract is not None:
+            context["contract"] = task.contract.model_dump(mode="json")
+        working_memory = task.working_memory.model_dump(mode="json")
+        if any(
+            value
+            for key, value in working_memory.items()
+            if key != "schema_version"
+        ):
+            context["working_memory"] = working_memory
+        return context
+
+    @staticmethod
+    def _typed_node_context(node: TaskNode) -> dict[str, Any]:
+        contract = node.contract.model_dump(mode="json", exclude_none=True)
+        return {key: value for key, value in contract.items() if value not in (None, [], {})}
+
     async def for_planner(self, task: Task) -> dict[str, Any]:
         memories = await self._memory_context(task.goal)
         get_project = getattr(self.repository, "get_project", None)
@@ -28,7 +48,7 @@ class ContextBuilder:
                 "memory_loaded": True,
                 "workspace_root": self.workspace_root,
                 "projects_root": self.projects_root,
-                "execution_target": task.metadata.get("target"),
+                "execution_target": task.runtime.target,
             },
             "task": {
                 "id": task.id,
@@ -38,6 +58,7 @@ class ContextBuilder:
                 "priority": task.priority,
                 "deadline": task.deadline,
                 "metadata": task.metadata,
+                **self._typed_task_context(task),
             },
             "project": {
                 "id": project.id,
@@ -59,7 +80,7 @@ class ContextBuilder:
                     "when the graph is absent, outdated, or insufficient for the requested change."
                 ),
             } if project else None,
-            "execution_target": task.metadata.get("target"),
+            "execution_target": task.runtime.target,
             "constraints": {
                 "max_retries": task.budget.max_retries,
                 "max_execution_time": task.budget.max_execution_time,
@@ -84,6 +105,13 @@ class ContextBuilder:
             if task.project_id and hasattr(self.repository, "get_project")
             else None
         )
+        list_artifacts = getattr(self.repository, "list_artifacts", None)
+        ledger_artifacts = await list_artifacts(task.id) if list_artifacts else []
+        artifacts_by_node: dict[str, list[dict[str, Any]]] = {}
+        for artifact in ledger_artifacts:
+            artifacts_by_node.setdefault(artifact.producer_node_id, []).append(
+                artifact.model_dump(mode="json")
+            )
         dependency_results = []
         for edge in graph.edges:
             if edge.to_node == node.id:
@@ -91,23 +119,22 @@ class ContextBuilder:
                 dependency_results.append(
                     {
                         "node_id": dependency.id,
+                        "logical_id": dependency.contract.logical_id,
                         "description": dependency.description,
                         "status": dependency.status,
-                        "output": compact(dependency.output_data, limit=4000),
+                        "artifacts": artifacts_by_node.get(dependency.id, []),
                         "error": dependency.error,
                     }
                 )
         completed_artifacts = [
             {
-                "node_id": candidate.id,
-                "description": candidate.description,
-                "artifacts": candidate.output_data.get("artifacts", []),
+                "node_id": producer_id,
+                "artifacts": artifacts,
             }
-            for candidate in graph.nodes.values()
-            if candidate.id != node.id
-            and candidate.status.value == "SUCCEEDED"
-            and candidate.output_data.get("artifacts")
+            for producer_id, artifacts in artifacts_by_node.items()
+            if producer_id != node.id
         ]
+        resolved_inputs = await self.resolve_declared_inputs(task, node, graph)
         return {
             "phase": "NODE_RESOLVER",
             "user_prompt": task.goal,
@@ -116,10 +143,15 @@ class ContextBuilder:
                 "node_status": node.status,
                 "workspace_root": self.workspace_root,
                 "projects_root": self.projects_root,
-                "execution_target": task.metadata.get("target"),
+                "execution_target": task.runtime.target,
             },
             "long_term_memory": memories,
-            "task": {"id": task.id, "goal": task.goal, "status": task.status},
+            "task": {
+                "id": task.id,
+                "goal": task.goal,
+                "status": task.status,
+                **self._typed_task_context(task),
+            },
             "project": {
                 "id": project.id,
                 "name": project.name,
@@ -127,22 +159,28 @@ class ContextBuilder:
                 "codegraph_version": project.codegraph_version,
                 "codegraph": compact(project.codegraph, limit=12000) if project.codegraph else None,
             } if project else None,
-            "execution_target": task.metadata.get("target"),
+            "execution_target": task.runtime.target,
             "node": {
                 "id": node.id,
                 "type": node.type,
                 "description": node.description,
-                "acceptance": node.metadata.get("acceptance", {}),
-                "input": node.input_data,
+                "acceptance": node.contract.acceptance,
+                **self._typed_node_context(node),
+                "input": compact(node.input_data, limit=2000),
                 "retry_count": node.retry_count,
                 "max_retries": node.max_retries,
                 "previous_error": node.error,
-                "output": compact(node.output_data, limit=4000),
-                "review_status": node.metadata.get("review_status"),
-                "operation_hint": node.metadata.get("operation_hint"),
+                "output_summary": {
+                    "has_output": bool(node.output_data),
+                    "artifact_count": len(artifacts_by_node.get(node.id, [])),
+                    "error": node.error,
+                },
+                "review_status": node.runtime.review_status,
+                "operation_hint": node.runtime.operation_hint or None,
             },
             "dependency_results": dependency_results,
             "completed_artifacts": completed_artifacts[-20:],
+            **({"resolved_inputs": resolved_inputs} if resolved_inputs else {}),
             "available_actions": self._available_actions(),
             "constraints": {
                 "deadline": task.deadline,
@@ -152,13 +190,120 @@ class ContextBuilder:
             },
         }
 
+    async def resolve_declared_inputs(
+        self, task: Task, node: TaskNode, graph: TaskGraph
+    ) -> list[dict[str, Any]]:
+        declarations = [item.model_dump(mode="json") for item in node.contract.inputs]
+        if not declarations:
+            return []
+        list_artifacts = getattr(self.repository, "list_artifacts", None)
+        artifacts = await list_artifacts(task.id) if list_artifacts else []
+        resolved: list[dict[str, Any]] = []
+        for raw in declarations:
+            try:
+                requested = InputRef.model_validate(raw)
+            except ValueError as error:
+                raw_reference = str(raw)
+                resolved.append(
+                    ResolvedInput(
+                        requested=InputRef(kind="invalid", ref=raw_reference[:500]),
+                        missing=True,
+                        reason=f"invalid input declaration: {error}",
+                    ).model_dump(mode="json")
+                )
+                continue
+            matches = []
+            if requested.ref.startswith("artifact:"):
+                artifact_id = requested.ref.removeprefix("artifact:")
+                matches = [item for item in artifacts if item.id == artifact_id]
+            elif requested.ref.startswith("node:"):
+                parts = requested.ref.split(":", 2)
+                logical_id = parts[1] if len(parts) > 1 else ""
+                output_name = parts[2] if len(parts) > 2 else None
+                producer_ids = {
+                    candidate.id
+                    for candidate in graph.nodes.values()
+                    if candidate.contract.logical_id == logical_id
+                }
+                matches = [
+                    item
+                    for item in artifacts
+                    if item.producer_node_id in producer_ids
+                    and (output_name is None or item.metadata.get("name") == output_name)
+                ]
+            else:
+                reason = "unsupported input reference; use artifact:<id> or node:<id>[:output]"
+                resolved.append(
+                    ResolvedInput(requested=requested, missing=True, reason=reason).model_dump(
+                        mode="json"
+                    )
+                )
+                continue
+            resolved.append(
+                ResolvedInput(
+                    requested=requested,
+                    artifacts=matches,
+                    missing=not matches,
+                    reason=None if matches else "declared input was not published",
+                ).model_dump(mode="json")
+            )
+        return resolved
+
+    async def missing_required_inputs(
+        self, task: Task, node: TaskNode, graph: TaskGraph
+    ) -> list[dict[str, Any]]:
+        """Return required inputs that cannot be satisfied by published artifacts."""
+        resolved = await self.resolve_declared_inputs(task, node, graph)
+        return [
+            item
+            for item in resolved
+            if item.get("missing") and item.get("requested", {}).get("required", True)
+        ]
+
+    async def missing_required_outputs(
+        self, task: Task, node: TaskNode
+    ) -> list[dict[str, Any]]:
+        """Return declared outputs that were not published by the operation."""
+        declarations = [item.model_dump(mode="json") for item in node.contract.outputs]
+        if not declarations:
+            return []
+        list_artifacts = getattr(self.repository, "list_artifacts", None)
+        artifacts = await list_artifacts(task.id) if list_artifacts else []
+        missing: list[dict[str, Any]] = []
+        for raw in declarations:
+            try:
+                output = OutputSpec.model_validate(raw)
+            except ValueError as error:
+                missing.append(
+                    {
+                        "name": str(raw.get("name", "")) if isinstance(raw, dict) else str(raw),
+                        "reason": f"invalid output declaration: {error}",
+                    }
+                )
+                continue
+            if not output.required:
+                continue
+            published = any(
+                artifact.metadata.get("name") == output.name
+                and artifact.kind is output.kind
+                for artifact in artifacts
+            )
+            if not published:
+                missing.append(
+                    {
+                        "name": output.name,
+                        "kind": output.kind,
+                        "reason": "required output was not published",
+                    }
+                )
+        return missing
+
     def _available_actions(self, summary: bool = False) -> list[dict[str, Any]]:
         definitions = self.tools.definitions()
         if not summary:
             return [
                 {
                     "name": definition.name,
-                    "description": definition.description,
                     "methods": definition.methods,
                     "argument_schema": definition.argument_schema,
                 }
@@ -167,7 +312,7 @@ class ContextBuilder:
         return [
             {
                 "name": definition.name,
-                "description": definition.description,
+                "description": compact(definition.description, limit=600),
                 "methods": definition.methods,
             }
             for definition in definitions
@@ -207,11 +352,17 @@ class ContextBuilder:
         return {
             "phase": "VERIFIER",
             "user_prompt": task.goal,
-            "task": {"id": task.id, "goal": task.goal, "status": task.status},
+            "task": {
+                "id": task.id,
+                "goal": task.goal,
+                "status": task.status,
+                **self._typed_task_context(task),
+            },
             "node": {
                 "id": node.id,
                 "description": node.description,
-                "acceptance": node.metadata.get("acceptance", {}),
+                "acceptance": node.contract.acceptance,
+                **self._typed_node_context(node),
             },
             "execution_evidence": {
                 "result": compact(result.model_dump(mode="json"), limit=5000),
@@ -219,7 +370,12 @@ class ContextBuilder:
                 if isinstance(result.output, dict)
                 else None,
             },
-            "constraints": {"acceptance": node.metadata.get("acceptance", {})},
+            "constraints": {
+                "acceptance": node.contract.acceptance,
+                "require_evidence": bool(
+                    task.contract and task.contract.validation_strategy.require_evidence
+                ),
+            },
         }
 
     async def for_replanner(
@@ -234,16 +390,21 @@ class ContextBuilder:
                 "node_status": node.status,
                 "workspace_root": self.workspace_root,
                 "projects_root": self.projects_root,
-                "execution_target": task.metadata.get("target"),
+                "execution_target": task.runtime.target,
             },
-            "task": {"id": task.id, "goal": task.goal, "status": task.status},
+            "task": {
+                "id": task.id,
+                "goal": task.goal,
+                "status": task.status,
+                **self._typed_task_context(task),
+            },
             "long_term_memory": memories,
             "failure_context": {
                 "failed_node": {"id": node.id, "description": node.description, "error": node.error},
                 "failure": compact(failure.model_dump(mode="json"), limit=5000),
                 "recovery_policy": {
                     "max_attempts": task.budget.max_recovery_attempts,
-                    "attempts_used": task.metadata.get("recovery_attempts", 0),
+                    "attempts_used": task.runtime.recovery_attempts,
                     "allowed_strategies": [
                         "RETRY_NODE",
                         "FIX",
@@ -263,7 +424,7 @@ class ContextBuilder:
                 "id": task.id,
                 "goal": task.goal,
                 "status": task.status,
-                "execution_target": task.metadata.get("target"),
+                "execution_target": task.runtime.target,
                 "result_summary": task.result_summary,
                 "failure_reason": task.failure_reason,
             },

@@ -186,6 +186,11 @@ segunda respuesta al LLM. Tras un reinicio, los nodos que estaban en
 
 Para analizar estructura y relaciones del código, una operación puede usar la capability `project.analyze`. Devuelve archivos examinados, lenguajes, símbolos y aristas de imports; no se confunde con `filesystem.exists`, que solo comprueba una ruta. Para tareas de ordenador, `system.info` devuelve estado local básico y `browser.inspect` inventaría navegadores y pestañas observables. `browser.open` abre una URL pública, `browser.close_tab` cierra una pestaña identificada, `browser.close_site` cierra las pestañas observadas de un sitio y `browser.close_browser` cierra el proceso Windows identificado. Cada interacción se registra en `data/browser-interactions.jsonl` con origen, identidad, URL, objetivo y resultado. La memoria persistente vive en SQLite y sus recuerdos relevantes se incorporan al contexto del Planner.
 
+El diseño de la siguiente fase de memoria, contextos, recovery y prefill está en
+[docs/memory-context-performance.md](docs/memory-context-performance.md). Define
+condicionantes débiles, expansión trazable del grafo y los límites reales de la
+reutilización de KV cache con la API actual de Ollama.
+
 Para que Chrome o Edge expongan sus pestañas y URLs, hay que iniciarlo con un puerto DevTools, por ejemplo `--remote-debugging-port=9222`. Sin ese canal, Windows solo permite identificar la ventana/proceso del navegador; el sistema informa esa limitación y no afirma conocer sus pestañas.
 
 La salida aparece en tiempo real: `TASK_PLANNED` significa que el Planner ya respondió y creó el grafo; `LLM_CALLED` muestra la resolución del nodo; `TOOL_CALLED` y `TOOL_RESULT` delimitan la acción externa; `NODE_VERIFIED` muestra la decisión determinista; y `TASK_FINISHED` indica el estado persistido final.

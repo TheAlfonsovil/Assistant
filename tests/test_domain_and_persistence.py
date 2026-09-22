@@ -1,15 +1,34 @@
+import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from assistant.context import ContextBuilder
+from assistant.domain.contracts import (
+    AcceptanceCriterion,
+    ArtifactKind,
+    ArtifactRef,
+    CriterionStatus,
+    InputRef,
+    NodeContract,
+    NodeRuntimeState,
+    OutputSpec,
+    RetryPolicy,
+    SoftConstraint,
+    TaskContract,
+    TaskDeliverable,
+)
 from assistant.domain.errors import GraphCycleError
 from assistant.domain.graph import TaskGraph
 from assistant.domain.models import (
     DependencyType,
+    ErrorType,
     GraphEdge,
     MemoryRecord,
     NodeStatus,
     NodeType,
+    OperationResult,
+    RecoveryExpansion,
     Task,
     TaskEvent,
     TaskNode,
@@ -18,7 +37,10 @@ from assistant.domain.models import (
 from assistant.domain.state import InvalidStateTransition
 from assistant.infrastructure.db import Database
 from assistant.infrastructure.repositories import TaskRepository
+from assistant.llm import PlanNodeProposal
 from assistant.project_analysis import ProjectAnalyzer
+from assistant.scheduler import NodeScheduler
+from assistant.tools import ToolRegistry
 
 
 def test_graph_resolves_dependencies_and_rejects_cycles():
@@ -50,7 +72,7 @@ def test_graph_allows_success_dependency_for_skipped_branch():
         description="skipped branch",
         type=NodeType.OPERATION,
         status=NodeStatus.CANCELLED,
-        metadata={"branch_skipped": True},
+        runtime=NodeRuntimeState(branch_skipped=True),
     )
     dependent = TaskNode(
         task_id="task",
@@ -85,6 +107,80 @@ def test_graph_always_dependency_waits_for_terminal_status():
     assert graph.dependencies_satisfied(cleanup.id) is True
 
 
+def test_task_contract_models_deliverables_and_evidence():
+    contract = TaskContract(
+        objective="Create a local calculator",
+        deliverables=[
+            TaskDeliverable(kind=ArtifactKind.FILE, description="calculator source")
+        ],
+        acceptance_criteria=[
+            AcceptanceCriterion(id="AC-1", description="The calculator runs")
+        ],
+    )
+    artifact = ArtifactRef(
+        kind=ArtifactKind.TEST_RESULT,
+        description="smoke test",
+        producer_node_id="node-1",
+    )
+
+    assert contract.acceptance_criteria[0].id == "AC-1"
+    assert artifact.kind is ArtifactKind.TEST_RESULT
+    assert CriterionStatus.UNKNOWN.value == "UNKNOWN"
+
+
+def test_plan_node_contract_declares_inputs_outputs_and_policies():
+    node = PlanNodeProposal(
+        id="implement",
+        description="Implement the requested change",
+        inputs=[InputRef(kind="requirement", ref="artifact:requirement-id")],
+        outputs=[
+            OutputSpec(kind=ArtifactKind.FILE, name="source", description="Changed source")
+        ],
+        acceptance_criteria=["AC-1"],
+        allowed_tools=["project"],
+        retry_policy=RetryPolicy(max_attempts=2, retry_on=["validation_failure"]),
+    )
+
+    assert node.inputs[0].ref == "artifact:requirement-id"
+    assert node.outputs[0].kind is ArtifactKind.FILE
+    assert node.retry_policy.max_attempts == 2
+
+
+def test_retry_policy_controls_node_attempts_and_backoff():
+    node = TaskNode(
+        task_id="task",
+        description="retryable work",
+        retry_count=1,
+        contract=NodeContract(
+            retry_policy=RetryPolicy(
+                max_attempts=5,
+                backoff_seconds=1.5,
+                max_backoff_seconds=4,
+            )
+        ),
+    )
+
+    assert RetryPolicy(max_attempts=5).max_retries == 4
+    assert NodeScheduler.retry_delay(node) == 3.0
+
+
+def test_retry_policy_can_limit_failure_types():
+    node = TaskNode(
+        task_id="task",
+        description="retryable work",
+        contract=NodeContract(retry_policy=RetryPolicy(retry_on=["TIMEOUT"])),
+    )
+
+    assert NodeScheduler.retry_allowed(
+        node,
+        OperationResult(success=False, error_type=ErrorType.TIMEOUT, retryable=True),
+    )
+    assert not NodeScheduler.retry_allowed(
+        node,
+        OperationResult(success=False, error_type=ErrorType.TOOL_FAILURE, retryable=True),
+    )
+
+
 @pytest.mark.asyncio
 async def test_sqlite_persists_task_nodes_edges_and_events(tmp_path):
     database = Database(f"sqlite:///{tmp_path / 'nested' / 'assistant.db'}")
@@ -101,6 +197,183 @@ async def test_sqlite_persists_task_nodes_edges_and_events(tmp_path):
         ) if False else None
         assert (await repository.get_task(task.id)).goal == "persist me"
         assert (await repository.get_node(node.id)).description == "root"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_incompatible_schema_version(tmp_path):
+    path = tmp_path / "old-schema.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE schema_version (
+            version INTEGER NOT NULL,
+            applied_at DATETIME NOT NULL
+        );
+        INSERT INTO schema_version(version, applied_at)
+        VALUES (4, CURRENT_TIMESTAMP);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    database = Database(f"sqlite:///{path}")
+    with pytest.raises(RuntimeError, match="found schema 4"):
+        await database.create_all()
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_legacy_task_columns(tmp_path):
+    path = tmp_path / "legacy-schema.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE schema_version (
+            version INTEGER NOT NULL,
+            applied_at DATETIME NOT NULL
+        );
+        CREATE TABLE tasks (
+            id VARCHAR(36) PRIMARY KEY,
+            metadata_json JSON
+        );
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    database = Database(f"sqlite:///{path}")
+    with pytest.raises(RuntimeError, match="legacy"):
+        await database.create_all()
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_round_trips_task_contract_and_working_memory(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'contracts.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        task = Task(
+            goal="persist contract",
+            metadata={"legacy_flag": True},
+            contract=TaskContract(objective="Build a calculator"),
+        )
+        task.working_memory.artifact_refs.append(
+            ArtifactRef(
+                kind=ArtifactKind.FILE,
+                description="source",
+                producer_node_id="node-1",
+                path="calculator.py",
+            )
+        )
+        await repository.save_task(task)
+
+        loaded = await repository.get_task(task.id)
+
+        assert loaded.contract.objective == "Build a calculator"
+        assert loaded.working_memory.artifact_refs[0].path == "calculator.py"
+        assert loaded.metadata == {"legacy_flag": True}
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_persists_idempotent_recovery_expansion(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'recovery-expansion.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        expansion = RecoveryExpansion(
+            task_id="task-1",
+            target_node_id="node-1",
+            attempt=1,
+            strategy="FIX",
+            status="RUNNING",
+            node_ids=["fix-1", "fix-2"],
+            final_node_id="fix-2",
+        )
+        await repository.save_recovery_expansion(expansion)
+        loaded = await repository.get_recovery_expansion("task-1", "node-1", 1)
+        assert loaded is not None
+        assert loaded.node_ids == ["fix-1", "fix-2"]
+        assert await repository.get_recovery_expansion("task-1", "node-1", 2) is None
+    await database.close()
+
+
+def test_soft_constraint_is_advisory_by_default():
+    constraint = SoftConstraint(description="Prefer a short implementation")
+    assert constraint.strength == "soft"
+    assert constraint.on_violation == "warn"
+
+
+@pytest.mark.asyncio
+async def test_sqlite_persists_artifact_ledger(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'artifacts.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        artifact = ArtifactRef(
+            kind=ArtifactKind.REPORT,
+            description="audit report",
+            producer_node_id="node-1",
+            path="artifacts/report.md",
+            checksum="abc123",
+        )
+
+        await repository.save_artifact("task-1", artifact)
+        loaded = await repository.list_artifacts("task-1")
+
+        assert loaded == [artifact]
+        assert (await repository.list_artifacts("task-1", node_id="other")) == []
+        with pytest.raises(ValueError, match="immutable"):
+            await repository.save_artifact(
+                "task-1",
+                artifact.model_copy(update={"description": "changed"}),
+            )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_resolver_exposes_declared_artifact_inputs(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'resolved-inputs.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        source = TaskNode(
+            id="source-node",
+            task_id="task-1",
+            description="produce source",
+            status=NodeStatus.SUCCEEDED,
+            contract=NodeContract(logical_id="produce"),
+        )
+        consumer = TaskNode(
+            id="consumer-node",
+            task_id="task-1",
+            description="consume source",
+            status=NodeStatus.READY,
+            contract=NodeContract(
+                inputs=[
+                    {"kind": "report", "ref": "node:produce:source", "required": True}
+                ]
+            ),
+        )
+        artifact = ArtifactRef(
+            kind=ArtifactKind.REPORT,
+            description="source report",
+            producer_node_id=source.id,
+            metadata={"name": "source"},
+        )
+        await repository.save_artifact("task-1", artifact)
+        context = ContextBuilder(repository, ToolRegistry([]))
+
+        result = await context.for_resolver(
+            Task(id="task-1", goal="consume report"),
+            consumer,
+            TaskGraph([source, consumer], []),
+        )
+
+        assert result["resolved_inputs"][0]["missing"] is False
+        assert result["resolved_inputs"][0]["artifacts"][0]["id"] == artifact.id
     await database.close()
 
 

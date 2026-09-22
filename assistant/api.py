@@ -72,7 +72,7 @@ def _event_json(event, *, include_prompt: bool = False) -> dict:
 def _task_json(task) -> dict:
     return {
         **task.model_dump(mode="json"),
-        "final_response": task.metadata.get("final_response"),
+        "final_response": task.runtime.final_response,
     }
 
 
@@ -114,7 +114,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.2.8", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.3.0", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parent.parent / "dashboard"
 
 
@@ -283,11 +283,7 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         task_retries = task.retry_count + sum(
             node.retry_count for node in task_nodes.get(task.id, [])
         )
-        task_duration = (
-            max(0, (task.finished_at - task.started_at).total_seconds())
-            if task.started_at and task.finished_at else 0
-        )
-        for node_id in node_map:
+        for node_id, node in node_map.items():
             if node_id not in node_usage:
                 node_usage[node_id] = {
                     "llm_calls": 0, "tool_calls": 0, "retry_count": 0,
@@ -296,14 +292,14 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
                 }
             node_usage[node_id].update({
                 "task_id": task.id,
-                "label": node_map[node_id].description,
-                "type": node_map[node_id].type.value,
-                "status": node_map[node_id].status.value,
+                "label": node.description,
+                "type": node.type.value,
+                "status": node.status.value,
                 "duration_seconds": round(
-                    max(0, (node_map[node_id].finished_at - node_map[node_id].started_at).total_seconds())
-                    if node_map[node_id].started_at and node_map[node_id].finished_at else 0, 2
+                    max(0, (node.finished_at - node.started_at).total_seconds())
+                    if node.started_at and node.finished_at else 0, 2
                 ),
-                "retry_count": max(node_usage[node_id]["retry_count"], node_map[node_id].retry_count),
+                "retry_count": max(node_usage[node_id]["retry_count"], node.retry_count),
             })
         task_usage.append({
             "id": task.id,
@@ -518,7 +514,7 @@ async def dashboard_data(request: Request):
         "tasks": [
             {
                 **task.model_dump(mode="json"),
-                "final_response": task.metadata.get("final_response"),
+                "final_response": task.runtime.final_response,
             }
             for task in tasks
         ],
@@ -831,7 +827,7 @@ async def _chat_fast_stream(request: Request, chat_request: ChatFastRequest):
                     payload["error"] = current.failure_reason
                 yield f"event: status\ndata: {json.dumps(payload, default=str)}\n\n"
             if status in terminal:
-                result = current.metadata.get("final_response") or current.result_summary
+                result = current.runtime.final_response or current.result_summary
                 if result:
                     yield (
                         "event: result\n"

@@ -7,6 +7,14 @@ from uuid import uuid4
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
+from .contracts import (
+    NodeContract,
+    NodeRuntimeState,
+    TaskContract,
+    TaskRuntimeState,
+    WorkingMemory,
+)
+
 
 def utcnow() -> datetime:
     return datetime.now(UTC)
@@ -154,12 +162,14 @@ class Task(BaseModel):
     result_summary: str | None = None
     failure_reason: str | None = None
     budget: TaskBudget = Field(default_factory=TaskBudget)
+    contract: TaskContract | None = None
+    working_memory: WorkingMemory = Field(default_factory=WorkingMemory)
+    runtime: TaskRuntimeState = Field(default_factory=TaskRuntimeState)
 
     def __init__(self, **data: Any) -> None:
         super().__init__(**data)
         if self.root_task_id is None:
             self.root_task_id = self.id
-
 
 class TaskNode(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
@@ -178,13 +188,31 @@ class TaskNode(BaseModel):
     finished_at: datetime | None = None
     error: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
-
+    contract: NodeContract = Field(default_factory=NodeContract)
+    runtime: NodeRuntimeState = Field(default_factory=NodeRuntimeState)
 
 class GraphEdge(BaseModel):
     from_node: str
     to_node: str
     dependency_type: DependencyType = DependencyType.SUCCESS
     condition: str | None = None
+
+
+class RecoveryExpansion(BaseModel):
+    """Persistent identity and lifecycle for one recovery subgraph."""
+
+    id: str = Field(default_factory=lambda: str(uuid4()))
+    task_id: str
+    target_node_id: str
+    attempt: int = Field(ge=1)
+    strategy: str = "FIX"
+    status: str = "CREATED"
+    branch_name: str | None = None
+    node_ids: list[str] = Field(default_factory=list)
+    final_node_id: str | None = None
+    reason: str = ""
+    created_at: datetime = Field(default_factory=utcnow)
+    finished_at: datetime | None = None
 
 
 class TaskEvent(BaseModel):

@@ -4,6 +4,71 @@
 
 A task starts in `QUEUED` with a persisted root node. The API starts a background runtime, while the CLI can run a task directly or start the same runtime explicitly. Simple factual or computational requests can finish during planning with a direct answer and no child operation nodes. Multi-step work receives a Pydantic-validated graph proposal.
 
+Tasks may also carry a typed `TaskContract` and `WorkingMemory`. The contract
+defines the objective, deliverables, acceptance criteria, constraints and
+validation strategy independently of the requested domain. Working memory is a
+task-local blackboard for typed facts, decisions, open questions and
+`ArtifactRef` values produced by nodes. These models are persisted in dedicated
+JSON columns; task and node extension metadata is not used for control state.
+The SQLite schema records the current storage revision. The application only
+accepts the current revision and never silently upgrades an older database.
+
+## Typed node state
+
+Each node now has two explicit persisted documents:
+
+- `NodeContract`: logical identity, inputs/outputs, acceptance, tools, retry,
+  idempotency, failure policy and deadline.
+- `NodeRuntimeState`: retry schedule, review state, branch state and recovery
+  expansion state.
+
+New plans write these documents to dedicated JSON columns. Databases created
+before schema 5 are intentionally unsupported; the application refuses them at
+startup instead of silently transforming them. A database that records any
+revision other than schema 5 is rejected even when its columns look compatible.
+
+Schema version 5 removes `tasks.metadata_json` and `task_nodes.metadata_json`
+after projecting their contents into `contract_json`, `working_memory_json`,
+`runtime_json` and `extensions_json`. Metadata on operation results and
+artifacts remains intentionally open-ended because it stores evidence rather
+than task control state.
+
+Planner nodes may declare typed `inputs`, `outputs`, `acceptance_criteria`,
+`allowed_tools`, `retry_policy`, `idempotency_policy` and `failure_policy`.
+Acceptance criteria accept either
+legacy strings or structured `{id, description, required}` objects; runtime
+metadata is normalized to JSON before persistence and verification emits one
+typed `CriterionResult` per criterion. Input references are intentionally
+limited to `artifact:<id>` and `node:<logical-id>[:output-name]`; arbitrary
+prefixes such as `contract:` are rejected during plan validation instead of
+being silently treated as resolvable inputs.
+`retry_policy.max_attempts` includes the initial attempt, so the effective
+retry count is `max_attempts - 1` capped by the task budget. `retry_on`, when
+provided, limits retries to the declared error types. Backoff is exponential
+and bounded by `backoff_seconds` and `max_backoff_seconds`; the persisted
+`next_retry_at` value is only the scheduling state derived from that policy.
+Nodes may also declare their own ISO deadline, which is checked together with
+the task deadline.
+
+Successful tool results publish their declared artifacts to the local artifact
+ledger. Each `ArtifactRef` records its task, producing node, kind, path,
+checksum and version. Artifact records are immutable: reusing an id with
+different content is rejected. Node `output_data` remains as a compatibility
+snapshot while resolver contexts prefer ledger references when available.
+Before the resolver LLM is called, declared inputs are resolved against the
+ledger. A missing required input deterministically blocks the node and task,
+persists the missing references in node metadata, and emits `INPUTS_MISSING`;
+no LLM call, budget consumption or tool execution occurs. Missing optional
+inputs remain visible to the resolver as evidence so it can choose an
+appropriate operation or recovery action. Invalid input declarations are
+treated as missing required inputs when marked required.
+After a successful operation, required `OutputSpec` declarations are checked
+against the artifacts published for that node. Matching requires the declared
+output name and artifact kind. A missing required output is attached to the
+verification evidence as `OUTPUT_REQUIRED_MISSING` and produces a retry
+decision instead of allowing the node to succeed; optional outputs do not
+block completion.
+
 Project selection is a planning clarification, not an executable node phase. After
 the user selects a project, the task returns to `QUEUED` so it always passes
 through the Planner before any node resolver runs.
@@ -15,6 +80,12 @@ Transient and timeout results can return a node to `READY` while incrementing it
 When no node is ready, the engine reconciles the graph: all terminal nodes complete the task, a running node with an active lease keeps the task running, a waiting node moves the task to `WAITING`, a blocked node moves it to `BLOCKED`, and any other no-progress graph is blocked explicitly with a `TASK_NO_PROGRESS` event. Expired node deadlines emit `NODE_DEADLINE_EXCEEDED` and become blocked. Terminal tasks receive one persisted `FINAL_RESPONSE`, shared by CLI and API, including timeout and unexpected-exception paths. Deadlines and execution budgets are terminal transitions, not silent runtime exits.
 
 Structural `WAIT` nodes pause without calling the LLM and resume with their persisted input. Structural `VERIFY` nodes complete when their dependencies succeeded. `CONDITION` and `DECISION` nodes evaluate a safe structured expression (`truthy`, `falsy`, `equals`, `not_equals`, `contains`, `greater_than` or `less_than`) and can skip declared branches; they never evaluate arbitrary code. `NOTIFY` nodes use the registered `notify.send` operation and persist the local delivery result like any other tool call. Operation arguments, required fields and positive finite timeouts are checked against the registered tool before execution. Operation results move both the node and task to `VERIFYING` before deterministic verification; a successful verification returns the task to `READY` for reconciliation. Recovery requeues both `RUNNING` and interrupted `VERIFYING` nodes and requeues their parent task. On startup it removes only expired leases, then removes the lease belonging to each interrupted node; it does not globally steal live leases from unrelated local work. `FAILURE` dependencies wait until the upstream node is actually `FAILED`, while `ALWAYS` dependencies wait for any terminal upstream state (`SUCCEEDED`, `FAILED`, `BLOCKED` or `CANCELLED`). Planner graphs are validated for duplicate IDs, unknown dependencies, typed dependencies, branch targets, structural expressions and cycles before any planned node is persisted. Plans above `TaskBudget.max_plan_nodes` are decomposed into smaller `SUBTASK` nodes instead of being persisted as one oversized graph.
+Recovery design is being tightened so a failed node remains immutable evidence
+and any corrective work is represented as a persisted recovery subgraph linked
+by `parent_node_id`, `recovery_target_id` and explicit graph-expansion events.
+Only a successful finalization node may requeue the original target. See
+[memory-context-performance.md](memory-context-performance.md) for the complete
+recovery, weak-constraint and context-cache contract.
 Notifications use the registered `notify.send` tool and therefore follow the
 same lease, budget, idempotency and verification path as other operations. The
 local adapter persists a JSONL delivery record; external delivery remains an

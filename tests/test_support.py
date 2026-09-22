@@ -23,6 +23,24 @@ def test_deterministic_verifier_classifies_results():
     )
 
 
+def test_deterministic_verifier_retries_when_required_output_is_missing():
+    verifier = DeterministicVerifier()
+    result = OperationResult(
+        success=True,
+        metadata={
+            "missing_required_outputs": [
+                {"name": "source", "kind": "file", "reason": "required output was not published"}
+            ]
+        },
+    )
+
+    verification = verifier.verify(result)
+
+    assert verification.decision is VerificationDecision.RETRY
+    assert verification.missing_evidence == ["output:source"]
+    assert verification.diagnostics[0].code == "OUTPUT_REQUIRED_MISSING"
+
+
 def test_deterministic_verifier_requires_declared_evidence():
     verifier = DeterministicVerifier()
     result = OperationResult(
@@ -48,6 +66,63 @@ def test_deterministic_verifier_supports_typed_field_evidence():
     )
 
     assert verifier.verify(result).decision is VerificationDecision.SUCCESS
+
+
+def test_deterministic_verifier_reports_structured_acceptance_criteria():
+    result = OperationResult(
+        success=True,
+        metadata={
+            "acceptance_criteria": [
+                {"id": "tests-pass", "description": "Tests pass", "required": True}
+            ]
+        },
+    )
+
+    verification = DeterministicVerifier().verify(result)
+
+    assert verification.criteria_results[0].criterion_id == "tests-pass"
+    assert verification.criteria_results[0].status.value == "PASS"
+
+
+def test_deterministic_verifier_records_soft_constraint_warning_without_blocking():
+    result = OperationResult(
+        success=True,
+        metadata={
+            "constraint_violations": [
+                {
+                    "id": "prefer-tests",
+                    "description": "Tests were not available",
+                    "strength": "soft",
+                }
+            ]
+        },
+    )
+
+    verification = DeterministicVerifier().verify(result)
+
+    assert verification.decision is VerificationDecision.SUCCESS
+    assert verification.diagnostics[0].code == "SOFT_CONSTRAINT_VIOLATED"
+    assert verification.diagnostics[0].severity == "warning"
+
+
+def test_deterministic_verifier_blocks_hard_constraint_violation():
+    result = OperationResult(
+        success=True,
+        metadata={
+            "constraint_violations": [
+                {
+                    "id": "no-network",
+                    "description": "Network access was forbidden",
+                    "strength": "hard",
+                }
+            ]
+        },
+    )
+
+    verification = DeterministicVerifier().verify(result)
+
+    assert verification.decision is VerificationDecision.BLOCK
+    assert verification.diagnostics[0].code == "HARD_CONSTRAINT_VIOLATED"
 
 
 @pytest.mark.asyncio

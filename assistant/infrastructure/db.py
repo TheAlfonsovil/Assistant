@@ -27,6 +27,8 @@ def ensure_sqlite_directory(url: str) -> None:
 
 
 class Database:
+    CURRENT_SCHEMA_VERSION = 5
+
     def __init__(self, url: str):
         ensure_sqlite_directory(url)
         async_url = async_database_url(url)
@@ -53,21 +55,63 @@ class Database:
     async def create_all(self) -> None:
         async with self.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
-            await connection.run_sync(self._migrate_existing_schema)
             await connection.execute(
                 text(
                     "CREATE TABLE IF NOT EXISTS schema_version "
                     "(version INTEGER NOT NULL, applied_at DATETIME NOT NULL)"
                 )
             )
+            await connection.run_sync(self._validate_schema)
             current = await connection.scalar(text("SELECT MAX(version) FROM schema_version"))
+            if current is not None and current != self.CURRENT_SCHEMA_VERSION:
+                raise RuntimeError(
+                    "Incompatible database schema. This version requires schema "
+                    f"{self.CURRENT_SCHEMA_VERSION}, found schema {current}; "
+                    "recreate or export the database before starting the assistant."
+                )
             if current is None:
                 await connection.execute(
                     text(
                         "INSERT INTO schema_version(version, applied_at) "
-                        "VALUES (1, CURRENT_TIMESTAMP)"
-                    )
+                        "VALUES (:version, CURRENT_TIMESTAMP)"
+                    ),
+                    {"version": self.CURRENT_SCHEMA_VERSION},
                 )
+
+    @staticmethod
+    def _validate_schema(connection) -> None:
+        inspector = inspect(connection)
+        required_columns = {
+            "tasks": {
+                "contract_json",
+                "working_memory_json",
+                "runtime_json",
+                "extensions_json",
+            },
+            "task_nodes": {"contract_json", "runtime_json", "extensions_json"},
+            "projects": {"codegraph", "codegraph_updated_at", "codegraph_version"},
+            "memories": {"expires_at"},
+        }
+        incompatible = {
+            table: sorted(columns - {column["name"] for column in inspector.get_columns(table)})
+            for table, columns in required_columns.items()
+            if table in inspector.get_table_names()
+            and columns - {column["name"] for column in inspector.get_columns(table)}
+        }
+        legacy = {
+            table
+            for table in ("tasks", "task_nodes")
+            if table in inspector.get_table_names()
+            and "metadata_json" in {
+                column["name"] for column in inspector.get_columns(table)
+            }
+        }
+        if incompatible or legacy:
+            raise RuntimeError(
+                "Incompatible database schema. This version requires schema "
+                f"{Database.CURRENT_SCHEMA_VERSION}; recreate or export the database "
+                f"before starting the assistant (missing={incompatible}, legacy={sorted(legacy)})."
+            )
 
     async def health_check(self) -> dict[str, object]:
         async with self.sessions() as session:
@@ -84,30 +128,6 @@ class Database:
                     await session.scalar(text("PRAGMA quick_check"))
                 )
             return result
-
-    @staticmethod
-    def _migrate_existing_schema(connection) -> None:
-        inspector = inspect(connection)
-        if "tasks" in inspector.get_table_names():
-            columns = {column["name"] for column in inspector.get_columns("tasks")}
-            if "project_id" not in columns:
-                connection.execute(text("ALTER TABLE tasks ADD COLUMN project_id VARCHAR(36)"))
-        if "projects" in inspector.get_table_names():
-            columns = {column["name"] for column in inspector.get_columns("projects")}
-            if "codegraph" not in columns:
-                connection.execute(text("ALTER TABLE projects ADD COLUMN codegraph JSON"))
-            if "codegraph_updated_at" not in columns:
-                connection.execute(
-                    text("ALTER TABLE projects ADD COLUMN codegraph_updated_at DATETIME")
-                )
-            if "codegraph_version" not in columns:
-                connection.execute(
-                    text("ALTER TABLE projects ADD COLUMN codegraph_version INTEGER DEFAULT 0")
-                )
-        if "memories" in inspector.get_table_names():
-            columns = {column["name"] for column in inspector.get_columns("memories")}
-            if "expires_at" not in columns:
-                connection.execute(text("ALTER TABLE memories ADD COLUMN expires_at DATETIME"))
 
     async def session(self) -> AsyncIterator[AsyncSession]:
         async with self.sessions() as session:

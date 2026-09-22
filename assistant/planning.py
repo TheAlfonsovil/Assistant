@@ -83,7 +83,7 @@ def validate_plan_quality(proposal: PlanProposal, max_nodes: int) -> None:
                 f"node {item.id} references unknown dependencies: {sorted(unknown)}"
             )
         for branch_key in ("skip_on_false", "skip_on_true"):
-            targets = item.metadata.get(branch_key, [])
+            targets = getattr(item.branch_config, branch_key)
             if not isinstance(targets, list) or any(target not in known_ids for target in targets):
                 raise PlanQualityError(f"node {item.id} has invalid {branch_key} targets")
             if item.id in targets:
@@ -96,6 +96,52 @@ def validate_plan_quality(proposal: PlanProposal, max_nodes: int) -> None:
             )
         if not isinstance(item.acceptance, dict):
             raise PlanQualityError(f"node {item.id} has invalid acceptance evidence")
+        for criterion in item.acceptance_criteria:
+            if isinstance(criterion, str) and not criterion.strip():
+                raise PlanQualityError(f"node {item.id} has an empty acceptance criterion")
+            if not isinstance(criterion, str) and not criterion.description.strip():
+                raise PlanQualityError(f"node {item.id} has an empty acceptance criterion")
+        if any(not value.strip() for value in item.allowed_tools):
+            raise PlanQualityError(f"node {item.id} has an empty allowed tool")
+        output_names: set[str] = set()
+        for output in item.outputs:
+            name = output.name.strip()
+            if not name:
+                raise PlanQualityError(f"node {item.id} has an output without a name")
+            if name in output_names:
+                raise PlanQualityError(
+                    f"node {item.id} declares duplicate output name {name!r}"
+                )
+            output_names.add(name)
+        for input_ref in item.inputs:
+            reference = input_ref.ref.strip()
+            if reference != input_ref.ref:
+                raise PlanQualityError(
+                    f"node {item.id} has whitespace around input reference {input_ref.ref!r}"
+                )
+            if reference.startswith("artifact:"):
+                if not reference.removeprefix("artifact:").strip():
+                    raise PlanQualityError(
+                        f"node {item.id} has an empty artifact input reference"
+                    )
+            elif reference.startswith("node:"):
+                parts = reference.split(":")
+                if len(parts) not in {2, 3} or not parts[1].strip():
+                    raise PlanQualityError(
+                        f"node {item.id} has an invalid node input reference {reference!r}"
+                    )
+                if len(parts) == 3 and not parts[2].strip():
+                    raise PlanQualityError(
+                        f"node {item.id} has an empty node output name"
+                    )
+                if parts[1] not in known_ids:
+                    raise PlanQualityError(
+                        f"node {item.id} references unknown input node {parts[1]!r}"
+                    )
+            else:
+                raise PlanQualityError(
+                    f"node {item.id} has unsupported input reference {reference!r}"
+                )
         acceptance = item.acceptance
         if "fields" in acceptance and not isinstance(acceptance["fields"], dict):
             raise PlanQualityError(f"node {item.id} has invalid field evidence")
@@ -109,16 +155,16 @@ def validate_plan_quality(proposal: PlanProposal, max_nodes: int) -> None:
             if key in acceptance and not isinstance(acceptance[key], (str, list)):
                 raise PlanQualityError(f"node {item.id} has invalid {key} evidence")
         if item.type in {"CONDITION", "DECISION"}:
-            operator = item.metadata.get("operator", "truthy")
+            operator = item.branch_config.operator
             if operator not in _ALLOWED_CONDITION_OPERATORS:
                 raise PlanQualityError(
                     f"{item.type.lower()} node {item.id} uses unsupported operator {operator}"
                 )
-            if "value" not in item.metadata and not item.metadata.get("source_node_id"):
+            if item.branch_config.value is None and not item.branch_config.source_node_id:
                 raise PlanQualityError(
                     f"{item.type.lower()} node {item.id} needs value or source_node_id"
                 )
-            source_id = item.metadata.get("source_node_id")
+            source_id = item.branch_config.source_node_id
             if source_id and source_id not in known_ids:
                 raise PlanQualityError(
                     f"{item.type.lower()} node {item.id} references unknown source {source_id}"
