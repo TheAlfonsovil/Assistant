@@ -34,6 +34,24 @@ class DeterministicVerifier:
         )
 
     @staticmethod
+    def with_tool_evidence(result: OperationResult, evidence: dict) -> OperationResult:
+        """Attach deterministic tool evidence without interpreting prose acceptance."""
+        if not result.success or not isinstance(result.output, dict) or not evidence:
+            return result
+        metadata = dict(result.metadata)
+        expected = dict(metadata.get("expected") or {})
+        fields = expected.get("fields", {})
+        if not isinstance(fields, dict):
+            fields = {}
+        for field in evidence.get("success_fields", []):
+            if field in result.output:
+                fields.setdefault(field, result.output[field])
+        if fields:
+            expected["fields"] = fields
+        metadata["expected"] = expected
+        return result.model_copy(update={"metadata": metadata})
+
+    @staticmethod
     def _acceptance_is_met(result: OperationResult) -> bool:
         expected = result.metadata.get("expected", {})
         if not expected:

@@ -34,6 +34,7 @@ from assistant.idle import IdleCycle
 from assistant.infrastructure.db import Database
 from assistant.infrastructure.orm import LeaseRow
 from assistant.infrastructure.repositories import TaskRepository
+from assistant.verifier import DeterministicVerifier
 from assistant.llm import (
     ActionProposal,
     AssistantResponse,
@@ -281,6 +282,61 @@ async def test_project_modify_rejects_escape_and_reports_failed_validation(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_project_read_and_edit_support_contextual_bounded_changes(tmp_path):
+    root = tmp_path / "project"
+    root.mkdir()
+    (root / "package.json").write_text('{"scripts":{"test":"npm test"}}', encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "main.js").write_text("export const app = true;\n", encoding="utf-8")
+    registry = build_tool_registry()
+
+    read = await registry.execute(
+        Operation(
+            tool="project",
+            method="read",
+            args={"root": str(root), "files": ["package.json", "src/main.js"]},
+        )
+    )
+    assert read.success is True
+    assert read.output["files"]["package.json"].startswith("{")
+
+    edit = await registry.execute(
+        Operation(
+            tool="project",
+            method="edit",
+            args={
+                "root": str(root),
+                "feature": "JWT login",
+                "changes": [{"path": "src/main.js", "content": "export const auth = true;\n"}],
+                "deletions": ["package.json"],
+            },
+        )
+    )
+    assert edit.success is True
+    assert edit.output["files"] == ["src\\main.js"]
+    assert edit.output["deleted"] == ["package.json"]
+    assert not (root / "package.json").exists()
+
+
+def test_tool_evidence_replaces_prose_acceptance_for_structured_results():
+    result = OperationResult(
+        success=True,
+        output={"root": "C:/project", "files_analyzed": ["pom.xml"], "file_count": 1, "languages": {".xml": 1}},
+        metadata={
+            "expected": {
+                "contains": ["project structure identified", "frontend and backend stack detected"]
+            }
+        },
+    )
+    verified = DeterministicVerifier.with_tool_evidence(
+        result,
+        {"success_fields": ["root", "files_analyzed", "file_count", "languages"]},
+    )
+    verified.metadata["expected"].pop("contains", None)
+    assert DeterministicVerifier().verify(verified).decision.value == "SUCCESS"
+
+
+@pytest.mark.asyncio
 async def test_tool_registry_rejects_arguments_with_wrong_declared_type():
     result = await build_tool_registry().execute(
         Operation(tool="project", method="analyze", args={"root": 123})
@@ -415,6 +471,38 @@ async def test_codegraph_builds_system_relationships_and_prompt_context(tmp_path
         Task(goal="understand the system", metadata={"include_system_graph": True})
     )
     assert "system_graph" not in planner_context
+
+
+@pytest.mark.asyncio
+async def test_planner_context_includes_registered_codegraph_as_bounded_evidence(tmp_path):
+    repository = TaskRepository.__new__(TaskRepository)
+    project = Project(
+        name="graph-project",
+        path=str(tmp_path),
+        codegraph={
+            "graph": {"nodes": [{"id": "src/main.js", "kind": "module"}], "edges": []},
+            "file_count": 1,
+        },
+        codegraph_version=4,
+    )
+
+    async def get_project(project_id):
+        return project
+
+    repository.get_project = get_project
+    async def search_memory(query, limit=8):
+        return []
+
+    async def list_memory(limit=20):
+        return []
+
+    repository.search_memory = search_memory
+    repository.list_memory = list_memory
+    context = ContextBuilder(repository, ToolRegistry([]), workspace_root=str(tmp_path))
+    planner_context = await context.for_planner(Task(goal="añade autenticación", project_id=project.id))
+
+    assert planner_context["project"]["codegraph_version"] == 4
+    assert planner_context["project"]["codegraph"]["graph"]["nodes"][0]["id"] == "src/main.js"
 
 
 @pytest.mark.asyncio
@@ -620,6 +708,30 @@ def test_browser_intent_replaces_direct_answer_with_open_operation():
 
     assert normalized.answer is None
     assert normalized.nodes[0].metadata["operation_hint"]["method"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_registered_project_modification_cannot_become_direct_answer(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-normalization.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        project = Project(name="test_zone", path=str(tmp_path / "test_zone"))
+        (tmp_path / "test_zone").mkdir()
+        repository = TaskRepository(session)
+        await repository.create_project(project)
+        service = TaskService(session, MockLLMProvider(), ToolRegistry())
+        task = Task(
+            goal="añadele un login con jwt y que admin:admin pueda loguear",
+            project_id=project.id,
+        )
+        proposal = await service._normalize_project_modification(
+            task,
+            PlanProposal(answer="¿Qué framework usa el backend?"),
+        )
+        assert proposal.answer is None
+        assert proposal.nodes[0].metadata["operation_hint"]["method"] == "analyze"
+        assert proposal.nodes[0].metadata["operation_hint"]["args"]["root"] == project.path
+    await database.close()
 
 
 def test_project_audit_plan_removes_generic_verification_node():

@@ -95,6 +95,17 @@ Rules:
   `device` and `os` as target metadata; do not confuse the target platform with
   the Assistant's own runtime.
 - `project.analyze` example: {"tool":"project","method":"analyze","args":{"root":"C:/project","max_files":500}}
+- `project.read` reads a bounded list of relative files from the registered
+  project and returns their contents. Use it after `project.analyze` selects
+  relevant files; never read the whole repository.
+- `project.edit` applies bounded full-file replacements and optional relative
+  file deletions inside the registered project root. Include a concise feature,
+  all changed file contents, and validation commands only when justified by the
+  stack and request.
+- A successful edit is not sufficient evidence for the user's final goal.
+  Prefer a separate dependent build/test/smoke operation for verification. If
+  its evidence is insufficient or fails, return REPLAN or RETRY so recovery can
+  create a corrective branch.
 - Project review example: {"action":"OPERATION","operation":{"tool":"project","method":"analyze","args":{"root":"C:/project","max_files":500},"timeout":300,"retry_policy":{},"idempotency_key":"audit-C:/project","metadata":{}},"subtasks":[],"reason":null}
 - For SUBTASKS, operation must be null and subtasks contains descriptions.
 - For WAIT, BLOCK, REPLAN, or COMPLETE, explain the reason.

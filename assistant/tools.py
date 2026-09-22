@@ -22,6 +22,7 @@ class ToolDefinition(BaseModel):
     permissions: list[str] = Field(default_factory=list)
     timeout: float = 60.0
     idempotent: bool = True
+    evidence: dict[str, Any] = Field(default_factory=dict)
 
 
 class Tool(ABC):

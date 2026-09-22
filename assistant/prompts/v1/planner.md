@@ -82,10 +82,34 @@ CONTRACT
   `containerize`, `device`, and `os` arguments. For the active computer branch
   on this machine, use `device=computer` and `os=windows-11` unless the user
   selects another target.
-- For a feature request against an existing project, prefer `project.modify`.
-  It requires an explicit feature and a bounded `changes` array; use
-  `commands` only for requested or necessary post-change validation. Never
-  report a feature as implemented when no files were changed.
+- For a feature request against an existing project, use the project workflow:
+  `project.analyze` to discover the stack and relevant files, `project.read` to
+  load only the key manifests/source files needed for the requested feature,
+  then `project.edit` with bounded full-file changes and optional deletions.
+  Use `commands` only for requested or necessary post-change validation.
+  `project.modify` remains accepted for compatibility, but new plans should
+  prefer `project.edit`. Never report a feature as implemented when no files
+  were changed.
+- When `RESOLVED PROJECT` is present, it is authoritative evidence of the
+  project's framework, runtime, and path. Do not ask the user to identify
+  those details again. For requests containing implementation verbs such as
+  "add", "añade", "implement", "implementa", "modify", "modifica", "improve",
+  "mejora", or "include", always return executable nodes. Start with a
+  `project.analyze` operation when the exact files are not yet known, then use
+  `project.read` and `project.edit` with the bounded changes discovered from
+  that analysis. The edit node must depend on the read evidence.
+- A change is not complete merely because files were written. For any
+  implementation or edit request, add a dependent verification node that runs
+  the project's relevant build/tests or a concrete smoke check, and make its
+  acceptance describe the user-visible outcome. If verification fails, the
+  runtime must be able to retry or replan rather than report success.
+- If a registered project's codegraph is available, use it as initial
+  structural evidence to select files and dependencies. It is an index, not
+  source-of-truth: refresh it with `codegraph.build` after edits or when its
+  version/evidence is stale or insufficient.
+  Missing non-critical implementation details must be resolved from the
+  registered project's evidence and safe defaults, not converted into a
+  direct-answer question.
 - Do not add audits, tests, code changes, Sonar, deployment, browser actions, or
   reports unless the request or available evidence requires them.
 - Do not commit or push unless the user explicitly requests it.

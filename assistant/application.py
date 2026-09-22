@@ -1000,6 +1000,42 @@ class TaskService:
             return proposal
         return fallback
 
+    async def _normalize_project_modification(
+        self, task: Task, proposal: PlanProposal
+    ) -> PlanProposal:
+        """Keep an existing-project change executable when the planner asks a question."""
+        if proposal.answer is None or proposal.nodes or proposal.subtasks or not task.project_id:
+            return proposal
+        goal = task.goal.casefold()
+        if not re.search(
+            r"\b(?:añad|agreg|implement|modific|mejor|inclu|add|improv|modify)\w*",
+            goal,
+        ):
+            return proposal
+        project = await self.repository.get_project(task.project_id)
+        if project is None:
+            return proposal
+        return PlanProposal(
+            task_id=task.id,
+            coverage=["inspect the registered project before applying the requested change"],
+            nodes=[
+                PlanNodeProposal(
+                    id="fallback-project-analyze",
+                    description=f"Inspeccionar la estructura del proyecto {project.name} para preparar el cambio solicitado",
+                    type="OPERATION",
+                    acceptance={"fields": {"root": project.path}},
+                    metadata={
+                        "operation_hint": {
+                            "tool": "project",
+                            "method": "analyze",
+                            "args": {"root": project.path, "max_files": 500},
+                            "timeout": 120,
+                        }
+                    },
+                )
+            ],
+        )
+
     @staticmethod
     def _fallback_plan(task: Task) -> PlanProposal | None:
         goal = task.goal.casefold()
@@ -1484,6 +1520,12 @@ class TaskService:
         if operation.tool == "project" and operation.method == "audit" and output.get("audit") is not None:
             project.last_audited_at = datetime.now(UTC)
             event_type = "PROJECT_AUDITED"
+        if operation.tool == "project" and operation.method in {"edit", "modify"}:
+            # Source edits invalidate the persisted structural index. Keeping a
+            # stale graph would make the next planner select obsolete files.
+            project.codegraph = None
+            project.codegraph_updated_at = None
+            event_type = "PROJECT_CODEGRAPH_INVALIDATED"
         if event_type:
             await self.repository.update_project(project)
             await self.repository.save_event(
@@ -1809,6 +1851,7 @@ class TaskService:
                         )
                     )
                 proposal = self._normalize_browser_intent(task, proposal)
+                proposal = await self._normalize_project_modification(task, proposal)
                 if proposal.answer is None and not proposal.nodes and not proposal.subtasks:
                     normalized = self._normalize_coverage_plan(task, proposal)
                     if normalized.nodes:
@@ -2300,7 +2343,9 @@ class TaskService:
                 # scaffold owns the final child path: it creates <root>/<name>.
                 # Never let an LLM-provided root duplicate the project name.
                 operation.args["root"] = self.projects_root
-            elif operation.tool in {"project", "codegraph"} and operation.method in {"analyze", "audit", "build", "system"}:
+            elif operation.tool == "project" and operation.method in {"analyze", "read", "audit", "edit", "modify", "build", "system"}:
+                operation.args["root"] = project.path if project else self.context_builder.workspace_root
+            elif operation.tool == "codegraph" and operation.method in {"analyze", "audit", "build", "system"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
             operation_key = operation.idempotency_key or self._operation_key(
                 task.id, node.id, operation
@@ -2410,6 +2455,19 @@ class TaskService:
             acceptance = node.metadata.get("acceptance")
             if acceptance:
                 verification_result.metadata["expected"] = acceptance
+            if tool_definition is not None:
+                evidence = tool_definition.evidence.get(operation.method, {})
+                if evidence:
+                    verification_result = DeterministicVerifier.with_tool_evidence(
+                        verification_result, evidence
+                    )
+                    expected = verification_result.metadata.get("expected", {})
+                    if isinstance(expected, dict) and evidence.get("success_fields"):
+                        # Natural-language acceptance is guidance for the
+                        # planner, not a literal substring contract.
+                        expected.pop("contains", None)
+                        expected.pop("output_contains", None)
+                        verification_result.metadata["expected"] = expected
             verification = self.verifier.verify(verification_result)
             await self.repository.save_event(
                 TaskEvent(

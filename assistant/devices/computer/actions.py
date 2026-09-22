@@ -348,13 +348,20 @@ class ProjectTool(Tool):
     definition = ToolDefinition(
         name="project",
         description=(
-            "Inspect, audit, or create a local project. Audit is read-only and "
-            "does not run tests unless run_tests=true."
+            "Inspect, read, audit, create, or edit a local project. Read/edit are "
+            "bounded to the registered project root."
         ),
-        methods=["analyze", "audit", "create", "scaffold", "modify"],
+        methods=["analyze", "read", "audit", "create", "scaffold", "modify", "edit"],
+        evidence={
+            "analyze": {"success_fields": ["root", "files_analyzed", "file_count", "languages"]},
+            "read": {"success_fields": ["root", "files"]},
+            "edit": {"success_fields": ["feature", "files", "deleted", "validation"]},
+            "modify": {"success_fields": ["feature", "files", "validation"]},
+        },
         argument_schema={
             "root": {"type": "string"},
             "max_files": {"type": "integer"},
+            "files": {"type": "array", "description": "Relative files to read, bounded by the project root."},
             "timeout": {"type": "number"},
             "run_tests": {
                 "type": "boolean",
@@ -373,6 +380,7 @@ class ProjectTool(Tool):
             "os": {"type": "string", "description": "Target operating system, for example windows-11."},
             "feature": {"type": "string", "description": "Feature to add or modify."},
             "changes": {"type": "array", "description": "Files to write, each with path and content."},
+            "deletions": {"type": "array", "description": "Relative files to delete, bounded by the project root."},
             "commands": {"type": "array", "description": "Optional validation commands to run after modification."},
         },
         permissions=["filesystem.read", "project.analysis"],
@@ -403,11 +411,13 @@ class ProjectTool(Tool):
                 return OperationResult(success=False, error=str(error), error_type=ErrorType.TOOL_FAILURE)
         if method == "scaffold":
             return await self._scaffold(args)
-        if method == "modify":
+        if method in {"modify", "edit"}:
             return await self._modify(args, timeout)
         if not isinstance(args.get("root"), str):
             return OperationResult(success=False, error="project requires a root directory", error_type=ErrorType.INVALID_ARGUMENT)
         analyzer = ProjectAnalyzer()
+        if method == "read":
+            return await self._read(args)
         if method == "audit":
             run_tests = args.get("run_tests", False)
             if not isinstance(run_tests, bool):
@@ -423,6 +433,41 @@ class ProjectTool(Tool):
                 run_tests=run_tests,
             )
         return await analyzer.analyze(args["root"], int(args.get("max_files", 500)))
+
+    async def _read(self, args: dict[str, Any]) -> OperationResult:
+        root = args.get("root")
+        files = args.get("files")
+        if not isinstance(root, str) or not isinstance(files, list) or not files:
+            return OperationResult(
+                success=False,
+                error="project.read requires root and a non-empty files array",
+                error_type=ErrorType.INVALID_ARGUMENT,
+            )
+        if len(files) > 20 or any(not isinstance(item, str) or not item.strip() for item in files):
+            return OperationResult(
+                success=False,
+                error="project.read accepts at most 20 non-empty relative file paths",
+                error_type=ErrorType.INVALID_ARGUMENT,
+            )
+        project_root = Path(root).resolve()
+        if not project_root.is_dir():
+            return OperationResult(success=False, error=f"project directory does not exist: {project_root}", error_type=ErrorType.NOT_FOUND)
+        contents: dict[str, str] = {}
+        try:
+            for relative in files:
+                path = (project_root / relative).resolve()
+                if project_root not in path.parents or not path.is_file():
+                    raise FileNotFoundError(relative)
+                if path.stat().st_size > 200_000:
+                    raise ValueError(f"file is too large to read: {relative}")
+                contents[str(path.relative_to(project_root))] = path.read_text(encoding="utf-8")
+        except (OSError, ValueError) as error:
+            return OperationResult(
+                success=False,
+                error=str(error),
+                error_type=ErrorType.NOT_FOUND if isinstance(error, FileNotFoundError) else ErrorType.INVALID_ARGUMENT,
+            )
+        return OperationResult(success=True, output={"root": str(project_root), "files": contents})
 
     async def _scaffold(self, args: dict[str, Any]) -> OperationResult:
         root = args.get("root")
@@ -495,14 +540,18 @@ class ProjectTool(Tool):
         root = args.get("root")
         feature = args.get("feature")
         changes = args.get("changes")
+        deletions = args.get("deletions", [])
         if not isinstance(root, str) or not isinstance(feature, str) or not feature.strip():
-            return OperationResult(success=False, error="project.modify requires root and feature", error_type=ErrorType.INVALID_ARGUMENT)
+            return OperationResult(success=False, error="project.edit requires root and feature", error_type=ErrorType.INVALID_ARGUMENT)
         if not isinstance(changes, list) or not changes:
-            return OperationResult(success=False, error="project.modify requires a non-empty changes array", error_type=ErrorType.INVALID_ARGUMENT)
+            return OperationResult(success=False, error="project.edit requires a non-empty changes array", error_type=ErrorType.INVALID_ARGUMENT)
+        if not isinstance(deletions, list) or any(not isinstance(item, str) or not item.strip() for item in deletions):
+            return OperationResult(success=False, error="deletions must contain relative file paths", error_type=ErrorType.INVALID_ARGUMENT)
         project_root = Path(root).resolve()
         if not project_root.is_dir():
             return OperationResult(success=False, error=f"project directory does not exist: {project_root}", error_type=ErrorType.NOT_FOUND)
         written = []
+        deleted = []
         try:
             for change in changes:
                 if not isinstance(change, dict) or not isinstance(change.get("path"), str) or not isinstance(change.get("content"), str):
@@ -513,6 +562,15 @@ class ProjectTool(Tool):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(change["content"], encoding="utf-8")
                 written.append(str(path.relative_to(project_root)))
+            for relative in deletions:
+                path = (project_root / relative).resolve()
+                if project_root not in path.parents:
+                    raise ValueError(f"deletion path escapes project: {relative}")
+                if path.exists():
+                    if not path.is_file():
+                        raise ValueError(f"deletion target is not a file: {relative}")
+                    path.unlink()
+                    deleted.append(str(path.relative_to(project_root)))
         except (OSError, ValueError) as error:
             return OperationResult(success=False, error=str(error), error_type=ErrorType.INVALID_ARGUMENT)
         validation = []
@@ -526,7 +584,7 @@ class ProjectTool(Tool):
             validation.append({"command": command, "exit_code": process.returncode, "stdout": stdout.decode(errors="replace")[-4000:], "stderr": stderr.decode(errors="replace")[-4000:]})
             if process.returncode != 0:
                 return OperationResult(success=False, output={"feature": feature, "files": written, "validation": validation}, error=f"validation command failed: {command}", error_type=ErrorType.TOOL_FAILURE)
-        return OperationResult(success=True, output={"feature": feature, "files": written, "validation": validation}, side_effects=["project.modified"])
+        return OperationResult(success=True, output={"feature": feature, "files": written, "deleted": deleted, "validation": validation}, side_effects=["project.modified"])
 
     @staticmethod
     def _vue_spring_files(name: str, frontend: dict[str, Any], backend: dict[str, Any], args: dict[str, Any]) -> dict[str, str]:

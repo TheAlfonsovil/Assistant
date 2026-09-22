@@ -228,6 +228,7 @@ class OllamaLLMProvider:
             },
             "rendered_instructions": rendered_instructions,
             "prompt_chars": len(rendered_instructions),
+            "prompt_preview": rendered_instructions[:4000],
         }
         self.last_request = request
         self._trace(

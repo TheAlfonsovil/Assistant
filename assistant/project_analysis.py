@@ -38,6 +38,15 @@ class ProjectAnalyzer:
             output = {
                 "root": str(started_files),
                 "files_analyzed": [str(path.relative_to(started_files)) for path in files],
+                "key_files": [
+                    str(path.relative_to(started_files))
+                    for path in files
+                    if path.name in {
+                        "package.json", "pom.xml", "build.gradle", "build.gradle.kts",
+                        "requirements.txt", "pyproject.toml", "Dockerfile",
+                        "docker-compose.yml", "vite.config.js", "vite.config.ts",
+                    }
+                ][:50],
                 "file_count": len(files),
                 "languages": dict(languages),
                 "modules": modules[:2000],

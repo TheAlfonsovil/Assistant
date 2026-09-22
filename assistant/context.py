@@ -52,6 +52,12 @@ class ContextBuilder:
                 ),
                 "codegraph_version": project.codegraph_version,
                 "codegraph_available": project.codegraph is not None,
+                "codegraph": compact(project.codegraph, limit=12000) if project.codegraph else None,
+                "codegraph_usage": (
+                    "Use this graph as initial structural evidence when available. "
+                    "Treat it as stale after project changes; refresh with codegraph.build "
+                    "when the graph is absent, outdated, or insufficient for the requested change."
+                ),
             } if project else None,
             "execution_target": task.metadata.get("target"),
             "constraints": {
@@ -73,6 +79,11 @@ class ContextBuilder:
 
     async def for_resolver(self, task: Task, node: TaskNode, graph: TaskGraph) -> dict[str, Any]:
         memories = await self._memory_context(task.goal)
+        project = (
+            await self.repository.get_project(task.project_id)
+            if task.project_id and hasattr(self.repository, "get_project")
+            else None
+        )
         dependency_results = []
         for edge in graph.edges:
             if edge.to_node == node.id:
@@ -109,6 +120,13 @@ class ContextBuilder:
             },
             "long_term_memory": memories,
             "task": {"id": task.id, "goal": task.goal, "status": task.status},
+            "project": {
+                "id": project.id,
+                "name": project.name,
+                "path": project.path,
+                "codegraph_version": project.codegraph_version,
+                "codegraph": compact(project.codegraph, limit=12000) if project.codegraph else None,
+            } if project else None,
             "execution_target": task.metadata.get("target"),
             "node": {
                 "id": node.id,
