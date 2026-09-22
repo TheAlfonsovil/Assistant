@@ -190,6 +190,7 @@ class ProjectAnalyzer:
             }
         except TimeoutError:
             process.kill()
+            await process.wait()
             return {"available": True, "command": command, "timed_out": True}
         except OSError as error:
             return {"available": True, "command": command, "error": str(error)}

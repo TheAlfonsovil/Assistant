@@ -76,12 +76,11 @@ class TaskGraph:
                 and dependency.status is not NodeStatus.FAILED
             ):
                 return False
-            if edge.dependency_type is DependencyType.ALWAYS and dependency.status in {
-                NodeStatus.CREATED,
-                NodeStatus.READY,
-                NodeStatus.RUNNING,
-                NodeStatus.WAITING,
-                NodeStatus.VERIFYING,
+            if edge.dependency_type is DependencyType.ALWAYS and dependency.status not in {
+                NodeStatus.SUCCEEDED,
+                NodeStatus.FAILED,
+                NodeStatus.BLOCKED,
+                NodeStatus.CANCELLED,
             }:
                 return False
         return True

@@ -89,8 +89,11 @@ Rules:
   workspace as a substitute. `project.create` currently creates only a
   directory; do not claim that it scaffolded Vue, Spring Boot, Docker, or any
   other framework unless a dedicated registered capability produced those files.
-- `project.scaffold` generates a supported application skeleton and requires
-  explicit stack arguments. `project.modify` applies bounded file changes for a
+- `project.initialize` creates a stack-neutral workspace with a durable
+  manifest, artifact directories, and optional initial files. Use it for
+  books, chemistry, research, data, content, automation, API integrations, or
+  mixed projects. `project.scaffold` is only for an explicitly requested
+  application stack. `project.modify` applies bounded file changes for a
   named feature and may run explicitly supplied validation commands. Preserve
   `device` and `os` as target metadata; do not confuse the target platform with
   the Assistant's own runtime.
@@ -100,8 +103,12 @@ Rules:
   relevant files; never read the whole repository.
 - `project.edit` applies bounded full-file replacements and optional relative
   file deletions inside the registered project root. Include a concise feature,
-  all changed file contents, and validation commands only when justified by the
-  stack and request.
+  all changed file contents or `edit_operations` using `write`, `append`,
+  `prepend`, or `json_merge`, and validation commands only when justified by
+  the stack and request.
+- `project.validate` runs stack-aware build/test/syntax checks and validates
+  Docker Compose configuration when present. Use it after every scaffold or
+  edit; a successful write alone is not implementation evidence.
 - A successful edit is not sufficient evidence for the user's final goal.
   Prefer a separate dependent build/test/smoke operation for verification. If
   its evidence is insufficient or fails, return REPLAN or RETRY so recovery can

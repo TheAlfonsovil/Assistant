@@ -12,9 +12,12 @@ class RecoveryManager:
 
     async def recover(self) -> int:
         now = datetime.now(UTC)
-        # Startup creates a new worker identity. Every lease from the previous
-        # process is therefore stale, even when its wall-clock expiry is later.
-        expired_leases = await self.session.execute(delete(LeaseRow))
+        # The runtime is intentionally local and single-worker. Remove only
+        # leases that are definitely expired; live unrelated leases must not be
+        # stolen during startup.
+        expired_leases = await self.session.execute(
+            delete(LeaseRow).where(LeaseRow.expires_at <= now)
+        )
         result = await self.session.execute(
             select(NodeRow).where(
                 NodeRow.status.in_([NodeStatus.RUNNING.value, NodeStatus.VERIFYING.value])

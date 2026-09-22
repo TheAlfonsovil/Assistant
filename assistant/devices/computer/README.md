@@ -5,7 +5,7 @@ The computer branch is the only real device branch in V1. Its capabilities are r
 - `filesystem`: read, write, list, exists, info, search (recursive, limited to 500 results)
 - `shell`: exec
 - `git`: status, diff, log, branch, checkout, add, commit
-- `project`: analyze, audit, create, scaffold, modify
+- `project`: analyze, read, audit, validate, create, initialize, scaffold, modify, edit
 - `system`: info (read-only local diagnostics)
 - `codegraph`: build (bounded Python module, symbol and import graph)
 - `web`: search, fetch (public HTTP(S) only)
@@ -17,10 +17,12 @@ Future computer capabilities should be added as focused tools or capabilities he
 read-only inventory of safe manifests, detected tests and limitations; it
 accepts `run_tests` (boolean, default `false`) and only executes a detected
 test command when that value is `true`. `project.create` still only creates a
-direct child directory. `project.scaffold` is the supported high-level
-operation for a Vue + Java 25/Spring Boot 4 application with Docker Compose and
-a Windows PowerShell launcher. `project.modify` applies explicit, bounded file
-changes for a named feature and can run explicitly supplied validation commands.
+direct child directory. `project.initialize` creates a stack-neutral workspace with a manifest and
+artifact directories. `project.validate` runs stack-aware build, test, Python
+syntax and Docker Compose configuration checks after a change. `project.scaffold` supports Vue + Java 25 /
+Spring Boot 4 as well as Python FastAPI or Flask projects with a static HTML
+frontend. `project.modify` applies explicit, bounded file changes for a named
+feature and can run explicitly supplied validation commands.
 
 The `search` and `scrape_url` ideas from the `ai_testing` prototype are intentionally
 implemented as a lightweight HTTP adapter, without browser automation or

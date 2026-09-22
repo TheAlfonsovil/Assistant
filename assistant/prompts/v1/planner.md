@@ -77,15 +77,18 @@ CONTRACT
   Treat a requested framework, runtime, platform, or deployment target as a
   required constraint. If no registered action can satisfy it, use WAIT rather
   than silently creating an   empty directory or substituting an unrelated stack.
-- For a new application request with frontend/backend/container requirements,
-  prefer `project.scaffold` and pass explicit `frontend`, `backend`,
-  `containerize`, `device`, and `os` arguments. For the active computer branch
-  on this machine, use `device=computer` and `os=windows-11` unless the user
-  selects another target.
+- For a new project request, first classify the requested deliverable. Use
+  `project.initialize` for stack-neutral workspaces (books, chemistry,
+  research, datasets, content, automation, API integrations, or mixed
+  artifacts), passing a meaningful `kind`, description, directories, and
+  initial artifacts. Use `project.scaffold` only when the user explicitly
+  requests a supported application stack and deployment shape.
 - For a feature request against an existing project, use the project workflow:
-  `project.analyze` to discover the stack and relevant files, `project.read` to
-  load only the key manifests/source files needed for the requested feature,
-  then `project.edit` with bounded full-file changes and optional deletions.
+  `project.analyze` to inventory all artifact types and relevant files,
+  `project.read` to load only the selected text/data artifacts, then
+  `project.edit` with bounded multi-file changes, append/prepend/JSON-merge
+  operations, and optional deletions. Prefer artifact-level edits over
+  rewriting unrelated files.
   Use `commands` only for requested or necessary post-change validation.
   `project.modify` remains accepted for compatibility, but new plans should
   prefer `project.edit`. Never report a feature as implemented when no files
@@ -99,10 +102,11 @@ CONTRACT
   `project.read` and `project.edit` with the bounded changes discovered from
   that analysis. The edit node must depend on the read evidence.
 - A change is not complete merely because files were written. For any
-  implementation or edit request, add a dependent verification node that runs
-  the project's relevant build/tests or a concrete smoke check, and make its
-  acceptance describe the user-visible outcome. If verification fails, the
-  runtime must be able to retry or replan rather than report success.
+implementation or edit request, add a dependent `project.validate` operation
+that runs relevant build/tests/syntax checks and validates Docker Compose when
+present. Add `deployment.verify` as well when a running endpoint or UI is
+required. A structural VERIFY node alone is not sufficient. If verification
+fails, the runtime must be able to retry or replan rather than report success.
 - If a registered project's codegraph is available, use it as initial
   structural evidence to select files and dependencies. It is an index, not
   source-of-truth: refresh it with `codegraph.build` after edits or when its

@@ -191,6 +191,30 @@ async def test_project_create_creates_direct_child_and_rejects_path_escape(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_project_edit_rolls_back_when_validation_fails(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    target = project / "main.py"
+    target.write_text("original\n", encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="edit",
+            args={
+                "root": str(project),
+                "feature": "update main",
+                "changes": [{"path": "main.py", "content": "changed\n"}],
+                "commands": ["python -c \"raise SystemExit(1)\""],
+            },
+        )
+    )
+
+    assert result.success is False
+    assert target.read_text(encoding="utf-8") == "original\n"
+
+
+@pytest.mark.asyncio
 async def test_project_scaffold_creates_vue_spring_boot_and_docker_files(tmp_path):
     result = await build_tool_registry().execute(
         Operation(
@@ -235,6 +259,107 @@ async def test_project_scaffold_can_skip_container_files_and_reject_duplicates(t
     assert created.success is True
     assert not (tmp_path / "plain-app" / "docker-compose.yml").exists()
     assert duplicate.success is False
+
+
+@pytest.mark.asyncio
+async def test_project_scaffold_supports_python_fastapi_static_frontend(tmp_path):
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="scaffold",
+            args={
+                "root": str(tmp_path),
+                "name": "sp500-app",
+                "frontend": {"framework": "static"},
+                "backend": {"language": "python", "framework": "fastapi"},
+                "containerize": True,
+            },
+        )
+    )
+
+    project = tmp_path / "sp500-app"
+    assert result.success is True
+    assert (project / "main.py").is_file()
+    assert (project / "static" / "index.html").is_file()
+    assert (project / "requirements.txt").is_file()
+    assert (project / "Dockerfile").is_file()
+    assert (project / "docker-compose.yml").is_file()
+
+
+@pytest.mark.asyncio
+async def test_project_initialize_supports_stack_neutral_artifact_workspaces(tmp_path):
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="initialize",
+            args={
+                "root": str(tmp_path),
+                "name": "chemistry-notebook",
+                "kind": "chemistry",
+                "description": "Lab notes and experiment data",
+                "directories": ["experiments", "molecules", "results"],
+                "files": [
+                    {"path": "experiments/README.md", "content": "# Experiments\n"},
+                    {"path": "molecules/water.json", "content": "{\"formula\":\"H2O\"}\n"},
+                ],
+            },
+        )
+    )
+
+    project = tmp_path / "chemistry-notebook"
+    assert result.success is True
+    assert result.output["kind"] == "chemistry"
+    assert (project / ".assistant" / "project.json").is_file()
+    assert (project / "experiments" / "README.md").is_file()
+    assert (project / "molecules" / "water.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_project_validate_runs_custom_check_and_reports_structured_status(tmp_path):
+    project = tmp_path / "app"
+    project.mkdir()
+    (project / "main.py").write_text("print('ok')\n", encoding="utf-8")
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="validate",
+            args={
+                "root": str(project),
+                "checks": ["build"],
+                "commands": ["python -m compileall -q ."],
+            },
+        )
+    )
+
+    assert result.success is True
+    assert result.output["validation_status"] == "PASS"
+    assert any(item["name"] == "custom_1" and item["status"] == "PASS" for item in result.output["checks"])
+
+
+@pytest.mark.asyncio
+async def test_project_edit_supports_append_and_json_merge_artifacts(tmp_path):
+    project = tmp_path / "workspace"
+    project.mkdir()
+    (project / "notes.md").write_text("# Notes\n", encoding="utf-8")
+    (project / "config.json").write_text('{"name":"old","enabled":false}\n', encoding="utf-8")
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="edit",
+            args={
+                "root": str(project),
+                "feature": "extend research workspace",
+                "edit_operations": [
+                    {"path": "notes.md", "content": "- New finding\n", "mode": "append"},
+                    {"path": "config.json", "content": '{"enabled":true,"mode":"research"}', "mode": "json_merge"},
+                ],
+            },
+        )
+    )
+
+    assert result.success is True
+    assert "New finding" in (project / "notes.md").read_text(encoding="utf-8")
+    assert '"enabled": true' in (project / "config.json").read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio
@@ -731,6 +856,48 @@ async def test_registered_project_modification_cannot_become_direct_answer(tmp_p
         assert proposal.answer is None
         assert proposal.nodes[0].metadata["operation_hint"]["method"] == "analyze"
         assert proposal.nodes[0].metadata["operation_hint"]["args"]["root"] == project.path
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_project_mutation_gets_real_validation_operation(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-validation-plan.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        project_path = tmp_path / "test_zone"
+        project_path.mkdir()
+        repository = TaskRepository(session)
+        project = Project(name="test_zone", path=str(project_path))
+        await repository.create_project(project)
+        service = TaskService(session, MockLLMProvider(), ToolRegistry())
+        task = Task(goal="añade una funcionalidad al proyecto", project_id=project.id)
+        proposal = PlanProposal(
+            nodes=[
+                PlanNodeProposal(
+                    id="edit",
+                    description="Edit project files",
+                    type="OPERATION",
+                    metadata={
+                        "operation_hint": {
+                            "tool": "project",
+                            "method": "edit",
+                            "args": {"root": str(project_path), "feature": "feature", "changes": []},
+                        }
+                    },
+                ),
+                PlanNodeProposal(
+                    id="verify",
+                    description="Verify the change",
+                    type="VERIFY",
+                    dependencies=["edit"],
+                ),
+            ]
+        )
+        normalized = await service._ensure_project_validation(task, proposal)
+        validation = normalized.nodes[-1]
+        assert validation.type == "OPERATION"
+        assert validation.metadata["operation_hint"]["method"] == "validate"
+        assert validation.dependencies == ["edit", "verify"]
     await database.close()
 
 
@@ -1826,12 +1993,12 @@ async def test_empty_planner_creation_fallback_creates_requested_project(tmp_pat
         assert (projects_root / "test_zone").is_dir()
         nodes = await service.repository.list_nodes(task.id)
         assert [node.description for node in nodes if node.type is NodeType.OPERATION] == [
-            "Crear el proyecto test_zone en la raíz configurada de proyectos"
+            "Inicializar el workspace test_zone como proyecto de tipo workspace"
         ]
         events = await service.repository.list_events(task.id)
         assert any(
             event.event_type == "PLAN_REPAIRED"
-            and "fallback-project-create" in event.payload.get("nodes", [])
+            and "fallback-project-initialize" in event.payload.get("nodes", [])
             for event in events
         )
     await database.close()
@@ -2058,6 +2225,35 @@ async def test_recovery_requeues_parent_task_and_running_node(tmp_path):
             event.event_type == "NODE_RECOVERED"
             for event in await repository.list_events(task.id)
         )
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_keeps_live_unrelated_leases(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'recovery-live-lease.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        task = Task(goal="keep live lease", status=TaskStatus.READY)
+        node = TaskNode(
+            task_id=task.id,
+            type=NodeType.OPERATION,
+            description="ready operation",
+            status=NodeStatus.READY,
+        )
+        await repository.save_task(task)
+        await repository.save_node(node)
+        session.add(
+            LeaseRow(
+                node_id=node.id,
+                owner="other-local-worker",
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+        assert await RecoveryManager(session).recover() == 0
+        assert await session.get(LeaseRow, node.id) is not None
     await database.close()
 
 

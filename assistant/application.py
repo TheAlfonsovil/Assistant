@@ -220,10 +220,12 @@ class TaskService:
         for candidate in root.iterdir():
             if not candidate.is_dir():
                 continue
-            if not all(
+            is_scaffold = all(
                 (candidate / marker).is_file()
                 for marker in ("docker-compose.yml", "frontend/package.json", "backend/pom.xml")
-            ):
+            )
+            is_workspace = (candidate / ".assistant" / "project.json").is_file()
+            if not (is_scaffold or is_workspace):
                 continue
             resolved = str(candidate.resolve())
             if resolved.casefold() in known_paths or candidate.name.casefold() in known_names:
@@ -233,7 +235,7 @@ class TaskService:
                     name=candidate.name,
                     path=resolved,
                     description="Scaffold project recovered from the configured projects root",
-                    project_type="code",
+                    project_type="workspace" if is_workspace and not is_scaffold else "code",
                 )
             )
             known_paths.add(resolved.casefold())
@@ -1036,6 +1038,90 @@ class TaskService:
             ],
         )
 
+    async def _ensure_project_validation(self, task: Task, proposal: PlanProposal) -> PlanProposal:
+        """Guarantee that project mutations have executable validation evidence."""
+        if proposal.answer is not None or not proposal.nodes:
+            return proposal
+        mutation_methods = {"create", "scaffold", "modify", "edit"}
+        mutation_nodes = []
+        validation_present = False
+        project_root = None
+        for node in proposal.nodes:
+            hint = node.metadata.get("operation_hint", {})
+            method = hint.get("method") if isinstance(hint, dict) else None
+            if not method:
+                action = node.metadata.get("action")
+                if isinstance(action, str) and action.startswith("project."):
+                    method = action.split(".", 1)[1]
+            if method in mutation_methods:
+                mutation_nodes.append(node)
+                args = hint.get("args", {})
+                if isinstance(args, dict):
+                    if method == "scaffold" and args.get("root") and args.get("name"):
+                        project_root = str(Path(args["root"]) / str(args["name"]))
+                    elif args.get("root"):
+                        project_root = str(args["root"])
+            if method == "validate":
+                validation_present = True
+        if not mutation_nodes or validation_present:
+            return proposal
+        if not project_root and task.project_id:
+            project = await self.repository.get_project(task.project_id)
+            project_root = project.path if project else None
+        if not project_root:
+            return proposal
+        validation_id = "auto-project-validation"
+        if any(node.id == validation_id for node in proposal.nodes):
+            return proposal
+        validation = PlanNodeProposal(
+            id=validation_id,
+            description="Build, test and validate the changed project configuration",
+            type="OPERATION",
+            dependencies=[node.id for node in proposal.nodes],
+            acceptance={
+                "fields": {
+                    "root": project_root,
+                    "validation_status": "PASS",
+                }
+            },
+            metadata={
+                "operation_hint": {
+                    "tool": "project",
+                    "method": "validate",
+                    "args": {"root": project_root},
+                    "timeout": 300,
+                }
+            },
+        )
+        structural_verify = next(
+            (
+                node
+                for node in proposal.nodes
+                if node.type == "VERIFY"
+                and not isinstance(node.metadata.get("operation_hint"), dict)
+            ),
+            None,
+        )
+        if structural_verify is not None and len(proposal.nodes) >= task.budget.max_plan_nodes:
+            replacement = structural_verify.model_copy(
+                update={
+                    "description": validation.description,
+                    "type": validation.type,
+                    "dependencies": validation.dependencies,
+                    "acceptance": validation.acceptance,
+                    "metadata": validation.metadata,
+                }
+            )
+            return proposal.model_copy(
+                update={
+                    "nodes": [
+                        replacement if node.id == structural_verify.id else node
+                        for node in proposal.nodes
+                    ]
+                }
+            )
+        return proposal.model_copy(update={"nodes": [*proposal.nodes, validation]})
+
     @staticmethod
     def _fallback_plan(task: Task) -> PlanProposal | None:
         goal = task.goal.casefold()
@@ -1099,9 +1185,16 @@ class TaskService:
                 )
             project_name = creation_match.group(1)
             scaffold_requested = any(
-                term in goal for term in ("vue", "spring boot", "springboot", "docker", "frontend", "backend")
+                term in goal
+                for term in (
+                    "vue", "spring boot", "springboot", "docker", "frontend",
+                    "backend", "python", "fastapi", "flask", "sp500", "s&p",
+                )
             )
             if scaffold_requested:
+                python_stack = any(
+                    term in goal for term in ("python", "fastapi", "flask", "sp500", "s&p")
+                )
                 return PlanProposal(
                     task_id=task.id,
                     coverage=["scaffold the requested application stack and validate its generated structure"],
@@ -1117,8 +1210,12 @@ class TaskService:
                                     "method": "scaffold",
                                     "args": {
                                         "name": project_name,
-                                        "frontend": {"framework": "vue"},
-                                        "backend": {"language": "java", "java_version": "25", "framework": "spring-boot"},
+                                        "frontend": {"framework": "static" if python_stack else "vue"},
+                                        "backend": (
+                                            {"language": "python", "framework": "fastapi"}
+                                            if python_stack
+                                            else {"language": "java", "java_version": "25", "framework": "spring-boot"}
+                                        ),
                                         "containerize": True,
                                         "device": "computer",
                                         "os": "windows-11",
@@ -1129,20 +1226,34 @@ class TaskService:
                         )
                     ],
                 )
+            kind = "workspace"
+            if any(term in goal for term in ("libro", "novela", "book", "writing", "manuscrito")):
+                kind = "book"
+            elif any(term in goal for term in ("química", "quimica", "chemistry", "laboratorio", "lab")):
+                kind = "chemistry"
+            elif any(term in goal for term in ("twitter", "x.com", "automatización", "automation", "api")):
+                kind = "automation"
+            elif any(term in goal for term in ("datos", "dataset", "investigación", "research")):
+                kind = "research"
             return PlanProposal(
                 task_id=task.id,
-                coverage=["create the requested project directory"],
+                coverage=["initialize a stack-neutral workspace with a durable manifest and artifact folders"],
                 nodes=[
                     PlanNodeProposal(
-                        id="fallback-project-create",
-                        description=f"Crear el proyecto {project_name} en la raíz configurada de proyectos",
+                        id="fallback-project-initialize",
+                        description=f"Inicializar el workspace {project_name} como proyecto de tipo {kind}",
                         type="OPERATION",
-                        acceptance={"fields": {"name": project_name}},
+                        acceptance={"fields": {"name": project_name, "kind": kind}},
                         metadata={
                             "operation_hint": {
                                 "tool": "project",
-                                "method": "create",
-                                "args": {"name": project_name, "template": "empty"},
+                                "method": "initialize",
+                                "args": {
+                                    "name": project_name,
+                                    "kind": kind,
+                                    "description": task.goal,
+                                    "directories": ["notes", "data", "artifacts"],
+                                },
                                 "timeout": 300,
                             }
                         },
@@ -1852,6 +1963,7 @@ class TaskService:
                     )
                 proposal = self._normalize_browser_intent(task, proposal)
                 proposal = await self._normalize_project_modification(task, proposal)
+                proposal = await self._ensure_project_validation(task, proposal)
                 if proposal.answer is None and not proposal.nodes and not proposal.subtasks:
                     normalized = self._normalize_coverage_plan(task, proposal)
                     if normalized.nodes:
@@ -2038,7 +2150,7 @@ class TaskService:
                 return True
             return True
         graph = await self.graph(task_id)
-        selected = self.scheduler.next_ready_node(task.status, graph)
+        selected = self.scheduler.next_ready_node(task.status, graph, task.deadline)
         ready = graph.ready_nodes()
         await self.repository.save_event(
             TaskEvent(
@@ -2343,8 +2455,12 @@ class TaskService:
                 # scaffold owns the final child path: it creates <root>/<name>.
                 # Never let an LLM-provided root duplicate the project name.
                 operation.args["root"] = self.projects_root
+            elif operation.tool == "project" and operation.method == "initialize":
+                operation.args["root"] = self.projects_root
             elif operation.tool == "project" and operation.method in {"analyze", "read", "audit", "edit", "modify", "build", "system"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
+            elif operation.tool == "project" and operation.method == "validate":
+                operation.args["root"] = project.path if project else operation.args.get("root", self.context_builder.workspace_root)
             elif operation.tool == "codegraph" and operation.method in {"analyze", "audit", "build", "system"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
             operation_key = operation.idempotency_key or self._operation_key(

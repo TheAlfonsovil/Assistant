@@ -66,6 +66,25 @@ def test_graph_allows_success_dependency_for_skipped_branch():
     assert graph.dependencies_satisfied(dependent.id) is True
 
 
+def test_graph_always_dependency_waits_for_terminal_status():
+    upstream = TaskNode(task_id="task", description="upstream", status=NodeStatus.READY)
+    cleanup = TaskNode(task_id="task", description="cleanup", status=NodeStatus.READY)
+    graph = TaskGraph(
+        [upstream, cleanup],
+        [
+            GraphEdge(
+                from_node=upstream.id,
+                to_node=cleanup.id,
+                dependency_type=DependencyType.ALWAYS,
+            )
+        ],
+    )
+
+    assert graph.dependencies_satisfied(cleanup.id) is False
+    upstream.status = NodeStatus.BLOCKED
+    assert graph.dependencies_satisfied(cleanup.id) is True
+
+
 @pytest.mark.asyncio
 async def test_sqlite_persists_task_nodes_edges_and_events(tmp_path):
     database = Database(f"sqlite:///{tmp_path / 'nested' / 'assistant.db'}")
