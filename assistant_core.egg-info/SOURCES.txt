@@ -3,8 +3,6 @@ README.md
 pyproject.toml
 assistant/__init__.py
 assistant/__main__.py
-assistant/api.py
-assistant/application.py
 assistant/cli.py
 assistant/config.py
 assistant/context.py
@@ -18,6 +16,10 @@ assistant/runtime.py
 assistant/scheduler.py
 assistant/tools.py
 assistant/verifier.py
+assistant/api/__init__.py
+assistant/api/application.py
+assistant/application/__init__.py
+assistant/application/service.py
 assistant/capabilities/__init__.py
 assistant/capabilities/project.py
 assistant/core/__init__.py
@@ -28,12 +30,13 @@ assistant/devices/__init__.py
 assistant/devices/base.py
 assistant/devices/registry.py
 assistant/devices/computer/__init__.py
-assistant/devices/computer/actions.py
 assistant/devices/computer/browser.py
 assistant/devices/computer/codegraph.py
 assistant/devices/computer/registry.py
 assistant/devices/computer/system.py
 assistant/devices/computer/web.py
+assistant/devices/computer/actions/__init__.py
+assistant/devices/computer/actions/core.py
 assistant/devices/home/__init__.py
 assistant/devices/mobile/__init__.py
 assistant/devices/robot/__init__.py

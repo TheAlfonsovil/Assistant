@@ -97,6 +97,19 @@ class AssistantResponse(BaseModel):
     confidence: str = "medium"
 
 
+def _compact_schema(value: Any) -> Any:
+    """Remove prose-only JSON Schema metadata before embedding it in prompts."""
+    if isinstance(value, dict):
+        return {
+            key: _compact_schema(item)
+            for key, item in value.items()
+            if key not in {"title", "description", "default", "examples"}
+        }
+    if isinstance(value, list):
+        return [_compact_schema(item) for item in value]
+    return value
+
+
 # Compatibility name for callers of the first reporting implementation.
 FinalReport = AssistantResponse
 
@@ -242,7 +255,8 @@ class OllamaLLMProvider:
         """Build and retain the exact request before network I/O starts."""
         prompt_path = Path(__file__).parent / "prompts" / "v1" / f"{role.lower()}.md"
         instructions = prompt_path.read_text(encoding="utf-8")
-        rendered_instructions = render(instructions, context, schema.model_json_schema())
+        output_schema = _compact_schema(schema.model_json_schema())
+        rendered_instructions = render(instructions, context, output_schema)
         if len(rendered_instructions) > self.effective_prompt_chars:
             raise ValueError(
                 f"LLM prompt exceeds effective context budget of {self.effective_prompt_chars} characters"

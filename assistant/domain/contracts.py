@@ -207,6 +207,9 @@ class TaskRuntimeState(BaseModel):
     final_finished_at: datetime | None = None
     llm_calls: int = 0
     tool_calls: int = 0
+    codegraph_queries: int = 0
+    project_reads: int = 0
+    source_bytes: int = 0
     recovery_attempts: int = 0
     created_project: dict[str, Any] = Field(default_factory=dict)
 

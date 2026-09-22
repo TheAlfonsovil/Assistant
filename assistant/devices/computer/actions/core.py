@@ -383,7 +383,12 @@ class ProjectTool(Tool):
         argument_schema={
             "root": {"type": "string"},
             "max_files": {"type": "integer"},
-            "files": {"type": "array", "description": "Relative files to read, bounded by the project root."},
+            "files": {
+                "type": "array",
+                "description": (
+                    "Relative paths or {path,start_line,end_line} ranges, bounded by the project root."
+                ),
+            },
             "timeout": {"type": "number"},
             "run_tests": {
                 "type": "boolean",
@@ -588,10 +593,15 @@ class ProjectTool(Tool):
                 error="project.read requires root and a non-empty files array",
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
-        if len(files) > 20 or any(not isinstance(item, str) or not item.strip() for item in files):
+        if len(files) > 20 or any(
+            not isinstance(item, str | dict) or
+            (isinstance(item, str) and not item.strip()) or
+            (isinstance(item, dict) and not isinstance(item.get("path"), str))
+            for item in files
+        ):
             return OperationResult(
                 success=False,
-                error="project.read accepts at most 20 non-empty relative file paths",
+                error="project.read accepts at most 20 non-empty relative file paths or ranges",
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
         project_root = Path(root).resolve()
@@ -599,20 +609,36 @@ class ProjectTool(Tool):
             return OperationResult(success=False, error=f"project directory does not exist: {project_root}", error_type=ErrorType.NOT_FOUND)
         contents: dict[str, str] = {}
         try:
-            for relative in files:
+            total_bytes = 0
+            for item in files:
+                relative = item if isinstance(item, str) else item["path"]
                 path = (project_root / relative).resolve()
                 if project_root not in path.parents or not path.is_file():
                     raise FileNotFoundError(relative)
                 if path.stat().st_size > 200_000:
                     raise ValueError(f"file is too large to read: {relative}")
-                contents[str(path.relative_to(project_root))] = path.read_text(encoding="utf-8")
+                text = path.read_text(encoding="utf-8")
+                if isinstance(item, dict):
+                    start = item.get("start_line", 1)
+                    end = item.get("end_line")
+                    if not isinstance(start, int) or start < 1 or (
+                        end is not None and (not isinstance(end, int) or end < start)
+                    ):
+                        raise ValueError(f"invalid line range for: {relative}")
+                    lines = text.splitlines(keepends=True)
+                    text = "".join(lines[start - 1:end])
+                total_bytes += len(text.encode("utf-8"))
+                contents[str(path.relative_to(project_root))] = text
         except (OSError, ValueError) as error:
             return OperationResult(
                 success=False,
                 error=str(error),
                 error_type=ErrorType.NOT_FOUND if isinstance(error, FileNotFoundError) else ErrorType.INVALID_ARGUMENT,
             )
-        return OperationResult(success=True, output={"root": str(project_root), "files": contents})
+        return OperationResult(
+            success=True,
+            output={"root": str(project_root), "files": contents, "source_bytes": total_bytes},
+        )
 
     async def _validate(self, args: dict[str, Any], timeout: float) -> OperationResult:
         """Run safe, stack-aware checks after a project mutation."""

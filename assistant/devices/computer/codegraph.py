@@ -19,7 +19,7 @@ class CodeGraphTool(Tool):
             "max_files": {"type": "integer"},
             "query": {"type": "string", "description": "Optional text to match files, modules, or symbols."},
             "kind": {"type": "string", "description": "Optional node kind filter: module or symbol."},
-            "limit": {"type": "integer", "description": "Maximum matching nodes to return."},
+            "limit": {"type": "integer", "description": "Maximum matching nodes to return (1-500)."},
         },
         permissions=["filesystem.read", "project.analysis"],
     )
@@ -35,7 +35,11 @@ class CodeGraphTool(Tool):
             return await SystemGraphAnalyzer().analyze(
                 args["root"], int(args.get("max_files", 300))
             )
-        result = await ProjectAnalyzer().analyze(args["root"], int(args.get("max_files", 500)))
+        persisted = args.get("_persisted_graph")
+        if method == "query" and isinstance(persisted, dict) and persisted.get("graph"):
+            result = OperationResult(success=True, output=persisted)
+        else:
+            result = await ProjectAnalyzer().analyze(args["root"], int(args.get("max_files", 500)))
         if not result.success:
             return result
         output = result.output

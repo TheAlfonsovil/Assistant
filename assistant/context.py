@@ -21,7 +21,7 @@ class ContextBuilder:
     def _typed_task_context(task: Task) -> dict[str, Any]:
         context: dict[str, Any] = {}
         if task.contract is not None:
-            context["contract"] = task.contract.model_dump(mode="json")
+            context["contract"] = task.contract.model_dump(mode="json", exclude_none=True)
         working_memory = task.working_memory.model_dump(mode="json")
         if any(
             value
@@ -37,8 +37,10 @@ class ContextBuilder:
         return {key: value for key, value in contract.items() if value not in (None, [], {})}
 
     @staticmethod
-    def _codegraph_summary(codegraph: dict[str, Any] | None) -> dict[str, Any] | None:
-        """Expose an index to the planner, not the whole persisted graph."""
+    def _codegraph_summary(
+        codegraph: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Expose graph statistics; details are obtained with codegraph.query."""
         if not codegraph:
             return None
         graph = codegraph.get("graph") or {}
@@ -53,28 +55,30 @@ class ContextBuilder:
             "truncated": codegraph.get("truncated") or graph.get("truncated", False),
             "module_count": len(modules),
             "symbol_count": len(symbols),
-            "modules": [
-                {"id": item.get("id"), "file": item.get("file")}
-                for item in modules[:40]
-            ],
-            "symbols": [
-                {
-                    "id": item.get("id"),
-                    "name": item.get("name"),
-                    "file": item.get("file"),
-                    "line": item.get("line"),
-                }
-                for item in symbols[:40]
-            ],
             "edge_count": len(edges),
-            "query_hint": (
-                "Use codegraph.query with root, query, kind, and limit to inspect "
-                "specific files or symbols instead of requesting the full graph."
-            ),
+            "query": {
+                "tool": "codegraph.query",
+                "args": ["root", "query", "kind", "limit"],
+                "note": "Query relevant files or symbols instead of embedding the graph.",
+            },
         }
+
+    @staticmethod
+    def _planner_intent(goal: str) -> str:
+        normalized = goal.casefold()
+        if any(term in normalized for term in ("audit", "audita", "auditar", "review", "revisa", "inspect", "inspecciona")):
+            return "audit"
+        if any(term in normalized for term in ("create", "crear", "nuevo proyecto", "new project", "initialize", "inicializa")):
+            return "create"
+        if any(term in normalized for term in ("open", "abre", "browser", "navegador", "youtube", "url")):
+            return "browser"
+        if any(term in normalized for term in ("edit", "editar", "modify", "modifica", "implement", "implementa", "add", "añade", "mejora")):
+            return "edit"
+        return "general"
 
     async def for_planner(self, task: Task) -> dict[str, Any]:
         memories = await self._memory_context(task.goal)
+        intent = self._planner_intent(task.goal)
         get_project = getattr(self.repository, "get_project", None)
         project = await get_project(task.project_id) if task.project_id and get_project else None
         return {
@@ -85,7 +89,6 @@ class ContextBuilder:
                 "memory_loaded": True,
                 "workspace_root": self.workspace_root,
                 "projects_root": self.projects_root,
-                "execution_target": task.runtime.target,
             },
             "task": {
                 "id": task.id,
@@ -104,24 +107,18 @@ class ContextBuilder:
                 "description": project.description,
                 "project_type": project.project_type,
                 "audit_prompt": project.audit_prompt,
-                "execution_guidance": (
-                    "Use this project-specific instruction as scope guidance, not as a "
-                    f"replacement for the user request: {project.audit_prompt}"
-                ),
                 "codegraph_version": project.codegraph_version,
                 "codegraph_available": project.codegraph is not None,
                 "codegraph": self._codegraph_summary(project.codegraph),
-                "codegraph_usage": (
-                    "Use this graph as initial structural evidence when available. "
-                    "Treat it as stale after project changes; refresh with codegraph.build "
-                    "when the graph is absent, outdated, or insufficient for the requested change."
-                ),
             } if project else None,
             "execution_target": task.runtime.target,
             "constraints": {
                 "max_retries": task.budget.max_retries,
                 "max_execution_time": task.budget.max_execution_time,
                 "max_tool_calls": task.budget.max_tool_calls,
+                "max_codegraph_queries": task.budget.max_codegraph_queries,
+                "max_project_reads": task.budget.max_project_reads,
+                "max_source_bytes": task.budget.max_source_bytes,
                 "max_plan_nodes": task.budget.max_plan_nodes,
                 "planning_rules": [
                     "Each node must be independently executable and have a testable outcome.",
@@ -131,7 +128,7 @@ class ContextBuilder:
                 ],
             },
             "planner_feedback": "",
-            "available_actions": self._available_actions(summary=True),
+            "available_actions": self._available_actions(intent=intent),
             "long_term_memory": memories,
         }
 
@@ -335,24 +332,42 @@ class ContextBuilder:
                 )
         return missing
 
-    def _available_actions(self, summary: bool = False) -> list[dict[str, Any]]:
+    def _available_actions(self, intent: str = "general") -> list[dict[str, Any]]:
         definitions = self.tools.definitions()
-        if not summary:
-            return [
-                {
-                    "name": definition.name,
-                    "methods": definition.methods,
-                    "argument_schema": definition.argument_schema,
-                }
-                for definition in definitions
-            ]
-        return [
-            {
+        preferred = {
+            "audit": {"project", "codegraph", "git"},
+            "create": {"project", "filesystem"},
+            "edit": {"project", "codegraph"},
+            "browser": {"browser", "web"},
+        }.get(intent)
+        primary = [definition for definition in definitions if not preferred or definition.name in preferred]
+        optional_names = {"web", "browser", "deployment", "filesystem", "shell", "process", "git", "codegraph", "project"}
+        optional = [
+            definition for definition in definitions
+            if definition not in primary and definition.name in optional_names
+        ]
+        def describe(definition):
+            return {
                 "name": definition.name,
-                "description": compact(definition.description, limit=600),
                 "methods": definition.methods,
+                "args": {
+                    name: {
+                        key: value
+                        for key, value in schema.items()
+                        if key in {"type", "required", "default", "enum", "description"}
+                    }
+                    if isinstance(schema, dict)
+                    else {"type": schema}
+                    for name, schema in definition.argument_schema.items()
+                },
             }
-            for definition in definitions
+        return [
+            {"group": "primary", "tools": [describe(definition) for definition in primary]},
+            {
+                "group": "optional",
+                "when": "Use only if the request or discovered evidence requires it.",
+                "tools": [describe(definition) for definition in optional],
+            },
         ]
 
     async def _memory_context(self, query: str) -> list[dict[str, Any]]:

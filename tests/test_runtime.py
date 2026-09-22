@@ -548,6 +548,26 @@ async def test_codegraph_query_returns_only_matching_nodes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_project_read_supports_bounded_line_ranges(tmp_path):
+    (tmp_path / "module.py").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="read",
+            args={
+                "root": str(tmp_path),
+                "files": [{"path": "module.py", "start_line": 2, "end_line": 3}],
+            },
+        )
+    )
+
+    assert result.success is True
+    assert result.output["files"]["module.py"] == "two\nthree\n"
+    assert result.output["source_bytes"] == len(b"two\nthree\n")
+
+
+@pytest.mark.asyncio
 async def test_planner_context_includes_registered_codegraph_as_bounded_evidence(tmp_path):
     repository = TaskRepository.__new__(TaskRepository)
     project = Project(
@@ -576,8 +596,32 @@ async def test_planner_context_includes_registered_codegraph_as_bounded_evidence
     planner_context = await context.for_planner(Task(goal="añade autenticación", project_id=project.id))
 
     assert planner_context["project"]["codegraph_version"] == 4
-    assert planner_context["project"]["codegraph"]["modules"][0]["id"] == "src/main.js"
-    assert "query_hint" in planner_context["project"]["codegraph"]
+    assert planner_context["project"]["codegraph"]["module_count"] == 1
+    assert planner_context["project"]["codegraph"]["symbol_count"] == 0
+    assert planner_context["project"]["codegraph"]["query"]["tool"] == "codegraph.query"
+
+
+@pytest.mark.asyncio
+async def test_planner_context_filters_actions_and_keeps_argument_shapes(tmp_path):
+    repository = TaskRepository.__new__(TaskRepository)
+
+    async def search_memory(query, limit=8):
+        return []
+
+    async def list_memory(limit=20):
+        return []
+
+    repository.search_memory = search_memory
+    repository.list_memory = list_memory
+    context = ContextBuilder(repository, build_tool_registry(), workspace_root=str(tmp_path))
+    planner_context = await context.for_planner(Task(goal="audita el proyecto"))
+
+    groups = {item["group"]: item["tools"] for item in planner_context["available_actions"]}
+    action_names = {item["name"] for item in groups["primary"]}
+    assert action_names == {"project", "codegraph", "git"}
+    project = next(item for item in groups["primary"] if item["name"] == "project")
+    assert "run_tests" in project["args"]
+    assert project["args"]["run_tests"]["type"] == "boolean"
 
 
 @pytest.mark.asyncio
@@ -693,9 +737,12 @@ async def test_planner_context_includes_resolved_project_and_workflow_guidance(t
 
         assert context["project"]["name"] == "demo"
         assert context["project"]["path"] == str(tmp_path.resolve())
-        project_action = next(
-            action for action in context["available_actions"] if action["name"] == "project"
+        primary_tools = next(
+            group["tools"]
+            for group in context["available_actions"]
+            if group["group"] == "primary"
         )
+        project_action = next(action for action in primary_tools if action["name"] == "project")
         assert "audit" in project_action["methods"]
     await database.close()
 

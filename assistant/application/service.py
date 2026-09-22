@@ -1463,13 +1463,17 @@ class TaskService:
 
     @staticmethod
     def _operation_key(task_id: str, node_id: str, operation) -> str:
+        operation_args = {
+            key: value for key, value in operation.args.items()
+            if not key.startswith("_")
+        }
         payload = json.dumps(
             {
                 "task_id": task_id,
                 "node_id": node_id,
                 "tool": operation.tool,
                 "method": operation.method,
-                "args": operation.args,
+                "args": operation_args,
             },
             sort_keys=True,
             default=str,
@@ -2660,6 +2664,17 @@ class TaskService:
                 operation.args["root"] = project.path if project else operation.args.get("root", self.context_builder.workspace_root)
             elif operation.tool == "codegraph" and operation.method in {"analyze", "audit", "build", "system", "query"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
+                if operation.method == "query" and project and project.codegraph:
+                    operation.args["_persisted_graph"] = project.codegraph
+            budget_key = None
+            budget_limit = None
+            if operation.tool == "codegraph" and operation.method == "query":
+                budget_key, budget_limit = "codegraph_queries", task.budget.max_codegraph_queries
+            elif operation.tool == "project" and operation.method == "read":
+                budget_key, budget_limit = "project_reads", task.budget.max_project_reads
+            if budget_key and not await self._consume_budget(task, budget_key, budget_limit):
+                await self._block_node_for_budget(task, node, budget_key)
+                return True
             operation_key = operation.idempotency_key or self._operation_key(
                 task.id, node.id, operation
             )
@@ -2702,6 +2717,12 @@ class TaskService:
                 if not lease_held:
                     await self._fail_node(task, node, "node lease lost during tool execution")
                     return True
+                if operation.tool == "project" and operation.method == "read" and operation_result.output:
+                    source_bytes = int(operation_result.output.get("source_bytes", 0))
+                    task.runtime.source_bytes += source_bytes
+                    if task.runtime.source_bytes > task.budget.max_source_bytes:
+                        await self._block_node_for_budget(task, node, "source_bytes")
+                        return True
                 if cancellation.is_set():
                     node.status = NodeStatus.CANCELLED
                     node.output_data = operation_result.model_dump(mode="json")

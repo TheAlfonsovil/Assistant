@@ -114,6 +114,9 @@ class TaskBudget(BaseModel):
     max_recovery_attempts: int = 2
     max_execution_time: float = 86400.0
     max_tool_calls: int = 50
+    max_codegraph_queries: int = 100
+    max_project_reads: int = 100
+    max_source_bytes: int = 20_000_000
     max_plan_nodes: int = 100
 
 
