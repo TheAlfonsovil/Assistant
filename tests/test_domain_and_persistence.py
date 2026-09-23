@@ -8,6 +8,7 @@ from assistant.domain.contracts import (
     AcceptanceCriterion,
     ArtifactKind,
     ArtifactRef,
+    ContractScope,
     CriterionStatus,
     InputRef,
     NodeContract,
@@ -489,6 +490,40 @@ async def test_sqlite_persists_and_searches_long_term_memory(tmp_path):
         )
         memories = await repository.search_memory("Python project")
         assert memories[0].value == "Python"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_persistent_memory_isolated_by_scope(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'scoped-memory.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        await repository.upsert_memory(
+            kind="preference",
+            key="language",
+            value="Python",
+            scope=ContractScope.PROJECT,
+            scope_id="project-a",
+        )
+        await repository.upsert_memory(
+            kind="preference",
+            key="language",
+            value="Java",
+            scope=ContractScope.PROJECT,
+            scope_id="project-b",
+        )
+
+        project_a = await repository.search_memory(
+            "language", scope=ContractScope.PROJECT, scope_id="project-a"
+        )
+        project_b = await repository.search_memory(
+            "language", scope=ContractScope.PROJECT, scope_id="project-b"
+        )
+
+        assert project_a[0].value == "Python"
+        assert project_a[0].scope_id == "project-a"
+        assert project_b[0].value == "Java"
     await database.close()
 
 

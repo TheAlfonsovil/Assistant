@@ -5,9 +5,12 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .contracts import (
+    ContractScope,
+    DecisionRecord,
+    MemoryFact,
     NodeContract,
     NodeRuntimeState,
     TaskContract,
@@ -153,6 +156,165 @@ class Operation(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class AgentDecisionType(StrEnum):
+    """Actions an incremental agent may request from its runtime."""
+
+    EXECUTE = "EXECUTE"
+    DELEGATE = "DELEGATE"
+    WAIT = "WAIT"
+    ASK_USER = "ASK_USER"
+    COMPLETE = "COMPLETE"
+    FAIL = "FAIL"
+
+
+class AgentBudget(BaseModel):
+    """Limits available to one incremental agent run."""
+
+    max_steps: int = Field(default=100, ge=0)
+    max_llm_calls: int = Field(default=20, ge=0)
+    max_tool_calls: int = Field(default=50, ge=0)
+    max_execution_time: float = Field(default=86400.0, ge=0.0)
+    max_tokens: int | None = Field(default=None, ge=0)
+
+
+class WorkingMemoryPatch(BaseModel):
+    """Bounded, explicit changes a worker may make to task-local memory."""
+
+    facts: list[MemoryFact] = Field(default_factory=list, max_length=16)
+    decisions: list[DecisionRecord] = Field(default_factory=list, max_length=16)
+
+
+class AgentDecision(BaseModel):
+    """Typed, runtime-neutral decision emitted by an incremental agent."""
+
+    decision_type: AgentDecisionType = Field(
+        default=AgentDecisionType.WAIT,
+        validation_alias=AliasChoices("decision_type", "type", "action"),
+    )
+    reason: str = Field(default="", max_length=4000)
+    operation: Operation | None = None
+    subtasks: list[str] = Field(default_factory=list)
+    budget: AgentBudget | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    working_memory_updates: WorkingMemoryPatch = Field(default_factory=WorkingMemoryPatch)
+
+    @property
+    def type(self) -> AgentDecisionType:
+        return self.decision_type
+
+    @model_validator(mode="after")
+    def validate_payload(self) -> "AgentDecision":
+        if self.decision_type is AgentDecisionType.EXECUTE and self.operation is None:
+            raise ValueError("EXECUTE decisions require an operation")
+        if self.decision_type is AgentDecisionType.DELEGATE and not self.subtasks:
+            raise ValueError("DELEGATE decisions require at least one subtask")
+        if any(not item.strip() for item in self.subtasks):
+            raise ValueError("subtasks must not contain blank values")
+        return self
+
+
+class WorkerEvidence(BaseModel):
+    """A durable, typed piece of evidence emitted by an agent worker.
+
+    Evidence deliberately contains only JSON-compatible values so it can be
+    stored in task/event payloads and reconstructed with ``model_validate``.
+    """
+
+    id: str = Field(default_factory=lambda: str(uuid4()), min_length=1, max_length=100)
+    kind: str = Field(default="observation", min_length=1, max_length=100)
+    source: str = Field(default="worker", min_length=1, max_length=500)
+    content: Any = Field(
+        default=None,
+        validation_alias=AliasChoices("content", "value", "payload"),
+    )
+    path: str | None = None
+    line_start: int | None = Field(default=None, ge=1)
+    line_end: int | None = Field(default=None, ge=1)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utcnow)
+
+    @model_validator(mode="after")
+    def validate_location(self) -> "WorkerEvidence":
+        if self.line_start is not None and self.line_end is not None:
+            if self.line_end < self.line_start:
+                raise ValueError("line_end must be greater than or equal to line_start")
+        return self
+
+
+class RetryDirective(BaseModel):
+    """A persisted instruction describing whether worker execution may retry."""
+
+    action: str = Field(default="stop", pattern="^(retry|stop|replan|wait)$")
+    reason: str = Field(default="", max_length=4000)
+    attempt: int = Field(default=0, ge=0)
+    max_attempts: int = Field(default=1, ge=1)
+    delay_seconds: float = Field(default=0.0, ge=0.0)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def should_retry(self) -> bool:
+        return self.action == "retry" and self.attempt < self.max_attempts
+
+    @model_validator(mode="after")
+    def validate_retry_budget(self) -> "RetryDirective":
+        if self.action == "retry" and self.attempt >= self.max_attempts:
+            raise ValueError("retry directives require attempt to be below max_attempts")
+        return self
+
+
+class AgentSubtask(BaseModel):
+    """A durable unit of work returned by a worker for later scheduling."""
+
+    id: str = Field(default_factory=lambda: str(uuid4()), min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=10000)
+    status: str = Field(default="PENDING", min_length=1, max_length=32)
+    priority: int = Field(default=1, ge=0)
+    dependencies: list[str] = Field(default_factory=list)
+    input: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_dependencies(self) -> "AgentSubtask":
+        if any(not dependency.strip() for dependency in self.dependencies):
+            raise ValueError("dependencies must not contain blank values")
+        if len(set(self.dependencies)) != len(self.dependencies):
+            raise ValueError("dependencies must not contain duplicates")
+        if self.id in self.dependencies:
+            raise ValueError("a subtask cannot depend on itself")
+        return self
+
+
+class WorkerResult(BaseModel):
+    """The complete JSON-persistible result of one agent worker execution."""
+
+    success: bool
+    output: Any = None
+    summary: str = Field(default="", max_length=10000)
+    error: str | None = Field(default=None, max_length=4000)
+    error_type: ErrorType | None = None
+    evidence: list[WorkerEvidence] = Field(default_factory=list)
+    retry: RetryDirective | None = Field(
+        default=None,
+        validation_alias=AliasChoices("retry", "retry_directive"),
+    )
+    subtasks: list[AgentSubtask] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    started_at: datetime = Field(default_factory=utcnow)
+    finished_at: datetime = Field(default_factory=utcnow)
+    duration: float = Field(default=0.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def validate_result(self) -> "WorkerResult":
+        if self.success and self.error is not None:
+            raise ValueError("successful worker results must not contain an error")
+        if self.success and self.retry is not None and self.retry.should_retry:
+            raise ValueError("successful worker results cannot request a retry")
+        if self.finished_at < self.started_at:
+            raise ValueError("finished_at must be greater than or equal to started_at")
+        return self
+
+
 class OperationResult(BaseModel):
     success: bool
     output: Any = None
@@ -195,6 +357,19 @@ class Task(BaseModel):
         super().__init__(**data)
         if self.root_task_id is None:
             self.root_task_id = self.id
+
+    def apply_worker_decision(self, decision: AgentDecision) -> None:
+        """Apply only the explicitly typed, task-local worker memory patch."""
+        patch = decision.working_memory_updates
+        for fact in patch.facts:
+            self.working_memory.facts = [
+                existing for existing in self.working_memory.facts if existing.key != fact.key
+            ]
+            self.working_memory.facts.append(fact)
+        if patch.decisions:
+            self.working_memory.decisions.extend(patch.decisions)
+        self.working_memory.facts = self.working_memory.facts[-100:]
+        self.working_memory.decisions = self.working_memory.decisions[-100:]
 
 class TaskNode(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
@@ -260,6 +435,16 @@ class MemoryRecord(BaseModel):
     updated_at: datetime = Field(default_factory=utcnow)
     usage_count: int = 0
     expires_at: datetime | None = None
+    scope: ContractScope = ContractScope.GLOBAL
+    scope_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "MemoryRecord":
+        if self.scope is ContractScope.GLOBAL and self.scope_id is not None:
+            raise ValueError("global memory must not have a scope_id")
+        if self.scope is not ContractScope.GLOBAL and not self.scope_id:
+            raise ValueError("scoped memory requires a scope_id")
+        return self
 
 
 class UserProfile(BaseModel):

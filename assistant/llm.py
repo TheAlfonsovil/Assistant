@@ -24,8 +24,8 @@ from .domain.contracts import (
     OutputSpec,
     RetryPolicy,
 )
-from .domain.models import DependencyType, Operation, VerificationDecision
-from .prompts.v1.template import render
+from .domain.models import AgentDecision, DependencyType, Operation, VerificationDecision
+from .prompts.template import render
 
 
 class ActionProposal(BaseModel):
@@ -44,6 +44,22 @@ class NodeDecision(BaseModel):
     subtasks: list[str] = Field(default_factory=list)
     reason: str | None = None
     user_input_required: bool = False
+
+
+class OrchestratorDecision(BaseModel):
+    """Routing decision made before any worker is allowed to execute."""
+
+    stage: str = Field(default="ROUTE", pattern="^(ROUTE|FINALIZE|CONTINUE|BLOCK)$")
+    intent: str = Field(default="general", min_length=1, max_length=120)
+    target_type: str | None = Field(default=None, pattern="^(project|device|resource)$")
+    target_id: str | None = None
+    worker: str = Field(default="GENERAL_WORKER", min_length=1, max_length=120)
+    template: str = Field(default="general", min_length=1, max_length=120)
+    extra_context: dict[str, Any] = Field(default_factory=dict)
+    acceptance_criteria: list[str] = Field(default_factory=list)
+    reason: str = Field(default="", max_length=4000)
+    needs_input: bool = False
+    clarification: str | None = Field(default=None, max_length=2000)
 
 
 class PlanNodeProposal(BaseModel):
@@ -95,6 +111,14 @@ class AssistantResponse(BaseModel):
     evidence: list[str] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     confidence: str = "medium"
+
+
+def parse_agent_decision(raw: str | dict[str, Any]) -> AgentDecision:
+    """Parse one structured agent decision without coupling it to TaskService."""
+
+    if isinstance(raw, str):
+        return AgentDecision.model_validate_json(raw)
+    return AgentDecision.model_validate(raw)
 
 
 def _compact_schema(value: Any) -> Any:
@@ -153,6 +177,8 @@ FinalReport = AssistantResponse
 
 
 class LLMProvider(Protocol):
+    async def orchestrate(self, context: dict[str, Any]) -> OrchestratorDecision: ...
+    async def agent_decide(self, context: dict[str, Any]) -> AgentDecision: ...
     async def decide(self, context: dict[str, Any]) -> NodeDecision: ...
     async def plan(self, context: dict[str, Any]) -> PlanProposal: ...
     async def replan(self, context: dict[str, Any]) -> NodeDecision: ...
@@ -169,6 +195,55 @@ class MockLLMProvider:
 
     async def check_ready(self) -> bool:
         return True
+
+    async def orchestrate(self, context: dict[str, Any]) -> OrchestratorDecision:
+        if context.get("orchestration_stage") == "REVIEW":
+            return OrchestratorDecision(
+                stage="FINALIZE",
+                intent=context.get("intent") or "general",
+                worker=context.get("worker", "GENERAL_WORKER"),
+                template=context.get("template", "general"),
+                reason="The worker completed and its evidence is ready for final response.",
+            )
+        target = context.get("execution_target") or {}
+        project = context.get("project") or {}
+        if target:
+            return OrchestratorDecision(
+                intent="general",
+                target_type=target.get("type"),
+                target_id=target.get("id"),
+                worker="GENERAL_WORKER",
+                template="general",
+                reason="Use the target supplied with the task.",
+            )
+        if project:
+            return OrchestratorDecision(
+                intent="general",
+                target_type="project",
+                target_id=project.get("id"),
+                worker="GENERAL_WORKER",
+                template="general",
+                reason="Use the project attached to the task.",
+            )
+        return OrchestratorDecision(
+            intent="general",
+            worker="GENERAL_WORKER",
+            template="general",
+            reason="No explicit target was required for this operation.",
+        )
+
+    async def agent_decide(self, context: dict[str, Any]) -> AgentDecision:
+        self.decisions += 1
+        if context.get("last_observation") is None:
+            return AgentDecision(
+                decision_type="EXECUTE",
+                reason="Inspect the target before deciding the next evidence step.",
+                operation=self.operation,
+            )
+        return AgentDecision(
+            decision_type="COMPLETE",
+            reason="The configured operation completed and no further step is required.",
+        )
 
     async def decide(self, context: dict[str, Any]) -> NodeDecision:
         self.decisions += 1
@@ -211,6 +286,8 @@ class MockLLMProvider:
 
 class OllamaLLMProvider:
     DEFAULT_REASONING_POLICY: ClassVar[dict[str, str]] = {
+        "ORCHESTRATOR": "high",
+        "AGENT": "high",
         "PLANNER": "medium",
         "NODE_RESOLVER": "low",
         "REPLANNER": "high",
@@ -229,6 +306,7 @@ class OllamaLLMProvider:
         thinking: bool = False,
         reasoning_effort: str = "low",
         reasoning_policy: str = "",
+        keep_alive: str | int | None = "30m",
         context_reserve_tokens: int = 4096,
         trace_sink: Callable[[dict[str, Any]], None] | None = None,
         failure_threshold: int = 3,
@@ -244,6 +322,7 @@ class OllamaLLMProvider:
         self.thinking = thinking
         self.reasoning_effort = reasoning_effort if reasoning_effort in {"low", "medium", "high", "xhigh"} else "low"
         self.reasoning_policy = self._parse_reasoning_policy(reasoning_policy)
+        self.keep_alive = keep_alive
         self.context_reserve_tokens = max(256, min(context_reserve_tokens, self.num_ctx - 256))
         self.trace_sink = trace_sink
         self.request_timeout = timeout if timeout is not None else 300.0
@@ -291,8 +370,28 @@ class OllamaLLMProvider:
         self, role: str, context: dict[str, Any], schema: type[BaseModel]
     ) -> dict[str, Any]:
         """Build and retain the exact request before network I/O starts."""
-        prompt_path = Path(__file__).parent / "prompts" / "v1" / f"{role.lower()}.md"
+        prompt_name = role.lower()
+        if role == "AGENT":
+            prompt_name = {
+                "audit": "audit_worker",
+                "browser": "browser_worker",
+                "implementation": "code_worker",
+                "edit": "code_worker",
+                "tests": "test_worker",
+                "test": "test_worker",
+                "codegraph": "codegraph_worker",
+                "research": "research_worker",
+                "general": "general_worker",
+            }.get(str(context.get("template", "general")), "general_worker")
+        prompt_path = Path(__file__).parent / "prompts" / f"{prompt_name}.md"
         instructions = prompt_path.read_text(encoding="utf-8")
+        if role == "AGENT":
+            instructions = (
+                "Worker decision policy: use EXECUTE for one safe tool operation, DELEGATE "
+                "for bounded independent child tasks, COMPLETE only with evidence, and "
+                "WAIT, ASK_USER, or FAIL when progress cannot continue safely.\n\n"
+                + instructions
+            )
         output_schema = (
             _planner_schema()
             if role == "PLANNER"
@@ -367,6 +466,7 @@ class OllamaLLMProvider:
                             "num_ctx": self.num_ctx,
                         },
                         "think": self._thinking_for_role(role),
+                        "keep_alive": self.keep_alive,
                     },
                 ),
                 timeout=self.request_timeout,
@@ -454,6 +554,12 @@ class OllamaLLMProvider:
 
     async def decide(self, context: dict[str, Any]) -> NodeDecision:
         return await self._ask("NODE_RESOLVER", context, NodeDecision)
+
+    async def agent_decide(self, context: dict[str, Any]) -> AgentDecision:
+        return await self._ask("AGENT", context, AgentDecision)
+
+    async def orchestrate(self, context: dict[str, Any]) -> OrchestratorDecision:
+        return await self._ask("ORCHESTRATOR", context, OrchestratorDecision)
 
     async def plan(self, context: dict[str, Any]) -> PlanProposal:
         return await self._ask("PLANNER", context, PlanProposal)

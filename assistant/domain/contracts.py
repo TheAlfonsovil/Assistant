@@ -199,6 +199,7 @@ class TaskRuntimeState(BaseModel):
 
     target: Any = None
     workflow: str | None = None
+    agent_turns: int = 0
     run_tests: bool = False
     clarification: dict[str, Any] = Field(default_factory=dict)
     final_response: dict[str, Any] | None = None

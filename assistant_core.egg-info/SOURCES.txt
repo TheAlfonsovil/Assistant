@@ -59,7 +59,7 @@ assistant/infrastructure/repositories.py
 assistant/memory/__init__.py
 assistant/memory/sqlite.py
 assistant/prompts/__init__.py
-assistant/prompts/v1/template.py
+assistant/prompts/template.py
 assistant/startup/__init__.py
 assistant/startup/bootstrap.py
 assistant/startup/manager.py

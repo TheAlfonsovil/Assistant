@@ -13,9 +13,10 @@ class Settings(BaseSettings):
     ollama_timeout: float = 36000.0
     ollama_temperature: float = 0.1
     ollama_num_ctx: int = 32768
-    ollama_thinking: bool = False
+    ollama_thinking: bool = True
     ollama_reasoning_effort: str = "low"
-    ollama_reasoning_policy: str = "PLANNER:medium,NODE_RESOLVER:low,REPLANNER:high,VERIFIER:off,FINAL_RESPONSE:low"
+    ollama_reasoning_policy: str = "ORCHESTRATOR:high,AGENT:high,PLANNER:medium,NODE_RESOLVER:low,REPLANNER:high,VERIFIER:off,FINAL_RESPONSE:low"
+    ollama_keep_alive: str = "30m"
     ollama_context_reserve_tokens: int = 4096
     ollama_failure_threshold: int = 3
     ollama_recovery_timeout: float = 30.0

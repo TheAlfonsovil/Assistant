@@ -20,8 +20,20 @@ MARKERS = (
     "constraints",
     "planner_feedback",
     "failure_context",
-    "execution_evidence",
     "output_schema",
+    "working_memory",
+    "last_observation",
+    "evidence",
+    "audit_protocol",
+    "known_targets",
+    "available_workers",
+    "worker",
+    "template",
+    "orchestration_stage",
+    "worker_completion",
+    "execution_evidence",
+    "extra_context",
+    "acceptance_criteria",
 )
 
 
@@ -44,8 +56,23 @@ def render(template: str, context: dict[str, Any], output_schema: dict[str, Any]
         "constraints": context.get("constraints", {}),
         "planner_feedback": context.get("planner_feedback", ""),
         "failure_context": context.get("failure_context", {}),
-        "execution_evidence": context.get("events", context.get("dependency_results", [])),
+        "execution_evidence": context.get(
+            "execution_evidence",
+            context.get("events", context.get("dependency_results", [])),
+        ),
         "output_schema": output_schema,
+        "working_memory": context.get("working_memory", {}),
+        "last_observation": context.get("last_observation", None),
+        "evidence": context.get("evidence", []),
+        "audit_protocol": context.get("audit_protocol", None),
+        "known_targets": context.get("known_targets", []),
+        "available_workers": context.get("available_workers", []),
+        "worker": context.get("worker"),
+        "template": context.get("template"),
+        "orchestration_stage": context.get("orchestration_stage"),
+        "worker_completion": context.get("worker_completion"),
+        "extra_context": context.get("extra_context"),
+        "acceptance_criteria": context.get("acceptance_criteria"),
     }
     rendered = template
     for marker in MARKERS:

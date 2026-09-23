@@ -24,8 +24,8 @@ from ..domain.models import (
     priority_label,
 )
 from ..idle import IdleCycle
-from ..llm import AssistantResponse, NodeDecision, PlanProposal
-from ..prompts.v1.template import render
+from ..llm import AssistantResponse, NodeDecision, OrchestratorDecision, PlanProposal
+from ..prompts.template import render
 from ..runtime import TaskRuntime
 from ..startup.bootstrap import AssistantContext, create_context
 
@@ -37,11 +37,12 @@ def _event_json(event, *, include_prompt: bool = False) -> dict:
         request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
         if not request.get("rendered_instructions"):
             context = payload.get("context")
-            prompt_path = Path(__file__).parent / "prompts" / "v1" / f"{role.lower()}.md"
+            prompt_path = Path(__file__).parents[1] / "prompts" / f"{role.lower()}.md"
             schemas = {
                 "PLANNER": PlanProposal,
                 "NODE_RESOLVER": NodeDecision,
                 "FINAL_RESPONSE": AssistantResponse,
+                "ORCHESTRATOR": OrchestratorDecision,
             }
             schema = schemas.get(role)
             if isinstance(context, dict) and schema is not None and prompt_path.is_file():
@@ -116,7 +117,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.3.4", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.4.0", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parents[2] / "dashboard"
 
 

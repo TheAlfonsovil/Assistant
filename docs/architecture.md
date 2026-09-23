@@ -92,6 +92,26 @@ The planner will receive the definition automatically. Do not modify
 
 The final LLM phase is `FINAL_RESPONSE`, not a mandatory report. It chooses an appropriate response type (`answer`, `report`, `plan`, `clarification`, `blocked` or `action_proposal`) from the original request and execution evidence.
 
+## Task routing and agent lifecycle
+
+Creating a task records two independent inputs: the user goal and an optional
+execution target (`device`, `project` or another resource). Creation does not
+ask a worker to act. On the first execution turn, the `ORCHESTRATOR` receives a
+small routing envelope containing the goal, explicit target, known targets,
+long-term memory and available workers. It returns one routing decision:
+intent, resolved target, worker and template, or a clarification request.
+
+The routing decision is persisted as `ORCHESTRATOR_DECISION`. Only after that
+event does the selected worker receive its bounded context and call tools one
+operation at a time. Tool results are persisted as observations, and each
+subsequent turn returns to the worker/agent until it completes, waits, asks the
+user or fails. The task ledger remains the source of truth, so interruption and
+recovery resume from the last persisted decision or observation.
+
+For project work, the orchestrator receives only codegraph metadata and version
+information. The worker queries the graph or reads project files when evidence
+is needed; the complete graph is never copied into every prompt.
+
 ## Add a new device branch
 
 1. Add a package under `assistant/devices/<name>/`.
@@ -129,8 +149,13 @@ Each project stores a stable name, absolute path, description, project type and
 default audit prompt. A task may reference `project_id`. Resolution is
 deterministic: explicit id, explicit name, one default, or the sole enabled
 project. Multiple projects without an explicit selection remain unresolved and
-should be clarified by the user. The default project workflow starts with a bounded evidence operation, but audit
-tasks are not required to follow a fixed linear recipe. The planner can use the
+should be clarified by the user. Audit tasks use an incremental agent loop over
+the existing `TaskService` runtime: each bounded turn selects one operation,
+persists its decision and observation, and rebuilds context for the next turn.
+Task nodes and events remain the durable ledger, so a run can be resumed without
+a second scheduler. Terminal decisions are explicit (`COMPLETE`, `WAIT`,
+`ASK_USER` or `FAIL`), and unknown tools or exhausted budgets are blocked.
+The agent can use
 first result as an orientation point and add targeted, read-only exploration:
 codegraph queries, bounded project reads, `filesystem.search_text`, or a
 stack-specific validation command. Each next operation must answer an explicit

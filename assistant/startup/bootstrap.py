@@ -52,6 +52,7 @@ async def create_context(
             thinking=resolved_settings.ollama_thinking,
             reasoning_effort=resolved_settings.ollama_reasoning_effort,
             reasoning_policy=resolved_settings.ollama_reasoning_policy,
+            keep_alive=resolved_settings.ollama_keep_alive,
             context_reserve_tokens=resolved_settings.ollama_context_reserve_tokens,
             trace_sink=trace_sink,
             failure_threshold=resolved_settings.ollama_failure_threshold,

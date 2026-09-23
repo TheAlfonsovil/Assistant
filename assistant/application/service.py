@@ -27,6 +27,8 @@ from ..domain.contracts import (
 )
 from ..domain.graph import TaskGraph
 from ..domain.models import (
+    AgentDecision,
+    AgentDecisionType,
     DependencyType,
     ErrorType,
     GraphEdge,
@@ -48,6 +50,7 @@ from ..llm import (
     AssistantResponse,
     LLMProvider,
     NodeDecision,
+    OrchestratorDecision,
     PlanNodeProposal,
     PlanProposal,
 )
@@ -182,9 +185,13 @@ class TaskService:
             task.metadata.setdefault("project_path", project.path)
         if target:
             task.runtime.target = target
+        if self._supports_agent_mode():
+            task.metadata["execution_mode"] = "agent"
+            task.runtime.workflow = "agent"
         if project and self._is_project_audit_request(task.goal):
-            task.runtime.workflow = "project_audit"
-            task.runtime.run_tests = False
+            if task.runtime.workflow is None:
+                task.runtime.workflow = "project_audit"
+            task.runtime.run_tests = True
         if self.default_execution_time is not None:
             task.budget.max_execution_time = max(1.0, self.default_execution_time)
         if requires_project_selection:
@@ -241,6 +248,16 @@ class TaskService:
                 "review the project",
             )
         )
+
+    def _supports_agent_mode(self) -> bool:
+        agent_decide = getattr(self.llm, "agent_decide", None)
+        if not callable(agent_decide):
+            return False
+        from ..llm import MockLLMProvider
+
+        if isinstance(self.llm, MockLLMProvider):
+            return type(self.llm) is not MockLLMProvider and "agent_decide" in type(self.llm).__dict__
+        return True
 
     @staticmethod
     def _requested_target(request: TaskRequest) -> dict[str, str] | None:
@@ -363,8 +380,9 @@ class TaskService:
                 metadata={"project_name": project.name},
             )
         )
-        task.runtime.workflow = "project_audit"
-        task.runtime.run_tests = run_tests
+        task.runtime.workflow = "agent"
+        task.metadata["execution_mode"] = "agent"
+        task.runtime.run_tests = True if run_tests else task.runtime.run_tests
         await self.repository.save_task(task)
         return task
 
@@ -2030,6 +2048,413 @@ class TaskService:
                 edge.to_node for edge in graph.edges if edge.from_node == current_id
             )
 
+    async def _execute_agent_turn(
+        self, task: Task, time_remaining: float | None = None
+    ) -> bool:
+        if task.runtime.agent_turns >= task.budget.max_plan_nodes:
+            return await self._finish_task(
+                task, TaskStatus.BLOCKED, "agent step budget exhausted", "AGENT_BUDGET_EXHAUSTED"
+            ) is not None
+        if task.runtime.llm_calls >= task.budget.max_llm_calls:
+            return await self._finish_task(
+                task, TaskStatus.BLOCKED, "LLM call budget exhausted", "TASK_BUDGET_EXHAUSTED"
+            ) is not None
+        events = await self.repository.list_events(task.id)
+        last_observation = next(
+            (
+                event.payload
+                for event in reversed(events)
+                if event.event_type == "AGENT_OBSERVATION"
+            ),
+            None,
+        )
+        context = await self.context_builder.for_agent_decision(task, last_observation)
+        await self._persist_llm_request(task.id, "AGENT", context, AgentDecision)
+        task.runtime.llm_calls += 1
+        task.runtime.agent_turns += 1
+        decision = await self._call_llm(
+            self.llm.agent_decide(context), time_remaining
+        )
+        task.apply_worker_decision(decision)
+        # Audits must establish their evidence protocol before the model can
+        # finish or choose a different operation.
+        if (
+            self.context_builder._planner_intent(task.goal) == "audit"
+            and not any(event.event_type == "TOOL_CALLED" for event in events)
+        ):
+            decision = AgentDecision(
+                decision_type=AgentDecisionType.EXECUTE,
+                reason="read audit template",
+                operation=Operation(
+                    tool="project",
+                    method="read",
+                    args={"files": ["audit.md"]},
+                ),
+            )
+        elif self.context_builder._planner_intent(task.goal) == "audit":
+            audit_failed = any(
+                event.event_type == "AGENT_OBSERVATION"
+                and not event.payload.get("success", False)
+                for event in events
+            )
+            project_read_attempts = sum(
+                event.event_type == "TOOL_CALLED"
+                and event.payload.get("tool") == "project"
+                and event.payload.get("method") == "read"
+                for event in events
+            )
+            if audit_failed and project_read_attempts == 1:
+                decision = AgentDecision(
+                    decision_type=AgentDecisionType.EXECUTE,
+                    reason="read README fallback",
+                    operation=Operation(
+                        tool="project",
+                        method="read",
+                        args={"files": ["README.md"]},
+                    ),
+                )
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="AGENT_DECISION",
+                payload=decision.model_dump(mode="json"),
+            )
+        )
+        if decision.decision_type is AgentDecisionType.COMPLETE:
+            completion_evidence = [
+                {
+                    "type": event.event_type,
+                    "node_id": event.node_id,
+                    "payload": compact(event.payload, 2400),
+                }
+                for event in events[-12:]
+                if event.event_type in {
+                    "TOOL_RESULT",
+                    "AGENT_OBSERVATION",
+                    "NODE_COMPLETED",
+                    "NODE_FAILED",
+                }
+            ]
+            task.metadata["worker_completion"] = {
+                "reason": decision.reason,
+                "metadata": decision.metadata,
+                "evidence": completion_evidence,
+            }
+            task.metadata["orchestration_stage"] = "REVIEW"
+            task.result_summary = decision.reason or "Worker completed its execution."
+            task.status = TaskStatus.READY
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="WORKER_COMPLETED",
+                    payload=task.metadata["worker_completion"],
+                )
+            )
+            await self.repository.save_task(task)
+            return True
+
+        if decision.decision_type in {AgentDecisionType.FAIL, AgentDecisionType.WAIT, AgentDecisionType.ASK_USER}:
+            task.status = (
+                TaskStatus.FAILED
+                if decision.decision_type is AgentDecisionType.FAIL
+                else TaskStatus.WAITING
+            )
+            task.failure_reason = decision.reason or "agent requires external input"
+            task.finished_at = None if task.status is TaskStatus.WAITING else datetime.now(UTC)
+            if decision.decision_type is AgentDecisionType.ASK_USER:
+                task.runtime.clarification = {"kind": "agent_input", "prompt": decision.reason}
+            await self.repository.save_task(task)
+            return False
+        if decision.decision_type is AgentDecisionType.DELEGATE:
+            return await self._delegate_agent_work(task, decision, time_remaining)
+        if decision.decision_type is not AgentDecisionType.EXECUTE or decision.operation is None:
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="AGENT_DECISION_REJECTED",
+                    payload={"reason": "only EXECUTE decisions are executable"},
+                )
+            )
+            return True
+
+        operation = decision.operation
+        if self.tools.definition(operation.tool) is None:
+            task.status = TaskStatus.BLOCKED
+            task.failure_reason = f"unknown tool: {operation.tool}"
+            task.finished_at = datetime.now(UTC)
+            await self.repository.save_task(task)
+            return False
+        if not await self._consume_budget(task, "tool_calls", task.budget.max_tool_calls):
+            return False
+        project = await self.repository.get_project(task.project_id) if task.project_id else None
+        if operation.tool in {"project", "codegraph"} and project:
+            operation.args["root"] = project.path
+        node = TaskNode(
+            task_id=task.id,
+            type=NodeType.OPERATION,
+            description=decision.reason or f"{operation.tool}.{operation.method}",
+            status=NodeStatus.RUNNING,
+            runtime={"operation_hint": operation.model_dump(mode="json")},
+        )
+        await self.repository.save_node(node)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                node_id=node.id,
+                event_type="TOOL_CALLED",
+                payload={"tool": operation.tool, "method": operation.method},
+            )
+        )
+        task.status = TaskStatus.RUNNING
+        try:
+            operation_error = self.tools.validate_operation(operation)
+            if operation_error:
+                raise ValueError(operation_error)
+            output = await self.tools.execute(operation)
+            observation = output.model_dump(mode="json") if hasattr(output, "model_dump") else output
+            node.output_data = observation if isinstance(observation, dict) else {"value": observation}
+            node.status = NodeStatus.SUCCEEDED
+            node.finished_at = datetime.now(UTC)
+            await self.repository.save_node(node)
+            if isinstance(observation, dict):
+                await self._persist_project_operation_result(task, operation, observation)
+            await self.repository.save_event(
+                TaskEvent(task_id=task.id, node_id=node.id, event_type="TOOL_RESULT", payload=node.output_data)
+            )
+            await self.repository.save_event(
+                TaskEvent(task_id=task.id, node_id=node.id, event_type="AGENT_OBSERVATION", payload=node.output_data)
+            )
+        except Exception as error:
+            node.status = NodeStatus.FAILED
+            node.error = str(error)
+            node.finished_at = datetime.now(UTC)
+            await self.repository.save_node(node)
+            await self.repository.save_event(
+                TaskEvent(task_id=task.id, node_id=node.id, event_type="AGENT_OBSERVATION", payload={"success": False, "error": str(error)})
+            )
+        task.status = TaskStatus.READY
+        await self.repository.save_task(task)
+        return True
+
+    async def _delegate_agent_work(
+        self,
+        task: Task,
+        decision: AgentDecision,
+        time_remaining: float | None = None,
+    ) -> bool:
+        depth = int(task.metadata.get("agent_depth", 0))
+        if depth >= 3:
+            return await self._finish_task(
+                task,
+                TaskStatus.BLOCKED,
+                "agent delegation depth exhausted",
+                "AGENT_DELEGATION_DEPTH_EXHAUSTED",
+            ) is not None
+        if len(decision.subtasks) > task.budget.max_plan_nodes - task.runtime.agent_turns:
+            return await self._finish_task(
+                task,
+                TaskStatus.BLOCKED,
+                "agent delegation exceeds the remaining step budget",
+                "AGENT_DELEGATION_BUDGET_EXHAUSTED",
+            ) is not None
+
+        children: list[Task] = []
+        child_budget = task.budget.model_copy(
+            update=(
+                {
+                    "max_llm_calls": decision.budget.max_llm_calls,
+                    "max_tool_calls": decision.budget.max_tool_calls,
+                    "max_execution_time": decision.budget.max_execution_time,
+                    "max_plan_nodes": decision.budget.max_steps,
+                }
+                if decision.budget is not None
+                else {}
+            )
+        )
+        if time_remaining is not None:
+            child_budget.max_execution_time = min(
+                child_budget.max_execution_time, max(0.0, time_remaining)
+            )
+        for description in decision.subtasks:
+            child = Task(
+                parent_task_id=task.id,
+                root_task_id=task.root_task_id,
+                source="AGENT",
+                project_id=task.project_id,
+                goal=description,
+                description=description,
+                priority=task.priority,
+                status=TaskStatus.READY,
+                budget=child_budget.model_copy(deep=True),
+                metadata={
+                    "execution_mode": "agent",
+                    "orchestration_stage": "WORK",
+                    "worker": task.metadata.get("worker", "GENERAL_WORKER"),
+                    "template": task.metadata.get("template", "general"),
+                    "extra_context": {"delegated_from": task.id},
+                    "agent_depth": depth + 1,
+                },
+            )
+            await self.repository.save_task(child)
+            root = TaskNode(
+                task_id=child.id,
+                type=NodeType.TASK,
+                description=description,
+                status=NodeStatus.READY,
+                priority=child.priority,
+            )
+            await self.repository.save_node(root)
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=child.id,
+                    node_id=root.id,
+                    event_type="TASK_DELEGATED",
+                    payload={"parent_task_id": task.id, "goal": description},
+                )
+            )
+            children.append(child)
+
+        results = []
+        for child in children:
+            result = await self.run_task(child.id, wait_for_retry=False)
+            child_events = await self.repository.list_events(child.id)
+            results.append(
+                {
+                    "task_id": child.id,
+                    "status": result.status.value if result else TaskStatus.FAILED.value,
+                    "summary": result.result_summary if result else None,
+                    "failure_reason": result.failure_reason if result else "child task disappeared",
+                    "evidence": [
+                        {
+                            "type": event.event_type,
+                            "payload": compact(event.payload, 2400),
+                        }
+                        for event in child_events
+                        if event.event_type in {"TOOL_RESULT", "AGENT_OBSERVATION", "WORKER_COMPLETED"}
+                    ][-8:],
+                }
+            )
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="AGENT_DELEGATION_RESULT",
+                payload={"reason": decision.reason, "children": results},
+            )
+        )
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="AGENT_OBSERVATION",
+                payload={
+                    "success": all(item["status"] == TaskStatus.SUCCEEDED.value for item in results),
+                    "delegated_tasks": results,
+                },
+            )
+        )
+        task.status = TaskStatus.READY
+        await self.repository.save_task(task)
+        return True
+
+    async def _execute_orchestrator_turn(
+        self, task: Task, time_remaining: float | None = None
+    ) -> bool:
+        if task.runtime.llm_calls >= task.budget.max_llm_calls:
+            return await self._finish_task(
+                task, TaskStatus.BLOCKED, "LLM call budget exhausted", "TASK_BUDGET_EXHAUSTED"
+            ) is not None
+        context = await self.context_builder.for_orchestrator(task)
+        await self._persist_llm_request(
+            task.id, "ORCHESTRATOR", context, OrchestratorDecision
+        )
+        task.runtime.llm_calls += 1
+        task.runtime.agent_turns += 1
+        decision = await self._call_llm(
+            self.llm.orchestrate(context), time_remaining
+        )
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="ORCHESTRATOR_DECISION",
+                payload=decision.model_dump(mode="json"),
+            )
+        )
+        if context.get("orchestration_stage") == "REVIEW":
+            # Older providers only returned routing fields. Once a worker has
+            # completed, that shape is an implicit finalize decision.
+            if decision.stage in {"FINALIZE", "ROUTE"}:
+                task.metadata["orchestration_stage"] = "FINALIZED"
+                task.status = TaskStatus.SUCCEEDED
+                task.finished_at = datetime.now(UTC)
+                await self.repository.save_task(task)
+                return False
+            if decision.stage == "BLOCK":
+                task.status = TaskStatus.BLOCKED
+                task.failure_reason = decision.reason or "orchestrator blocked finalization"
+                task.finished_at = datetime.now(UTC)
+                await self.repository.save_task(task)
+                return False
+            if decision.needs_input:
+                task.status = TaskStatus.WAITING
+                task.failure_reason = decision.clarification or "orchestrator requires clarification"
+                task.runtime.clarification = {
+                    "kind": "orchestrator_review",
+                    "prompt": task.failure_reason,
+                }
+                await self.repository.save_task(task)
+                return False
+            task.metadata["orchestration_stage"] = "WORK"
+            if decision.worker:
+                task.metadata["worker"] = decision.worker
+            if decision.template:
+                task.metadata["template"] = decision.template
+            if decision.extra_context:
+                task.metadata["extra_context"] = decision.extra_context
+            if decision.acceptance_criteria:
+                task.metadata["acceptance_criteria"] = decision.acceptance_criteria
+            task.status = TaskStatus.READY
+            await self.repository.save_task(task)
+            return True
+        if decision.stage == "BLOCK":
+            task.status = TaskStatus.BLOCKED
+            task.failure_reason = decision.reason or "orchestrator blocked routing"
+            task.finished_at = datetime.now(UTC)
+            await self.repository.save_task(task)
+            return False
+        if decision.needs_input:
+            task.status = TaskStatus.WAITING
+            task.failure_reason = decision.clarification or "orchestrator requires clarification"
+            task.runtime.clarification = {
+                "kind": "orchestrator_routing",
+                "prompt": task.failure_reason,
+            }
+            await self.repository.save_task(task)
+            return False
+        if decision.target_type and decision.target_id:
+            target = {"type": decision.target_type, "id": decision.target_id}
+            if decision.target_type == "project":
+                project = await self.repository.resolve_project(decision.target_id, None)
+                if project is None:
+                    task.status = TaskStatus.BLOCKED
+                    task.failure_reason = f"orchestrator selected unknown project: {decision.target_id}"
+                    task.finished_at = datetime.now(UTC)
+                    await self.repository.save_task(task)
+                    return False
+                task.project_id = project.id
+                task.metadata["project_path"] = project.path
+            elif decision.target_type == "device":
+                self._validate_device_target(decision.target_id)
+            task.runtime.target = target
+        task.metadata["worker"] = decision.worker
+        task.metadata["template"] = decision.template
+        task.metadata["orchestrator_intent"] = decision.intent
+        task.metadata["extra_context"] = decision.extra_context
+        task.metadata["acceptance_criteria"] = decision.acceptance_criteria
+        task.metadata["orchestration_stage"] = "WORK"
+        task.runtime.workflow = "agent"
+        task.status = TaskStatus.READY
+        await self.repository.save_task(task)
+        return True
+
     async def execute_once(self, task_id: str, time_remaining: float | None = None) -> bool:
         task = await self.repository.get_task(task_id)
         if task is None or task.status in {
@@ -2041,6 +2466,14 @@ class TaskService:
         cancellation = self._cancellation_event(task_id)
         if cancellation.is_set():
             return False
+        if (
+            task.runtime.workflow == "agent"
+            or task.metadata.get("execution_mode") == "agent"
+        ) and self._supports_agent_mode():
+            events = await self.repository.list_events(task.id)
+            if task.metadata.get("orchestration_stage", "ROUTE") in {"ROUTE", "REVIEW"}:
+                return await self._execute_orchestrator_turn(task, time_remaining)
+            return await self._execute_agent_turn(task, time_remaining)
         if task.status in {TaskStatus.QUEUED, TaskStatus.PLANNING}:
             was_already_planning = task.status is TaskStatus.PLANNING
             task.status = TaskStatus.PLANNING

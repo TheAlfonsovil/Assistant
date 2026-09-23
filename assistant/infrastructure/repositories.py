@@ -6,8 +6,9 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from assistant.domain.contracts import ArtifactKind, ArtifactRef, TaskContract
+from assistant.domain.contracts import ArtifactKind, ArtifactRef, ContractScope, TaskContract
 from assistant.domain.models import (
+    AgentDecision,
     GraphEdge,
     MemoryRecord,
     NodeStatus,
@@ -258,7 +259,7 @@ class TaskRepository:
         values = {
             "id": memory.id,
             "kind": memory.kind,
-            "key": memory.key,
+            "key": self._memory_storage_key(memory.scope, memory.scope_id, memory.key),
             "value_json": memory.value,
             "source": memory.source,
             "confidence": memory.confidence,
@@ -285,10 +286,11 @@ class TaskRepository:
 
     @staticmethod
     def _memory_record(row: MemoryRow) -> MemoryRecord:
+        scope, scope_id, key = TaskRepository._memory_scope_from_storage_key(row.key)
         return MemoryRecord(
             id=row.id,
             kind=row.kind,
-            key=row.key,
+            key=key,
             value=row.value_json,
             source=row.source,
             confidence=row.confidence,
@@ -296,29 +298,76 @@ class TaskRepository:
             updated_at=row.updated_at,
             usage_count=row.usage_count,
             expires_at=row.expires_at,
+            scope=scope,
+            scope_id=scope_id,
         )
 
-    async def search_memory(self, query: str, limit: int = 10) -> list[MemoryRecord]:
+    @staticmethod
+    def _memory_storage_key(scope: ContractScope, scope_id: str | None, key: str) -> str:
+        if scope is ContractScope.GLOBAL:
+            return key
+        return f"@scope|{scope.value}|{scope_id}|{key}"
+
+    @staticmethod
+    def _memory_scope_from_storage_key(key: str) -> tuple[ContractScope, str | None, str]:
+        if not key.startswith("@scope|"):
+            return ContractScope.GLOBAL, None, key
+        _, scope, scope_id, original_key = key.split("|", 3)
+        return ContractScope(scope), scope_id, original_key
+
+    @staticmethod
+    def _memory_matches(
+        memory: MemoryRecord,
+        scope: ContractScope | None,
+        scope_id: str | None,
+    ) -> bool:
+        return (
+            (scope is None or memory.scope is scope)
+            and (scope_id is None or memory.scope_id == scope_id)
+        )
+
+    async def search_memory(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        scope: ContractScope | None = None,
+        scope_id: str | None = None,
+    ) -> list[MemoryRecord]:
         result = await self.session.execute(select(MemoryRow).order_by(MemoryRow.updated_at.desc()))
         terms = {term.lower() for term in query.split() if len(term) > 2}
         matches = []
         for row in result.scalars():
             if self._memory_expired(row):
                 continue
-            haystack = f"{row.kind} {row.key} {row.value_json}".lower()
-            if not terms or any(term in haystack for term in terms):
+            memory = self._memory_record(row)
+            haystack = f"{memory.kind} {memory.key} {memory.value}".lower()
+            if self._memory_matches(memory, scope, scope_id) and (
+                not terms or any(term in haystack for term in terms)
+            ):
                 row.usage_count += 1
-                matches.append(self._memory_record(row))
+                matches.append(memory)
                 if len(matches) == limit:
                     break
         await self.session.commit()
         return matches
 
-    async def list_memory(self, limit: int = 50) -> list[MemoryRecord]:
+    async def list_memory(
+        self,
+        limit: int = 50,
+        *,
+        scope: ContractScope | None = None,
+        scope_id: str | None = None,
+    ) -> list[MemoryRecord]:
         result = await self.session.execute(
             select(MemoryRow).order_by(MemoryRow.updated_at.desc()).limit(limit)
         )
-        return [self._memory_record(row) for row in result.scalars() if not self._memory_expired(row)]
+        return [
+            memory for row in result.scalars()
+            if not self._memory_expired(row)
+            for memory in [self._memory_record(row)]
+            if self._memory_matches(memory, scope, scope_id)
+        ]
 
     async def upsert_memory(
         self,
@@ -329,9 +378,14 @@ class TaskRepository:
         source: str = "SYSTEM",
         confidence: float = 1.0,
         expires_at: datetime | None = None,
+        scope: ContractScope = ContractScope.GLOBAL,
+        scope_id: str | None = None,
     ) -> MemoryRecord:
         result = await self.session.execute(
-            select(MemoryRow).where(MemoryRow.kind == kind, MemoryRow.key == key)
+            select(MemoryRow).where(
+                MemoryRow.kind == kind,
+                MemoryRow.key == self._memory_storage_key(scope, scope_id, key),
+            )
         )
         row = result.scalars().first()
         now = datetime.now(UTC)
@@ -339,6 +393,7 @@ class TaskRepository:
             memory = MemoryRecord(
                 kind=kind, key=key, value=value, source=source, confidence=confidence,
                 created_at=now, updated_at=now, expires_at=expires_at,
+                scope=scope, scope_id=scope_id,
             )
             await self.save_memory(memory)
             return memory
@@ -349,6 +404,15 @@ class TaskRepository:
         row.expires_at = expires_at
         await self.session.commit()
         return self._memory_record(row)
+
+    async def apply_worker_decision(self, task_id: str, decision: AgentDecision) -> Task:
+        """Persist the worker's bounded task-local memory patch."""
+        task = await self.get_task(task_id)
+        if task is None:
+            raise KeyError(f"Task not found: {task_id}")
+        task.apply_worker_decision(decision)
+        await self.save_task(task)
+        return task
 
     async def delete_memory(self, memory_id: str) -> bool:
         result = await self.session.execute(delete(MemoryRow).where(MemoryRow.id == memory_id))

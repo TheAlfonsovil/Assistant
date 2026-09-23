@@ -202,10 +202,13 @@ por el LLM.
 
 The default provider is Ollama at `http://localhost:11434` using
 `smtek/Qwen3.8-27B:Q3_K_M`. The local integration uses low temperature (`0.1`) and a
-`32768` token context by default because Planner and Resolver responses are
+`32768` token context by default because agent responses are
 schema-constrained decisions, not creative text. The included configuration uses
-phase-specific thinking: Planner `medium`, Resolver `low`, Replanner `high`,
-Verifier `off` and final response `low`. Change the comma-separated
+phase-specific thinking: Agent `high`, Planner `medium`, Resolver `low`,
+Replanner `high`, Verifier `off` and final response `low`. Ollama keeps the
+model loaded for 30 minutes by default so repeated agent turns avoid reload
+cost; stable prompt instructions are emitted before turn-specific evidence to
+maximize prefix/KV-cache reuse. Change the comma-separated
 `ASSISTANT_OLLAMA_REASONING_POLICY` value, or disable the feature globally with
 `ASSISTANT_OLLAMA_THINKING=false`. The prompt budget reserves output tokens, so it
 cannot exceed the configured context window even when

@@ -37,10 +37,12 @@ from assistant.infrastructure.orm import LeaseRow
 from assistant.infrastructure.repositories import TaskRepository
 from assistant.llm import (
     ActionProposal,
+    AgentDecision,
     AssistantResponse,
     FinalReport,
     MockLLMProvider,
     NodeDecision,
+    OrchestratorDecision,
     OllamaLLMProvider,
     PlanNodeProposal,
     PlanProposal,
@@ -48,7 +50,7 @@ from assistant.llm import (
 )
 from assistant.planning import plan_coverage_warnings
 from assistant.project_analysis import ProjectAnalyzer
-from assistant.prompts.v1.template import render
+from assistant.prompts.template import render
 from assistant.recovery import RecoveryManager
 from assistant.runtime import TaskRuntime
 from assistant.startup.manager import StartupManager
@@ -1019,7 +1021,7 @@ def test_project_audit_plan_repairs_direct_answer_into_audit_operation():
 
 
 def test_final_response_template_receives_execution_evidence():
-    template = (Path(__file__).parents[1] / "assistant" / "prompts" / "v1" / "final_response.md").read_text(
+    template = (Path(__file__).parents[1] / "assistant" / "prompts" / "final_response.md").read_text(
         encoding="utf-8"
     )
     rendered = render(
@@ -1478,6 +1480,32 @@ async def test_ollama_provider_applies_reasoning_policy_per_phase():
 
 
 @pytest.mark.asyncio
+async def test_ollama_agent_uses_high_reasoning_and_keep_alive():
+    requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"response": '{"decision_type": "COMPLETE", "reason": "done"}'},
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OllamaLLMProvider(
+        "http://ollama.test",
+        "test-model",
+        client=client,
+        thinking=True,
+        keep_alive="30m",
+    )
+    await provider.agent_decide({"task": {"goal": "inspect"}})
+
+    assert requests[0]["think"] == "high"
+    assert requests[0]["keep_alive"] == "30m"
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_ollama_provider_traces_prompt_and_validated_response():
     traces = []
 
@@ -1699,7 +1727,7 @@ async def test_all_llm_contexts_match_their_role_templates_and_stay_bounded():
     }
 
     for role, context in contexts.items():
-        template = (Path(__file__).parents[1] / "assistant" / "prompts" / "v1" / f"{role}.md").read_text()
+        template = (Path(__file__).parents[1] / "assistant" / "prompts" / f"{role}.md").read_text()
         rendered = render(template, context, {})
         assert "{{" not in rendered
         assert len(rendered) < 15000
@@ -2272,7 +2300,229 @@ async def test_chat_project_audit_gets_dedicated_workflow_metadata(tmp_path):
         )
 
         assert task.runtime.workflow == "project_audit"
-        assert task.runtime.run_tests is False
+        assert task.runtime.run_tests is True
+
+
+@pytest.mark.asyncio
+async def test_agent_audit_context_requires_template_then_general_fallback(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'agent-context.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            ToolRegistry(),
+            workspace_root=str(tmp_path),
+        )
+        (tmp_path / "project").mkdir()
+        project = await service.create_project(
+            Project(name="audit-context", path=str(tmp_path / "project"))
+        )
+        task = await service.create_task(
+            TaskRequest(goal="audita el proyecto", project_id=project.id)
+        )
+
+        context = await service.context_builder.for_agent_decision(task)
+        protocol = context["audit_protocol"]
+
+        assert protocol["required"] is True
+        assert protocol["first_attempt"][0]["args"] == {"files": ["audit.md"]}
+        assert protocol["first_attempt"][1]["args"] == {"files": ["README.md"]}
+        assert "tests_and_validation" in protocol["fallback_template"]
+        assert len(json.dumps(context, default=str)) < 48_000
+
+
+@pytest.mark.asyncio
+async def test_agent_audit_persists_one_tool_observation_per_turn(tmp_path):
+    class AuditAgent(MockLLMProvider):
+        async def agent_decide(self, context):
+            return AgentDecision(
+                decision_type="COMPLETE",
+                reason="model attempted to finish early",
+            )
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'agent-flow.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        (project_path / "audit.md").write_text("# Audit template", encoding="utf-8")
+        service = TaskService(
+            session,
+            AuditAgent(),
+            ToolRegistry(),
+            workspace_root=str(tmp_path),
+        )
+        project = await service.create_project(
+            Project(name="agent-flow", path=str(project_path))
+        )
+        task = await service.create_task(
+            TaskRequest(goal="audita el proyecto", project_id=project.id)
+        )
+
+        result = await service.run_task(task.id)
+        events = await service.repository.list_events(task.id)
+        nodes = await service.repository.list_nodes(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert [event.event_type for event in events].count("AGENT_DECISION") == 2
+        assert [event.event_type for event in events].count("AGENT_OBSERVATION") == 1
+        assert any(node.description == "read audit template" for node in nodes)
+        assert result.runtime.agent_turns == 4
+
+
+@pytest.mark.asyncio
+async def test_agent_audit_uses_readme_when_audit_template_is_missing(tmp_path):
+    class CompletingAgent(MockLLMProvider):
+        async def agent_decide(self, context):
+            return AgentDecision(decision_type="COMPLETE", reason="done")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'audit-fallback.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        (project_path / "README.md").write_text("# Project", encoding="utf-8")
+        service = TaskService(
+            session,
+            CompletingAgent(),
+            ToolRegistry(),
+            workspace_root=str(tmp_path),
+        )
+        project = await service.create_project(
+            Project(name="audit-fallback", path=str(project_path))
+        )
+        task = await service.create_task(
+            TaskRequest(goal="audita el proyecto", project_id=project.id)
+        )
+
+        await service.run_task(task.id)
+        nodes = await service.repository.list_nodes(task.id)
+
+        assert [node.description for node in nodes][-2:] == [
+            "read audit template",
+            "read README fallback",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_routes_target_worker_and_template_before_agent(tmp_path):
+    class RoutingAgent(MockLLMProvider):
+        async def orchestrate(self, context):
+            assert context["phase"] == "ORCHESTRATOR"
+            assert context["known_targets"]
+            return OrchestratorDecision(
+                intent="open_video_site",
+                target_type="device",
+                target_id="computer",
+                worker="BROWSER_WORKER",
+                template="browser",
+                reason="The request is a browser interaction.",
+            )
+
+        async def agent_decide(self, context):
+            assert context["execution_target"] == {
+                "type": "device",
+                "id": "computer",
+            }
+            return AgentDecision(decision_type="COMPLETE", reason="routed")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'orchestrator.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(session, RoutingAgent(), ToolRegistry(), workspace_root=str(tmp_path))
+        task = await service.create_task(
+            TaskRequest(goal="abre youtube", target_type="device", target_id="computer")
+        )
+
+        result = await service.run_task(task.id)
+        events = await service.repository.list_events(task.id)
+        routed = await service.get_task(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert any(event.event_type == "ORCHESTRATOR_DECISION" for event in events)
+        assert routed.metadata["worker"] == "BROWSER_WORKER"
+        assert routed.metadata["template"] == "browser"
+        assert routed.runtime.target == {"type": "device", "id": "computer"}
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_delegation_creates_children_and_returns_evidence_to_parent(tmp_path):
+    class DelegatingAgent(MockLLMProvider):
+        def __init__(self):
+            super().__init__()
+            self.parent_id = None
+
+        async def agent_decide(self, context):
+            task_id = context["task"]["id"]
+            if self.parent_id is None:
+                self.parent_id = task_id
+            if task_id == self.parent_id and context.get("last_observation") is None:
+                return AgentDecision(
+                    decision_type="DELEGATE",
+                    reason="Split the inspection into focused child tasks.",
+                    subtasks=["Inspect configuration", "Inspect tests"],
+                )
+            if task_id != self.parent_id and context.get("last_observation") is None:
+                return AgentDecision(
+                    decision_type="EXECUTE",
+                    reason="Inspect the delegated target.",
+                    operation=Operation(
+                        tool="filesystem", method="exists", args={"path": "."}
+                    ),
+                )
+            return AgentDecision(decision_type="COMPLETE", reason="Evidence collected.")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'delegation.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session, DelegatingAgent(), ToolRegistry(), workspace_root=str(tmp_path)
+        )
+        task = await service.create_task(TaskRequest(goal="coordinate the workspace"))
+
+        result = await service.run_task(task.id)
+        children = [
+            item for item in await service.repository.list_tasks()
+            if item.parent_task_id == task.id
+        ]
+        events = await service.repository.list_events(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert len(children) == 2
+        assert all(item.status is TaskStatus.SUCCEEDED for item in children)
+        assert any(event.event_type == "AGENT_DELEGATION_RESULT" for event in events)
+        assert any(event.event_type == "AGENT_OBSERVATION" for event in events)
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_block_stops_before_worker_execution(tmp_path):
+    class BlockingOrchestrator(MockLLMProvider):
+        def __init__(self):
+            super().__init__()
+            self.worker_called = False
+
+        async def orchestrate(self, context):
+            return OrchestratorDecision(stage="BLOCK", reason="Target is unsafe.")
+
+        async def agent_decide(self, context):
+            self.worker_called = True
+            return AgentDecision(decision_type="COMPLETE", reason="unexpected")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'orchestrator-block.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        provider = BlockingOrchestrator()
+        service = TaskService(session, provider, ToolRegistry(), workspace_root=str(tmp_path))
+        task = await service.create_task(TaskRequest(goal="unsafe action"))
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.BLOCKED
+        assert provider.worker_called is False
+        assert result.failure_reason == "Target is unsafe."
     await database.close()
 
 
