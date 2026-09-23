@@ -1,4 +1,5 @@
 import pytest
+from pathlib import Path
 
 from assistant.audit import (
     AuditFinding,
@@ -36,6 +37,32 @@ def test_general_profile_defines_broad_default_scope():
     )
 
 
+def test_project_analyzer_detects_hybrid_and_non_python_tests(tmp_path: Path):
+    (tmp_path / "package.json").write_text('{"scripts":{"test":"vitest"}}', encoding="utf-8")
+    (tmp_path / "pom.xml").write_text("<project/>", encoding="utf-8")
+    (tmp_path / "src" / "test").mkdir(parents=True)
+    (tmp_path / "src" / "test" / "AppTest.java").write_text("class AppTest {}", encoding="utf-8")
+    (tmp_path / "web").mkdir()
+    (tmp_path / "web" / "App.test.ts").write_text("test('ok', () => {})", encoding="utf-8")
+    files = ProjectAnalyzer._collect_files(tmp_path, 50)
+
+    kinds = ProjectAnalyzer._classify_project(tmp_path, files)
+    tests = ProjectAnalyzer._discover_test_files(tmp_path, files, {"package.json": '{"scripts":{"test":"vitest"}}'})
+    candidates = ProjectAnalyzer._test_candidates(tmp_path, {"package.json": '{"scripts":{"test":"vitest"}}'}, files, tests)
+
+    assert {"web", "jvm"} <= set(kinds)
+    assert "src/test/AppTest.java" in tests
+    assert "web/App.test.ts" in tests
+    assert {item["tool"] for item in candidates} == {"npm", "maven"}
+
+
+def test_project_analyzer_does_not_offer_ruff_without_python(tmp_path: Path):
+    (tmp_path / "Main.java").write_text("class Main {}", encoding="utf-8")
+    files = ProjectAnalyzer._collect_files(tmp_path, 10)
+
+    assert ProjectAnalyzer._quality_tools(tmp_path, {}, files) == []
+
+
 def test_collection_is_read_only_deterministic_and_isolates_failures():
     calls: list[str] = []
 
@@ -60,7 +87,7 @@ def test_collection_is_read_only_deterministic_and_isolates_failures():
     assert report.spec.read_only is True
 
 
-def test_evaluator_orders_findings_and_calculates_optional_score():
+def test_evaluator_orders_findings_without_global_score():
     spec = AuditSpec(target=AuditTarget(identifier="project"), scoring=True)
     report = run_audit(spec, findings=[
         AuditFinding(title="Z", category="quality", status=FindingStatus.PASS, score=1),
@@ -68,7 +95,7 @@ def test_evaluator_orders_findings_and_calculates_optional_score():
     ])
 
     assert [finding.title for finding in report.findings] == ["A", "Z"]
-    assert report.score == 0.5
+    assert "score" not in report.model_dump()
     assert report.passed is False
 
 
@@ -101,7 +128,7 @@ def test_evaluator_does_not_score_deferred_or_out_of_scope_checks():
         ),
     ])
 
-    assert report.score == 1
+    assert "score" not in report.model_dump()
     assert report.passed is True
     assert "Production deployment is absent" in report.deferred
     assert report.accepted_constraints == ["local prototype"]

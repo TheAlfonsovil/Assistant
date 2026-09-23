@@ -110,7 +110,8 @@ Mobile, home and robot intentionally expose mock status tools today. They establ
 - `assistant.capabilities`: user-facing abilities composed from one or more tools.
 - `assistant.application`: task creation, graph execution, leases, idempotency, retries and cancellation.
 - `assistant.runtime`: persistent background loop that resumes queued work from SQLite.
-- `assistant.project_analysis`: bounded project inventory with Python symbols and import edges.
+- `assistant.project_analysis`: bounded project inventory, key-file evidence,
+  multi-language structural symbols, test discovery and validation evidence.
 
 SQLite stores tasks, nodes, edges, events, leases and idempotency results. Important transitions are events for audit and later UI/debugging work.
 
@@ -128,20 +129,27 @@ Each project stores a stable name, absolute path, description, project type and
 default audit prompt. A task may reference `project_id`. Resolution is
 deterministic: explicit id, explicit name, one default, or the sole enabled
 project. Multiple projects without an explicit selection remain unresolved and
-should be clarified by the user. The default code-project workflow creates a
-normal task for each iteration:
+should be clarified by the user. The default project workflow starts with a bounded evidence operation, but audit
+tasks are not required to follow a fixed linear recipe. The planner can use the
+first result as an orientation point and add targeted, read-only exploration:
+codegraph queries, bounded project reads, `filesystem.search_text`, or a
+stack-specific validation command. Each next operation must answer an explicit
+unknown and must remain bounded. A typical audit may therefore look like:
 
 ```text
-audit -> evidence report
+orientation -> targeted search/read/query -> validation -> synthesis
 ```
 
-The audit phase is read-only and does not run tests unless the user explicitly
-requests them. When requested, `project.audit` receives the typed argument
-`run_tests=true`; otherwise it uses `run_tests=false` and reports detected test
-commands without executing them. Implementation, deployment and browser work
-are separate phases and must not be inferred from an audit request. This keeps
-repeated reviews independent and durable without making the project itself an
-endlessly running task.
+`filesystem.search_text` supports one or several words, bounded matches,
+case-sensitivity, `all`/`any` matching and small context windows. It never
+reads supported secret environment files. The audit phase is read-only with
+respect to project files and runs a detected test command by default.
+`project.audit` remains the deterministic evidence collector; it does not
+replace targeted exploration and it does not authorize the LLM to invent
+findings. The final response may render the persisted evidence as an
+`audit.md`-style report, but the report is a synthesis, not the source of
+truth. Implementation, deployment and browser work are separate phases and
+must not be inferred from an audit request.
 
 ## Memory injection
 

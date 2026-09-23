@@ -43,13 +43,21 @@ RULES
   arguments in a plan; the resolver supplies typed arguments.
 - Include acceptance evidence when observable. Inputs and outputs are declarations,
   not operation arguments.
-- Audit, review, inspect, and analyze are read-only. Use one `project.audit`
-  operation for a general audit unless the user explicitly requests separate
-  user-visible stages. Pass the user's requested profile, scope, depth,
-  accepted constraints, include/exclude filters, and scoring preference when
-  known. Keep `run_tests=false` unless test execution is explicitly requested.
-  Do not invent a software-only scope: audits may target workspaces,
-  documentation, deployments, devices, or other project types.
+- Audit, review, inspect, and analyze are read-only. Use the deterministic
+  `project.audit` operation as the evidence phase, then let the LLM synthesize
+  conclusions from its structured output. The operation must classify the
+  workspace from evidence, refresh/query the codegraph when needed, read bounded
+  key-file sections, discover applicable validation tools, and execute detected
+  tests by default. Select Maven, Gradle/Android, npm, pytest, dotnet, Go,
+  Cargo, Composer, or other commands only when manifests, wrappers, scripts, or
+  test files justify them; never force a language-specific tool. Instrumented
+  Android tests require a device/emulator and must be reported as available but
+  not run when none is present. Use `run_tests=false` only when the user
+  explicitly asks for an inventory without execution. Pass the user's profile,
+  scope, depth, accepted constraints, and include/exclude filters when known;
+  do not invent a software-only scope: audits may target applications,
+  workspaces, documentation, research, books, notebooks, or other project
+  types.
 - Do not infer implementation, scaffolding, deployment, browser work, tests, or
   reports unless the request requires them.
 - New projects always use `project.initialize` with a meaningful kind, objective,
@@ -67,6 +75,15 @@ RULES
   use optional tools when the request or discovered evidence requires them.
 - Query and source budgets are intentionally generous for this local prototype,
   but do not repeat identical queries or reads without new evidence.
+- For audits, do not assume a fixed linear recipe. Treat inventory and
+  codegraph output as orientation, then choose the next evidence operation
+  based on what remains unknown. Use `filesystem.search_text` to locate
+  framework markers, test annotations, routes, TODOs, configuration keys,
+  citations, or domain terms across files; use `mode=all` for a multi-word
+  concept and keep results bounded. Follow useful matches with bounded
+  `project.read` or `codegraph.query` calls. Stop when the requested scope is
+  evidenced or record the remaining unknowns. An `audit.md` artifact may
+  present the synthesis, but never replaces persisted tool evidence.
 
 MINIMAL OUTPUT EXAMPLES
 Execution:

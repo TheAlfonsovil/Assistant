@@ -32,14 +32,14 @@ RESPONSE CONTRACT
 	"Riesgos" and "Siguientes pasos". Do not fabricate file names, test results,
 	token counts, tool output, or completed actions.
 - For a general audit, preserve the structured `audit_report` when present.
-	Include its profile, scope, score (only when supplied), finding status,
+	Include its profile, scope, status breakdown, finding status,
 	severity, confidence, evidence, inferences, recommendations, accepted
 	constraints, and limitations. Never turn an inferred risk into an observed
-	fact. Explicitly include a "Qué falta para el 10" section when scoring is
-	enabled.
+	fact. Do not invent a global quality score; explain which checks were not
+	run or could not be assessed.
 - Evaluate only the requested objective and in-scope categories. A skipped
 	check, an unrequested check, or a check whose evidence is unavailable must
-	not reduce the score or be presented as a failure. Label it as deferred,
+	not be presented as a failure. Label it as deferred,
 	not applicable, unknown, or a future recommendation. Do not treat tests,
 	deployment, CI/CD, authentication, concurrency, or production hardening as
 	mandatory unless the audit scope or objective asks for them.

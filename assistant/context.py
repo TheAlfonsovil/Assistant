@@ -468,6 +468,19 @@ class ContextBuilder:
         }
 
     async def for_final_response(self, task: Task, events: list[Any]) -> dict[str, Any]:
+        audit_evidence = []
+        for event in events:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            report = payload.get("audit_report")
+            if report is None:
+                output = payload.get("output")
+                if isinstance(output, dict):
+                    report = output.get("audit_report")
+                    audit = output.get("audit")
+                    if isinstance(audit, dict):
+                        audit_evidence.append({"audit": compact(audit, limit=7000)})
+            if report is not None:
+                audit_evidence.append({"audit_report": compact(report, limit=12000)})
         return {
             "phase": "FINAL_RESPONSE",
             "user_prompt": task.goal,
@@ -480,6 +493,7 @@ class ContextBuilder:
                 "failure_reason": task.failure_reason,
             },
             "assistant_state": {"status": task.status.value},
+            "audit_evidence": audit_evidence[-3:],
             "events": [
                 {
                     "event": event.event_type,

@@ -26,12 +26,16 @@ class FilesystemTool(Tool):
     definition = ToolDefinition(
         name="filesystem",
         description="Local filesystem operations",
-        methods=["read", "write", "create", "delete", "list", "exists", "info", "search"],
+        methods=["read", "write", "create", "delete", "list", "exists", "info", "search", "search_text"],
         argument_schema={
             "path": {"type": "string", "required": True},
             "content": {"type": "string"},
             "pattern": {"type": "string"},
+            "query": {"type": "string"},
             "limit": {"type": "integer"},
+            "case_sensitive": {"type": "boolean"},
+            "mode": {"type": "string", "enum": ["all", "any"]},
+            "context_lines": {"type": "integer"},
         },
         permissions=["filesystem"],
     )
@@ -65,6 +69,65 @@ class FilesystemTool(Tool):
                     }
                     for item in matches
                 ]
+            elif method == "search_text":
+                if not path.is_dir():
+                    raise ValueError("filesystem.search_text requires a directory")
+                query = args.get("query")
+                if not isinstance(query, str) or not query.strip():
+                    raise ValueError("filesystem.search_text requires a non-empty query")
+                terms = query.casefold().split()
+                case_sensitive = bool(args.get("case_sensitive", False))
+                mode = args.get("mode", "all")
+                if mode not in {"all", "any"}:
+                    raise ValueError("filesystem.search_text mode must be all or any")
+                limit = min(max(int(args.get("limit", 100)), 1), 500)
+                context_lines = min(max(int(args.get("context_lines", 1)), 0), 3)
+                pattern = args.get("pattern", "*")
+                ignored_parts = {
+                    ".git", ".venv", "venv", "node_modules", "dist", "build",
+                    "__pycache__", ".pytest_cache", ".ruff_cache",
+                }
+                sensitive_names = {".env", ".env.local", ".env.production"}
+                matches: list[dict[str, Any]] = []
+                for candidate in path.rglob(pattern):
+                    if len(matches) >= limit or not candidate.is_file():
+                        break
+                    if sensitive_names.intersection(part.casefold() for part in candidate.parts):
+                        continue
+                    if ignored_parts.intersection(part.casefold() for part in candidate.parts):
+                        continue
+                    try:
+                        lines = candidate.read_text(encoding="utf-8").splitlines()
+                    except (OSError, UnicodeDecodeError):
+                        continue
+                    for line_number, line in enumerate(lines, start=1):
+                        haystack = line if case_sensitive else line.casefold()
+                        needles = terms if not case_sensitive else query.split()
+                        found = all(term in haystack for term in needles) if mode == "all" else any(
+                            term in haystack for term in needles
+                        )
+                        if not found:
+                            continue
+                        start = max(1, line_number - context_lines)
+                        end = min(len(lines), line_number + context_lines)
+                        matches.append({
+                            "path": str(candidate),
+                            "line": line_number,
+                            "text": line[:1000],
+                            "context": [
+                                {"line": index, "text": lines[index - 1][:1000]}
+                                for index in range(start, end + 1)
+                            ],
+                        })
+                        if len(matches) >= limit:
+                            break
+                output = {
+                    "query": query,
+                    "mode": mode,
+                    "case_sensitive": case_sensitive,
+                    "matches": matches,
+                    "truncated": len(matches) >= limit,
+                }
             elif method == "read":
                 output = await asyncio.to_thread(path.read_text, encoding="utf-8")
             elif method == "write":
@@ -393,7 +456,7 @@ class ProjectTool(Tool):
             "run_tests": {
                 "type": "boolean",
                 "description": "Only for audit: execute a detected test command when true.",
-                "default": False,
+                "default": True,
             },
             "profile": {
                 "type": "string",
@@ -487,7 +550,7 @@ class ProjectTool(Tool):
         if method == "read":
             return await self._read(args)
         if method == "audit":
-            run_tests = args.get("run_tests", False)
+            run_tests = args.get("run_tests", True)
             if not isinstance(run_tests, bool):
                 return OperationResult(
                     success=False,

@@ -89,6 +89,26 @@ async def test_computer_filesystem_info_and_search(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_computer_filesystem_searches_multiple_words_without_reading_env(tmp_path):
+    source = tmp_path / "src.py"
+    source.write_text("def audit_project():\n    return 'ok'\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("audit project secret\n", encoding="utf-8")
+    registry = build_tool_registry()
+
+    result = await registry.execute(
+        Operation(
+            tool="filesystem",
+            method="search_text",
+            args={"path": str(tmp_path), "query": "audit project"},
+        )
+    )
+
+    assert result.success is True
+    assert result.output["matches"][0]["path"].endswith("src.py")
+    assert all(".env" not in item["path"] for item in result.output["matches"])
+
+
+@pytest.mark.asyncio
 async def test_process_tool_manages_long_running_project_process(tmp_path):
     registry = build_tool_registry()
     command = f'"{sys.executable}" -c "import time; print(\'ready\', flush=True); time.sleep(30)"'
@@ -130,8 +150,8 @@ async def test_project_audit_is_read_only_by_default_and_does_not_read_env(tmp_p
     assert "pyproject.toml" in audit["configuration"]
     assert audit["sensitive_files"] == [".env"]
     assert audit["sensitive_file_contents_read"] is False
-    assert audit["run_tests"] is False
-    assert audit["test_result"]["executed"] is False
+    assert audit["run_tests"] is True
+    assert audit["test_result"]["executed"] is True
     assert audit["test_result"]["command"] == "python -m pytest -q"
     assert "do-not-read" not in json.dumps(audit)
 
@@ -923,6 +943,66 @@ def test_project_audit_plan_removes_generic_verification_node():
 
     assert [node.id for node in normalized.nodes] == ["audit"]
     assert normalized.nodes[0].dependencies == []
+
+
+def test_project_audit_plan_refreshes_codegraph_before_audit():
+    task = Task(goal="audita el proyecto")
+    task.runtime.workflow = "project_audit"
+    task.metadata["project_path"] = r"C:\projects\sample"
+    proposal = PlanProposal(
+        nodes=[
+            PlanNodeProposal(
+                id="audit",
+                description="Auditar el proyecto",
+                type="OPERATION",
+                operation_hint=OperationHint(tool="project", method="audit"),
+            )
+        ]
+    )
+
+    normalized = TaskService._normalize_project_audit_plan(task, proposal)
+
+    assert [node.id for node in normalized.nodes] == [
+        "refresh-codegraph-before-audit",
+        "audit",
+    ]
+    assert normalized.nodes[0].operation_hint.tool == "codegraph"
+    assert normalized.nodes[1].dependencies == ["refresh-codegraph-before-audit"]
+    assert normalized.nodes[1].operation_hint.args["run_tests"] is True
+
+
+def test_project_audit_plan_preserves_planner_selected_evidence_stages():
+    task = Task(goal="audita el proyecto")
+    task.runtime.workflow = "project_audit"
+    task.metadata["project_path"] = r"C:\projects\sample"
+    proposal = PlanProposal(
+        nodes=[
+            PlanNodeProposal(
+                id="read-manifests",
+                description="Read manifests",
+                type="OPERATION",
+                operation_hint=OperationHint(tool="project", method="read"),
+            ),
+            PlanNodeProposal(
+                id="audit",
+                description="Auditar el proyecto",
+                type="OPERATION",
+                operation_hint=OperationHint(tool="project", method="audit"),
+            ),
+        ]
+    )
+
+    normalized = TaskService._normalize_project_audit_plan(task, proposal)
+
+    assert [node.id for node in normalized.nodes] == [
+        "refresh-codegraph-before-audit",
+        "read-manifests",
+        "audit",
+    ]
+    assert normalized.nodes[-1].dependencies == [
+        "refresh-codegraph-before-audit",
+        "read-manifests",
+    ]
 
 
 def test_project_audit_plan_repairs_direct_answer_into_audit_operation():

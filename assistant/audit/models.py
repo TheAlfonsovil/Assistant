@@ -38,6 +38,7 @@ class FindingStatus(StrEnum):
     FAIL = "fail"
     WARN = "warn"
     UNKNOWN = "unknown"
+    NOT_RUN = "not_run"
     NOT_APPLICABLE = "not_applicable"
 
 
@@ -138,8 +139,8 @@ class AuditReport(BaseModel):
     findings: list[AuditFinding] = Field(default_factory=list)
     facts: Facts = Field(default_factory=Facts)
     generated_at: datetime = Field(default_factory=audit_now)
-    score: float | None = Field(default=None, ge=0.0, le=1.0)
     summary: str = ""
+    breakdown: dict[str, int] = Field(default_factory=dict)
     errors: list[str] = Field(default_factory=list)
     accepted_constraints: list[str] = Field(default_factory=list)
     deferred: list[str] = Field(default_factory=list)

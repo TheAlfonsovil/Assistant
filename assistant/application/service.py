@@ -178,6 +178,8 @@ class TaskService:
         task_data = request.model_dump(exclude={"project_name", "target_type", "target_id"})
         task_data["project_id"] = project.id if project else None
         task = Task.model_validate(task_data)
+        if project:
+            task.metadata.setdefault("project_path", project.path)
         if target:
             task.runtime.target = target
         if project and self._is_project_audit_request(task.goal):
@@ -1134,7 +1136,13 @@ class TaskService:
 
     @staticmethod
     def _normalize_project_audit_plan(task: Task, proposal: PlanProposal) -> PlanProposal:
-        """Keep the dedicated audit workflow focused on its single audit operation."""
+        """Keep audit evidence deterministic while preserving useful agent stages.
+
+        The planner may add bounded reads, graph queries, or applicable
+        validation operations. Those stages are evidence-producing work and
+        must not be discarded merely because the audit operation remains the
+        canonical structured collector.
+        """
         if task.runtime.workflow != "project_audit":
             return proposal
         audit_nodes = [
@@ -1153,11 +1161,51 @@ class TaskService:
                 return fallback
             return proposal
         audit = audit_nodes[0]
+        project_path = task.metadata.get("project_path")
+        executable_nodes = [
+            node for node in proposal.nodes
+            if node.operation_hint is not None
+            and node.id != audit.id
+            and node.type == "OPERATION"
+        ]
+        graph = next(
+            (
+                node for node in executable_nodes
+                if node.operation_hint
+                and node.operation_hint.tool == "codegraph"
+                and node.operation_hint.method == "build"
+            ),
+            None,
+        )
+        if graph is None and isinstance(project_path, str) and project_path:
+            graph = PlanNodeProposal(
+                id="refresh-codegraph-before-audit",
+                description="Actualizar el codegraph del proyecto antes de elaborar la auditoría",
+                type="OPERATION",
+                operation_hint=OperationHint(
+                    tool="codegraph",
+                    method="build",
+                    args={"root": project_path, "max_files": 500},
+                    timeout=300,
+                ),
+            )
+            executable_nodes.insert(0, graph)
+        evidence_dependencies = [node.id for node in executable_nodes]
+        dependencies = list(dict.fromkeys([*evidence_dependencies, *audit.dependencies]))
         # The audit tool returns structured findings; prose acceptance phrases
         # from the planner cannot be matched reliably against that payload and
         # would cause the same idempotent audit to retry unnecessarily.
-        audit = audit.model_copy(update={"dependencies": [], "acceptance": {}})
-        return proposal.model_copy(update={"nodes": [audit]})
+        audit = audit.model_copy(update={
+            "dependencies": dependencies,
+            "acceptance": {},
+            "operation_hint": audit.operation_hint.model_copy(update={
+                "args": {
+                    **audit.operation_hint.args,
+                    "run_tests": True,
+                }
+            }) if audit.operation_hint else None,
+        })
+        return proposal.model_copy(update={"nodes": [*executable_nodes, audit]})
 
     @staticmethod
     def _normalize_browser_intent(task: Task, proposal: PlanProposal) -> PlanProposal:
@@ -1385,10 +1433,10 @@ class TaskService:
                 "inspecciona",
                 "analiza",
                 "analyze",
-                "sonar",
             )
         )
-        tests_requested = any(
+        tests_requested = True
+        explicit_tests_requested = any(
             term in goal
             for term in (
                 "run tests",
@@ -1432,11 +1480,10 @@ class TaskService:
                     method="audit",
                     args={
                         "max_files": 500,
-                        "run_tests": tests_requested,
+                        "run_tests": tests_requested or explicit_tests_requested,
                         "objective": task.goal,
                         "profile": "general",
                         "depth": "standard",
-                        "scoring": True,
                     },
                     timeout=300,
                 ),

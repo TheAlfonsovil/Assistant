@@ -89,9 +89,9 @@ Rules:
 - When the node asks to audit a project or report findings with evidence, prefer
   `project.audit`; it reads bounded configuration safely, detects tests, and runs only
   a supported test command when one is discoverable.
-- `project.audit` is read-only. Set `run_tests=false` for a plain audit (the
-  default); set `run_tests=true` only when the user explicitly requested test
-  execution. A plain audit reports the detected test command without executing it.
+- `project.audit` is read-only with respect to project files. It runs a
+  detected test command by default; set `run_tests=false` only when the user
+  explicitly requests an inventory without execution. A plain audit reports the detected test command without executing it.
 - Use the registered project path as the project root. Do not use the assistant
   workspace as a substitute. `project.create` currently creates only a
   directory; use `project.initialize` when the user asks for a new project with
