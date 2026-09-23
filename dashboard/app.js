@@ -100,7 +100,7 @@ function renderTasks(tasks) {
   const active = tasks.filter((task) => activeStatuses.includes(task.status));
   const next = tasks.filter((task) => ["QUEUED", "READY"].includes(task.status)).sort((a, b) => (b.priority || 0) - (a.priority || 0) || new Date(a.created_at) - new Date(b.created_at))[0];
   $("#queue-summary").innerHTML = `<span><small>EN CURSO</small><b>${active.length}</b></span><span><small>SIGUIENTE</small><b>${next ? esc(next.goal) : "—"}</b></span><span><small>ACTUALIZACIÓN</small><b>En vivo</b></span>`;
-  $("#task-list").innerHTML = filtered.map((task) => `<button class="task-card ${state.selectedTask === task.id ? "selected" : ""}" data-task="${esc(task.id)}"><i class="status-mark status-${esc(task.status)}"></i><span><strong>${esc(task.goal)}</strong><small>${shortId(task.id)} · ${date(task.created_at)} · ${esc(task.priority_label || "Medium")}</small></span><em class="status-${esc(task.status)}">${esc(task.status)}</em></button>`).join("") || `<div class="empty">No hay tareas persistidas.</div>`;
+  $("#task-list").innerHTML = filtered.map((task) => `<button class="task-card ${state.selectedTask === task.id ? "selected" : ""}" data-task="${esc(task.id)}"><i class="status-mark status-${esc(task.status)}"></i><span><strong>${task.parent_task_id ? "↳ " : ""}${esc(task.goal)}</strong><small>${task.parent_task_id ? "SUBTASK · " : ""}${shortId(task.id)} · ${date(task.created_at)} · ${esc(task.priority_label || "Medium")}</small></span><em class="status-${esc(task.status)}">${esc(task.status)}</em></button>`).join("") || `<div class="empty">No hay tareas persistidas.</div>`;
   $("#task-list").querySelectorAll("[data-task]").forEach((button) => button.addEventListener("click", () => selectTask(button.dataset.task)));
 }
 function renderEvents(events) {
@@ -193,6 +193,11 @@ function taskActivity(taskId) {
   if (!event) return { label: "Esperando actividad", detail: "La tarea aún no ha emitido eventos." };
   const labels = {
     TASK_CREATED: "Tarea creada",
+    ORCHESTRATOR_DECISION: `Orquestador: ${event.payload?.worker || "routing"}`,
+    AGENT_DECISION: `Worker: ${event.payload?.decision_type || "decisión"}`,
+    AGENT_DELEGATION_RESULT: "Delegación completada",
+    TASK_DELEGATED: "Subtarea creada",
+    WORKER_COMPLETED: "Worker completó su turno",
     TASK_PLANNED: "Planner preparando el grafo",
     LLM_REQUEST: `${event.payload?.role || "LLM"} preparando contexto`,
     LLM_RESPONSE: `${event.payload?.role || "LLM"} respondió`,
@@ -217,6 +222,30 @@ function taskActivity(taskId) {
     BUDGET_EXHAUSTED: "Presupuesto agotado",
   };
   return { label: labels[event.event_type] || event.event_type, detail: date(event.created_at) };
+}
+function workflowGraph(taskId, task, nodes, edges, events) {
+  const workflow = [];
+  const add = (kind, title, detail, status = "READY", meta = "") => workflow.push({ kind, title, detail, status, meta });
+  add("start", "Tarea creada", `${shortId(taskId)} · ${date(task.created_at)}`, task.status);
+  const route = events.find((event) => event.event_type === "ORCHESTRATOR_DECISION");
+  if (route) {
+    const payload = route.payload || {};
+    add("orchestrator", "ORCHESTRATOR", `${payload.intent || "general"} · ${payload.worker || "GENERAL_WORKER"}`, payload.stage === "BLOCK" ? "BLOCKED" : "SUCCEEDED", payload.reason || "Routing inicial");
+  }
+  if (task.metadata?.worker || task.metadata?.template) {
+    add("worker", task.metadata.worker || "WORKER", `template: ${task.metadata.template || "general"}`, task.status, "Contexto de ejecución seleccionado");
+  }
+  nodes.forEach((node) => add("operation", node.description || node.type, `${node.type} · ${node.status}`, node.status, node.error || ""));
+  const children = (state.data?.tasks || []).filter((item) => item.parent_task_id === taskId);
+  children.forEach((child) => add("delegate", child.goal, `subtask · ${child.status}`, child.status, `hijo ${shortId(child.id)}`));
+  const delegation = events.find((event) => event.event_type === "AGENT_DELEGATION_RESULT");
+  if (delegation && !children.length) add("delegate", "Delegación solicitada", "Subtasks pendientes de persistir", "WAITING");
+  if (["SUCCEEDED", "FAILED", "BLOCKED", "CANCELLED"].includes(task.status)) {
+    add("finish", task.status === "SUCCEEDED" ? "Workflow finalizado" : "Workflow detenido", task.status, task.status, task.failure_reason || task.result_summary || "Estado terminal");
+  } else {
+    add("next", "Siguiente turno", task.status, task.status, "El runtime continuará desde el ledger");
+  }
+  return workflow.map((item, index) => `<div class="workflow-node workflow-${esc(item.kind)} status-${esc(item.status)}"><span>${String(index + 1).padStart(2, "0")}</span><div><strong>${esc(item.title)}</strong><small>${esc(item.detail)}</small>${item.meta ? `<em>${esc(item.meta)}</em>` : ""}</div></div>`).join("");
 }
 function renderTrace(taskId) {
   if (!taskId || !state.data) return;
@@ -262,6 +291,10 @@ function renderInspector(taskId) {
   const report = finalResponse ? `<section class="final-report"><div class="final-report-head"><p class="kicker">RESPUESTA FINAL</p><span class="badge status-${esc(task.status)}">${esc(finalResponse.response_type || "report")}</span></div><h4>${esc(finalResponse.title || "Resultado de la tarea")}</h4><p>${esc(finalResponse.summary || "")}</p>${Object.entries(finalResponse.sections || {}).map(([title, items]) => `<div class="final-report-section"><strong>${esc(title)}</strong><ul>${(items || []).map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>`).join("")} ${(finalResponse.evidence || []).length ? `<div class="final-report-section"><strong>Evidencia</strong><ul>${finalResponse.evidence.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}${(finalResponse.limitations || []).length ? `<div class="final-report-section report-limitations"><strong>Limitaciones</strong><ul>${finalResponse.limitations.map((item) => `<li>${esc(item)}</li>`).join("")}</ul></div>` : ""}</section>` : "";
   const approvalNode = nodes.find((node) => ["WAITING_APPROVAL", "APPROVAL_REQUIRED"].includes(node.status)) || null;
   $("#task-inspector").innerHTML = `<div class="inspector-head"><div><p class="kicker">TASK INSPECTOR</p><h3>${esc(task.goal)}</h3><small>${shortId(task.id)} · ${esc(task.status)}</small></div><span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div><div class="inspector-activity"><span class="activity-pulse"></span><div><strong>${esc(activity.label)}</strong><small>${esc(activity.detail)}</small></div></div>${recovery}${report}<div class="inspector-actions">${approvalNode ? `<button class="button primary" data-action="approval" data-node-id="${esc(approvalNode.id)}">Aprobar nodo</button>` : ""}${["WAITING", "BLOCKED"].includes(task.status) ? `<button class="button primary" data-action="input">Resolver</button>` : ""}${["BLOCKED", "FAILED"].includes(task.status) ? `<button class="button" data-action="replan">Replanificar</button>` : ""}${task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : ""}${!["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? `<button class="button ghost" data-action="cancel">Cancelar</button>` : ""}<button class="button ghost" data-action="trace">Ver traza</button></div><div class="usage-strip"><span>LLM <b>${usage?.llm_calls || 0}</b></span><span>TOOLS <b>${usage?.tool_calls || 0}</b></span><span>NODOS <b>${nodes.length}</b></span><span>${tokenLabel} <b>${tokenValue}</b></span></div><p class="kicker">GRAFO DE DECISIONES · ${edges.length} DEPENDENCIAS</p><div class="graph-canvas">${nodes.map((node, index) => `<div class="decision-node status-${esc(node.status)}"><span>${String(index + 1).padStart(2, "0")}</span><strong>${esc(node.description || node.type)}</strong><small>${esc(node.type)} · ${esc(node.status)}</small>${edges.filter((edge) => edge.to_node === node.id).map((edge) => `<i>← ${esc(nodes.find((candidate) => candidate.id === edge.from_node)?.description || shortId(edge.from_node))}</i>`).join("")}</div>`).join("") || "<div class=empty>Sin nodos planificados.</div>"}</div><p class="kicker inspector-events-title">HISTORIAL COMPLETO · ${events.length} EVENTOS</p><div class="inspector-events">${eventRows || "<div class=empty>Sin eventos.</div>"}</div>`;
+  const workflowPanel = document.createElement("section");
+  workflowPanel.className = "workflow-panel";
+  workflowPanel.innerHTML = `<div class="workflow-head"><p class="kicker">WORKFLOW GRAPH</p><small>${events.length} eventos · ${nodes.length} nodos · ${(state.data?.tasks || []).filter((item) => item.parent_task_id === taskId).length} subtareas</small></div><div class="workflow-canvas">${workflowGraph(taskId, task, nodes, edges, events)}</div>`;
+  $("#task-inspector").querySelector(".inspector-actions")?.after(workflowPanel);
   $("#task-inspector").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => taskAction(button.dataset.action, task, button.dataset.nodeId)));
 }
 async function loadTaskDetail(taskId, force = false) {

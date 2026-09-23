@@ -70,6 +70,7 @@ assistant_core.egg-info/dependency_links.txt
 assistant_core.egg-info/entry_points.txt
 assistant_core.egg-info/requires.txt
 assistant_core.egg-info/top_level.txt
+tests/test_agent_decisions.py
 tests/test_audit.py
 tests/test_domain_and_persistence.py
 tests/test_runtime.py
