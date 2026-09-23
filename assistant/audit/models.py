@@ -48,6 +48,7 @@ class AuditProfile(BaseModel):
     description: str = ""
     target_kinds: list[TargetKind] = Field(default_factory=lambda: list(TargetKind))
     default_depth: Depth = Depth.STANDARD
+    default_scope: list[str] = Field(default_factory=list)
     checks: list[str] = Field(default_factory=list)
 
 
@@ -125,6 +126,9 @@ class AuditFinding(BaseModel):
     inferences: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
     score: float | None = Field(default=None, ge=0.0, le=1.0)
+    in_scope: bool = True
+    effort: str | None = None
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
 
 class AuditReport(BaseModel):
@@ -137,7 +141,12 @@ class AuditReport(BaseModel):
     score: float | None = Field(default=None, ge=0.0, le=1.0)
     summary: str = ""
     errors: list[str] = Field(default_factory=list)
+    accepted_constraints: list[str] = Field(default_factory=list)
+    deferred: list[str] = Field(default_factory=list)
 
     @property
     def passed(self) -> bool:
-        return not any(f.status is FindingStatus.FAIL for f in self.findings)
+        return not any(
+            f.status is FindingStatus.FAIL and f.in_scope
+            for f in self.findings
+        )

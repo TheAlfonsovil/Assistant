@@ -18,6 +18,7 @@ from .audit import (
     FindingStatus,
     TargetKind,
     evaluate,
+    get_profile,
 )
 from .domain.models import ErrorType, OperationResult
 
@@ -94,6 +95,7 @@ class ProjectAnalyzer:
         include: list[str] | None = None,
         exclude: list[str] | None = None,
         scoring: bool = True,
+        objective: str = "Assess the target and report actionable findings.",
     ) -> OperationResult:
         """Collect safe project evidence and optionally run detected tests."""
         structural = await self.analyze(root, max_files)
@@ -192,16 +194,21 @@ class ProjectAnalyzer:
                 ],
             }
         })
+        audit_profile = get_profile(profile)
+        effective_scope = list(dict.fromkeys(
+            scope if scope else audit_profile.default_scope
+        ))
+        effective_depth = depth or audit_profile.default_depth.value
         audit_spec = AuditSpec(
             target=AuditTarget(
                 kind=TargetKind.PROJECT,
                 identifier=str(project_root),
                 name=project_root.name,
             ),
-            objective="Assess the target and report actionable findings.",
+            objective=objective,
             profile=profile,
-            scope=scope or [],
-            depth=depth,
+            scope=effective_scope,
+            depth=effective_depth,
             accepted_constraints=accepted_constraints or [],
             include=include or [],
             exclude=exclude or [],
@@ -263,6 +270,7 @@ class ProjectAnalyzer:
             recommendations=["Increase max_files or narrow the include scope for a deeper audit."]
             if structural.output["truncated"] else [],
             score=0.6 if structural.output["truncated"] else 1.0,
+            effort="low",
         ))
         findings.append(AuditFinding(
             id="security.sensitive-files",
@@ -280,6 +288,8 @@ class ProjectAnalyzer:
             recommendations=["Verify that sensitive files are excluded from version control."]
             if sensitive_files else [],
             score=0.7 if sensitive_files else 1.0,
+            effort="low",
+            confidence=0.98 if sensitive_files else 0.9,
         ))
         findings.append(AuditFinding(
             id="testing.execution",
@@ -288,30 +298,26 @@ class ProjectAnalyzer:
             status=(
                 FindingStatus.PASS
                 if test_result.get("executed") and test_result.get("exit_code") == 0
-                else FindingStatus.WARN
-                if test_files
-                else FindingStatus.UNKNOWN
+                else FindingStatus.NOT_APPLICABLE
             ),
-            severity="medium" if test_files and not test_result.get("executed") else "info",
+            severity="info",
             message=(
-                "Tests were detected but not executed."
-                if test_files and not test_result.get("executed")
-                else "Tests completed successfully."
+                "Tests were executed and completed successfully."
                 if test_result.get("executed") and test_result.get("exit_code") == 0
-                else "No supported test evidence was found."
+                else "Test execution was not requested; this check is not scored."
             ),
             evidence=[evidence[2]],
-            recommendations=["Run the detected test command for a complete audit."]
+            recommendations=["Run the detected test command when test validation is in scope."]
             if test_files and not test_result.get("executed") else [],
-            score=0.6 if test_files and not test_result.get("executed") else
-            1.0 if test_result.get("executed") and test_result.get("exit_code") == 0 else 0.5,
+            score=1.0 if test_result.get("executed") and test_result.get("exit_code") == 0 else None,
+            effort="low",
         ))
         findings.append(AuditFinding(
             id="documentation.available",
             title="Documentation artifacts are available",
             category="documentation",
-            status=FindingStatus.PASS if documentation_files else FindingStatus.UNKNOWN,
-            severity="info" if documentation_files else "low",
+            status=FindingStatus.PASS if documentation_files else FindingStatus.NOT_APPLICABLE,
+            severity="info",
             message=(
                 f"Detected {len(documentation_files)} documentation artifact(s)."
                 if documentation_files
@@ -320,14 +326,15 @@ class ProjectAnalyzer:
             evidence=[evidence[3]],
             recommendations=["Add a README or project guide describing purpose, setup, and validation."]
             if not documentation_files else [],
-            score=1.0 if documentation_files else 0.5,
+            score=1.0 if documentation_files else None,
+            effort="low",
         ))
         findings.append(AuditFinding(
             id="operations.deployment-artifacts",
             title="Deployment artifacts are inventoried",
             category="operations",
-            status=FindingStatus.PASS if deployment_files else FindingStatus.UNKNOWN,
-            severity="info" if deployment_files else "low",
+            status=FindingStatus.PASS if deployment_files else FindingStatus.NOT_APPLICABLE,
+            severity="info",
             message=(
                 f"Detected {len(deployment_files)} deployment or automation artifact(s)."
                 if deployment_files
@@ -336,14 +343,15 @@ class ProjectAnalyzer:
             evidence=[evidence[3]],
             recommendations=["Document the intended local or production execution path."]
             if not deployment_files else [],
-            score=1.0 if deployment_files else 0.5,
+            score=1.0 if deployment_files else None,
+            effort="medium",
         ))
         findings.append(AuditFinding(
             id="repository.ignore-policy",
             title="Repository ignore policy is visible",
             category="configuration",
-            status=FindingStatus.PASS if gitignore_rules else FindingStatus.UNKNOWN,
-            severity="info" if gitignore_rules else "low",
+            status=FindingStatus.PASS if gitignore_rules else FindingStatus.NOT_APPLICABLE,
+            severity="info",
             message=(
                 f"Detected {len(gitignore_rules)} non-comment ignore rule(s)."
                 if gitignore_rules
@@ -355,8 +363,25 @@ class ProjectAnalyzer:
             ],
             recommendations=["Verify sensitive files and local databases are explicitly ignored."]
             if sensitive_files and not gitignore_rules else [],
-            score=1.0 if gitignore_rules else 0.5,
+            score=1.0 if gitignore_rules else None,
+            effort="low",
         ))
+        requested_scope = {item.casefold() for item in (scope or [])}
+        if not requested_scope:
+            requested_scope = {item.casefold() for item in effective_scope}
+        aliases = {
+            "testing": {"testing", "tests", "quality"},
+            "security": {"security", "privacy", "configuration"},
+            "documentation": {"documentation", "docs", "completeness"},
+            "operations": {"operations", "deployment", "deploy"},
+            "configuration": {"configuration", "security", "quality"},
+            "coverage": {"coverage", "structure", "architecture"},
+        }
+        for finding in findings:
+            category_scope = aliases.get(finding.category, {finding.category})
+            finding.in_scope = not requested_scope or bool(category_scope & requested_scope)
+            if finding.status is FindingStatus.NOT_APPLICABLE or not finding.in_scope:
+                finding.score = None
         report = evaluate(
             audit_spec,
             Facts(

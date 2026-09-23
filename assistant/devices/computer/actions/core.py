@@ -400,6 +400,10 @@ class ProjectTool(Tool):
                 "description": "Audit profile, for example general, software-project, documentation, or deployment.",
                 "default": "general",
             },
+            "objective": {
+                "type": "string",
+                "description": "What the audit is intended to assess; used to interpret findings.",
+            },
             "scope": {
                 "type": "array",
                 "description": "Audit dimensions to inspect. Empty selects the profile defaults.",
@@ -514,6 +518,7 @@ class ProjectTool(Tool):
                 float(args.get("timeout", timeout)),
                 run_tests=run_tests,
                 profile=str(args.get("profile", "general")),
+                objective=str(args.get("objective", "Assess the target and report actionable findings.")),
                 scope=args.get("scope"),
                 depth=str(args.get("depth", "standard")),
                 accepted_constraints=args.get("accepted_constraints"),

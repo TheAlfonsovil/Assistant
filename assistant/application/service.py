@@ -1430,7 +1430,14 @@ class TaskService:
                 operation_hint=OperationHint(
                     tool="project",
                     method="audit",
-                    args={"max_files": 500, "run_tests": tests_requested},
+                    args={
+                        "max_files": 500,
+                        "run_tests": tests_requested,
+                        "objective": task.goal,
+                        "profile": "general",
+                        "depth": "standard",
+                        "scoring": True,
+                    },
                     timeout=300,
                 ),
             )

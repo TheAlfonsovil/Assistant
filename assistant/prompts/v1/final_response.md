@@ -37,6 +37,12 @@ RESPONSE CONTRACT
 	constraints, and limitations. Never turn an inferred risk into an observed
 	fact. Explicitly include a "Qué falta para el 10" section when scoring is
 	enabled.
+- Evaluate only the requested objective and in-scope categories. A skipped
+	check, an unrequested check, or a check whose evidence is unavailable must
+	not reduce the score or be presented as a failure. Label it as deferred,
+	not applicable, unknown, or a future recommendation. Do not treat tests,
+	deployment, CI/CD, authentication, concurrency, or production hardening as
+	mandatory unless the audit scope or objective asks for them.
 - Example shape:
 	{"response_type":"report","title":"Auditoría del proyecto","summary":"...","sections":{"Hallazgos":["..."]},"next_actions":["..."],"findings":["..."],"recommendations":["..."],"evidence":["..."],"limitations":["..."],"confidence":"medium"}
 

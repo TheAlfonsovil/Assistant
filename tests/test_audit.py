@@ -11,6 +11,7 @@ from assistant.audit import (
     TargetKind,
     run_audit,
 )
+from assistant.audit.profiles import get_profile
 from assistant.project_analysis import ProjectAnalyzer
 
 
@@ -25,6 +26,14 @@ def test_audit_contract_supports_generic_target_and_normalizes_terms():
     assert spec.scope == ["api"]
     assert spec.read_only is True
     assert spec.target.kind is TargetKind.DOCUMENTATION
+
+
+def test_general_profile_defines_broad_default_scope():
+    profile = get_profile("general")
+
+    assert {"structure", "architecture", "security", "testing", "documentation"} <= set(
+        profile.default_scope
+    )
 
 
 def test_collection_is_read_only_deterministic_and_isolates_failures():
@@ -61,6 +70,41 @@ def test_evaluator_orders_findings_and_calculates_optional_score():
     assert [finding.title for finding in report.findings] == ["A", "Z"]
     assert report.score == 0.5
     assert report.passed is False
+
+
+def test_evaluator_does_not_score_deferred_or_out_of_scope_checks():
+    spec = AuditSpec(
+        target=AuditTarget(identifier="workspace"),
+        scope=["architecture"],
+        accepted_constraints=["local prototype"],
+        scoring=True,
+    )
+    report = run_audit(spec, findings=[
+        AuditFinding(
+            title="Architecture is coherent",
+            category="architecture",
+            status=FindingStatus.PASS,
+            score=1,
+        ),
+        AuditFinding(
+            title="Tests were not run",
+            category="testing",
+            status=FindingStatus.NOT_APPLICABLE,
+            score=None,
+        ),
+        AuditFinding(
+            title="Production deployment is absent",
+            category="operations",
+            status=FindingStatus.WARN,
+            score=0,
+            in_scope=False,
+        ),
+    ])
+
+    assert report.score == 1
+    assert report.passed is True
+    assert "Production deployment is absent" in report.deferred
+    assert report.accepted_constraints == ["local prototype"]
 
 
 @pytest.mark.asyncio
