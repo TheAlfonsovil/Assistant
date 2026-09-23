@@ -20,6 +20,12 @@ assistant/api/__init__.py
 assistant/api/application.py
 assistant/application/__init__.py
 assistant/application/service.py
+assistant/audit/__init__.py
+assistant/audit/collector.py
+assistant/audit/evaluator.py
+assistant/audit/models.py
+assistant/audit/orchestrator.py
+assistant/audit/profiles.py
 assistant/capabilities/__init__.py
 assistant/capabilities/project.py
 assistant/core/__init__.py
@@ -64,6 +70,7 @@ assistant_core.egg-info/dependency_links.txt
 assistant_core.egg-info/entry_points.txt
 assistant_core.egg-info/requires.txt
 assistant_core.egg-info/top_level.txt
+tests/test_audit.py
 tests/test_domain_and_persistence.py
 tests/test_runtime.py
 tests/test_support.py

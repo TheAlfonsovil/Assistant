@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Assistant / Control room</title>
-  <link rel="stylesheet" href="/dashboard/style.css">
+  <link rel="stylesheet" href="/dashboard/style.css?v=full-trace-1">
 </head>
 <body>
   <div class="app-shell">
@@ -67,6 +67,6 @@
 
   <div id="modal" class="modal hidden"><div class="modal-card"><div class="modal-head"><div><p class="eyebrow">NEW TASK</p><h2>Lanzar tarea</h2></div><button id="close-modal" class="icon-button" aria-label="Cerrar">×</button></div><form id="task-form"><label>Objetivo<textarea id="goal" required placeholder="Ej.: crea un proyecto o abre YouTube"></textarea></label><label>Destino<select id="task-target" class="input"><option value="device:computer">Ordenador</option></select></label><label>Prioridad<select id="priority" class="input"><option value="Inmediate">Inmediate</option><option value="High">High</option><option value="Medium" selected>Medium</option><option value="Low">Low</option></select></label><button class="button primary">Enviar al runtime <span>→</span></button></form></div></div>
   <div id="toast" class="toast"></div>
-  <script src="/dashboard/app.js"></script>
+  <script src="/dashboard/app.js?v=live-task-detail-1"></script>
 </body>
 </html>

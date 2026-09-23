@@ -9,6 +9,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .audit import (
+    AuditFinding,
+    AuditSpec,
+    AuditTarget,
+    Evidence,
+    Facts,
+    FindingStatus,
+    TargetKind,
+    evaluate,
+)
 from .domain.models import ErrorType, OperationResult
 
 
@@ -77,6 +87,13 @@ class ProjectAnalyzer:
         max_files: int = 500,
         timeout: float = 60.0,
         run_tests: bool = False,
+        profile: str = "general",
+        scope: list[str] | None = None,
+        depth: str = "standard",
+        accepted_constraints: list[str] | None = None,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+        scoring: bool = True,
     ) -> OperationResult:
         """Collect safe project evidence and optionally run detected tests."""
         structural = await self.analyze(root, max_files)
@@ -123,6 +140,27 @@ class ProjectAnalyzer:
             for path in files
             if path.name in {".env", ".env.local", ".env.production"}
         ]
+        documentation_files = [
+            path.relative_to(project_root).as_posix()
+            for path in files
+            if path.suffix.lower() in {".md", ".rst", ".adoc", ".txt"}
+            or path.name.casefold() in {"readme", "readme.md", "changelog"}
+        ]
+        deployment_files = [
+            path.relative_to(project_root).as_posix()
+            for path in files
+            if path.name.casefold() in {
+                "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+                "compose.yml", "compose.yaml", "makefile",
+            }
+            or path.suffix.lower() in {".tf", ".bicep"}
+        ]
+        gitignore = configuration.get(".gitignore", "")
+        gitignore_rules = [
+            line.strip()
+            for line in gitignore.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
         test_command = self._test_command(project_root, configuration, test_files)
         if run_tests and test_command:
             test_result = await self._run_test_command(test_command, project_root, timeout)
@@ -154,6 +192,190 @@ class ProjectAnalyzer:
                 ],
             }
         })
+        audit_spec = AuditSpec(
+            target=AuditTarget(
+                kind=TargetKind.PROJECT,
+                identifier=str(project_root),
+                name=project_root.name,
+            ),
+            objective="Assess the target and report actionable findings.",
+            profile=profile,
+            scope=scope or [],
+            depth=depth,
+            accepted_constraints=accepted_constraints or [],
+            include=include or [],
+            exclude=exclude or [],
+            scoring=scoring,
+        )
+        evidence = [
+            Evidence(
+                source="project.structure",
+                value={
+                    "file_count": structural.output["file_count"],
+                    "languages": structural.output["languages"],
+                    "truncated": structural.output["truncated"],
+                },
+                description="Bounded filesystem inventory was collected.",
+            ),
+            Evidence(
+                source="project.configuration",
+                value={
+                    "manifests": structural.output["audit"]["dependency_manifests"],
+                    "sensitive_files": sensitive_files,
+                    "contents_read": False,
+                },
+                description="Configuration manifests were read with sensitive values redacted; secret-bearing files were not read.",
+            ),
+            Evidence(
+                source="project.tests",
+                value={
+                    "files": len(test_files),
+                    "command": test_command,
+                    "executed": test_result.get("executed", False),
+                    "result": test_result,
+                },
+                description="Test discovery and optional execution result.",
+            ),
+            Evidence(
+                source="project.workspace",
+                value={
+                    "documentation_files": documentation_files[:500],
+                    "deployment_files": deployment_files[:200],
+                    "gitignore_present": ".gitignore" in configuration,
+                    "gitignore_rules": len(gitignore_rules),
+                },
+                description="General workspace artifacts were inventoried without executing them.",
+            ),
+        ]
+        findings: list[AuditFinding] = []
+        findings.append(AuditFinding(
+            id="scope.filesystem-truncated",
+            title="The filesystem inventory is bounded",
+            category="coverage",
+            status=FindingStatus.WARN if structural.output["truncated"] else FindingStatus.PASS,
+            severity="medium" if structural.output["truncated"] else "info",
+            message=(
+                "The inventory was truncated at the configured file limit."
+                if structural.output["truncated"]
+                else "The inventory completed within the configured file limit."
+            ),
+            evidence=[evidence[0]],
+            recommendations=["Increase max_files or narrow the include scope for a deeper audit."]
+            if structural.output["truncated"] else [],
+            score=0.6 if structural.output["truncated"] else 1.0,
+        ))
+        findings.append(AuditFinding(
+            id="security.sensitive-files",
+            title="Sensitive configuration files are present",
+            category="security",
+            status=FindingStatus.WARN if sensitive_files else FindingStatus.PASS,
+            severity="medium" if sensitive_files else "info",
+            message=(
+                f"Detected {len(sensitive_files)} sensitive file(s); their contents were not read."
+                if sensitive_files else "No supported sensitive environment files were detected."
+            ),
+            evidence=[evidence[1]],
+            inferences=["The contents and actual secrecy of these files are unknown."]
+            if sensitive_files else [],
+            recommendations=["Verify that sensitive files are excluded from version control."]
+            if sensitive_files else [],
+            score=0.7 if sensitive_files else 1.0,
+        ))
+        findings.append(AuditFinding(
+            id="testing.execution",
+            title="Test coverage evidence is limited",
+            category="testing",
+            status=(
+                FindingStatus.PASS
+                if test_result.get("executed") and test_result.get("exit_code") == 0
+                else FindingStatus.WARN
+                if test_files
+                else FindingStatus.UNKNOWN
+            ),
+            severity="medium" if test_files and not test_result.get("executed") else "info",
+            message=(
+                "Tests were detected but not executed."
+                if test_files and not test_result.get("executed")
+                else "Tests completed successfully."
+                if test_result.get("executed") and test_result.get("exit_code") == 0
+                else "No supported test evidence was found."
+            ),
+            evidence=[evidence[2]],
+            recommendations=["Run the detected test command for a complete audit."]
+            if test_files and not test_result.get("executed") else [],
+            score=0.6 if test_files and not test_result.get("executed") else
+            1.0 if test_result.get("executed") and test_result.get("exit_code") == 0 else 0.5,
+        ))
+        findings.append(AuditFinding(
+            id="documentation.available",
+            title="Documentation artifacts are available",
+            category="documentation",
+            status=FindingStatus.PASS if documentation_files else FindingStatus.UNKNOWN,
+            severity="info" if documentation_files else "low",
+            message=(
+                f"Detected {len(documentation_files)} documentation artifact(s)."
+                if documentation_files
+                else "No common documentation artifact was detected in the bounded inventory."
+            ),
+            evidence=[evidence[3]],
+            recommendations=["Add a README or project guide describing purpose, setup, and validation."]
+            if not documentation_files else [],
+            score=1.0 if documentation_files else 0.5,
+        ))
+        findings.append(AuditFinding(
+            id="operations.deployment-artifacts",
+            title="Deployment artifacts are inventoried",
+            category="operations",
+            status=FindingStatus.PASS if deployment_files else FindingStatus.UNKNOWN,
+            severity="info" if deployment_files else "low",
+            message=(
+                f"Detected {len(deployment_files)} deployment or automation artifact(s)."
+                if deployment_files
+                else "No common deployment or automation artifact was detected."
+            ),
+            evidence=[evidence[3]],
+            recommendations=["Document the intended local or production execution path."]
+            if not deployment_files else [],
+            score=1.0 if deployment_files else 0.5,
+        ))
+        findings.append(AuditFinding(
+            id="repository.ignore-policy",
+            title="Repository ignore policy is visible",
+            category="configuration",
+            status=FindingStatus.PASS if gitignore_rules else FindingStatus.UNKNOWN,
+            severity="info" if gitignore_rules else "low",
+            message=(
+                f"Detected {len(gitignore_rules)} non-comment ignore rule(s)."
+                if gitignore_rules
+                else "No usable .gitignore rules were observed in the bounded inventory."
+            ),
+            evidence=[evidence[3]],
+            inferences=[
+                "This audit does not claim that every sensitive file is actually ignored; exact Git matching requires a repository check."
+            ],
+            recommendations=["Verify sensitive files and local databases are explicitly ignored."]
+            if sensitive_files and not gitignore_rules else [],
+            score=1.0 if gitignore_rules else 0.5,
+        ))
+        report = evaluate(
+            audit_spec,
+            Facts(
+                values={
+                    "root": str(project_root),
+                    "file_count": structural.output["file_count"],
+                    "languages": structural.output["languages"],
+                    "test_files": len(test_files),
+                    "sensitive_files": sensitive_files,
+                    "documentation_files": len(documentation_files),
+                    "deployment_files": len(deployment_files),
+                    "gitignore_rules": len(gitignore_rules),
+                },
+                evidence=evidence,
+                source="project.audit",
+            ),
+            findings=findings,
+        )
+        structural.output["audit_report"] = report.model_dump(mode="json")
         return structural
 
     @staticmethod

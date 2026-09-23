@@ -110,6 +110,44 @@ def _compact_schema(value: Any) -> Any:
     return value
 
 
+def _planner_schema() -> dict[str, Any]:
+    """Describe planner output without embedding resolver-only contracts."""
+    return {
+        "type": "object",
+        "properties": {
+            "task_id": {"type": ["string", "null"]},
+            "answer": {"type": ["string", "null"]},
+            "coverage": {"type": "array", "items": {"type": "string"}},
+            "subtasks": {"type": "array", "items": {"type": "string"}},
+            "nodes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "description": {"type": "string"},
+                        "type": {"type": "string"},
+                        "dependencies": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "acceptance_criteria": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "allowed_tools": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["id", "description"],
+                },
+            },
+        },
+        "required": ["nodes", "answer"],
+    }
+
+
 # Compatibility name for callers of the first reporting implementation.
 FinalReport = AssistantResponse
 
@@ -255,7 +293,11 @@ class OllamaLLMProvider:
         """Build and retain the exact request before network I/O starts."""
         prompt_path = Path(__file__).parent / "prompts" / "v1" / f"{role.lower()}.md"
         instructions = prompt_path.read_text(encoding="utf-8")
-        output_schema = _compact_schema(schema.model_json_schema())
+        output_schema = (
+            _planner_schema()
+            if role == "PLANNER"
+            else _compact_schema(schema.model_json_schema())
+        )
         rendered_instructions = render(instructions, context, output_schema)
         if len(rendered_instructions) > self.effective_prompt_chars:
             raise ValueError(

@@ -395,6 +395,31 @@ class ProjectTool(Tool):
                 "description": "Only for audit: execute a detected test command when true.",
                 "default": False,
             },
+            "profile": {
+                "type": "string",
+                "description": "Audit profile, for example general, software-project, documentation, or deployment.",
+                "default": "general",
+            },
+            "scope": {
+                "type": "array",
+                "description": "Audit dimensions to inspect. Empty selects the profile defaults.",
+            },
+            "depth": {
+                "type": "string",
+                "enum": ["shallow", "standard", "deep"],
+                "default": "standard",
+            },
+            "accepted_constraints": {
+                "type": "array",
+                "description": "Known limitations that should be reported as accepted or deferred rather than unexpected defects.",
+            },
+            "include": {"type": "array"},
+            "exclude": {"type": "array"},
+            "scoring": {
+                "type": "boolean",
+                "description": "Include a deterministic score when enough evidence is available.",
+                "default": True,
+            },
             "checks": {
                 "type": "array",
                 "description": "Optional safe validation checks: build, test, docker.",
@@ -465,11 +490,36 @@ class ProjectTool(Tool):
                     error="project.audit run_tests must be a boolean",
                     error_type=ErrorType.INVALID_ARGUMENT,
                 )
+            list_fields = ("scope", "accepted_constraints", "include", "exclude")
+            for field in list_fields:
+                if field in args and (
+                    not isinstance(args[field], list)
+                    or any(not isinstance(item, str) for item in args[field])
+                ):
+                    return OperationResult(
+                        success=False,
+                        error=f"project.audit {field} must be an array of strings",
+                        error_type=ErrorType.INVALID_ARGUMENT,
+                    )
+            scoring = args.get("scoring", True)
+            if not isinstance(scoring, bool):
+                return OperationResult(
+                    success=False,
+                    error="project.audit scoring must be a boolean",
+                    error_type=ErrorType.INVALID_ARGUMENT,
+                )
             return await analyzer.audit(
                 args["root"],
                 int(args.get("max_files", 500)),
                 float(args.get("timeout", timeout)),
                 run_tests=run_tests,
+                profile=str(args.get("profile", "general")),
+                scope=args.get("scope"),
+                depth=str(args.get("depth", "standard")),
+                accepted_constraints=args.get("accepted_constraints"),
+                include=args.get("include"),
+                exclude=args.get("exclude"),
+                scoring=scoring,
             )
         if method == "validate":
             return await self._validate(args, timeout)

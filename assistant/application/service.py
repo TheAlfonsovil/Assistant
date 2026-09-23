@@ -1148,6 +1148,9 @@ class TaskService:
             or "audit the project" in node.description.casefold()
         ]
         if len(audit_nodes) != 1:
+            fallback = TaskService._fallback_plan(task)
+            if fallback is not None:
+                return fallback
             return proposal
         audit = audit_nodes[0]
         # The audit tool returns structured findings; prose acceptance phrases
@@ -2098,7 +2101,25 @@ class TaskService:
                                 },
                             )
                         )
+                original_proposal = proposal
                 proposal = self._normalize_project_audit_plan(task, proposal)
+                if (
+                    task.runtime.workflow == "project_audit"
+                    and original_proposal.answer is not None
+                    and proposal.answer is None
+                    and proposal.nodes
+                ):
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            event_type="PLAN_REPAIRED",
+                            payload={
+                                "reason": "direct_answer_is_invalid_for_project_audit",
+                                "strategy": "deterministic_project_audit",
+                                "nodes": [item.id for item in proposal.nodes],
+                            },
+                        )
+                    )
                 try:
                     validate_plan_quality(proposal, task.budget.max_plan_nodes)
                 except ValueError as error:
@@ -2480,33 +2501,71 @@ class TaskService:
                     )
                 )
                 return True
-            try:
-                if not await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
-                    await self._block_node_for_budget(task, node, "llm_calls")
-                    return True
-                await self._persist_llm_request(
-                    task_id, "NODE_RESOLVER", context, NodeDecision, node.id
-                )
-                decision = await self._call_llm(self.llm.decide(context), time_remaining)
-            except (HTTPError, ValidationError, ValueError, KeyError, TypeError, TimeoutError, RuntimeError) as error:
-                reason = f"node resolution failed: {error}"
-                await self.repository.save_event(
-                    TaskEvent(
-                        task_id=task_id,
-                        node_id=node.id,
-                        event_type="LLM_ERROR",
-                        payload={
-                            "role": "NODE_RESOLVER",
-                            "error_type": type(error).__name__,
-                            "error": str(error),
-                            "request": getattr(self.llm, "last_request", {}),
-                            "usage": getattr(self.llm, "last_usage", {}),
-                        },
+            operation_hint = node.runtime.operation_hint
+            if operation_hint:
+                try:
+                    decision = NodeDecision(
+                        action="OPERATION",
+                        operation=Operation.model_validate(operation_hint),
                     )
-                )
-                await self._fail_node(task, node, reason)
-                await self._attempt_recovery(task, node, reason, graph, time_remaining)
-                return True
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            node_id=node.id,
+                            event_type="NODE_RESOLVER_SKIPPED",
+                            payload={
+                                "reason": "planner_operation_hint_is_authoritative",
+                                "tool": decision.operation.tool,
+                                "method": decision.operation.method,
+                            },
+                        )
+                    )
+                except (ValidationError, ValueError, TypeError) as error:
+                    reason = f"invalid planner operation hint: {error}"
+                    node.status = NodeStatus.BLOCKED
+                    node.error = reason
+                    task.status = TaskStatus.BLOCKED
+                    task.failure_reason = reason
+                    task.finished_at = datetime.now(UTC)
+                    await self.repository.save_node(node)
+                    await self.repository.save_task(task)
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            node_id=node.id,
+                            event_type="NODE_BLOCKED",
+                            payload={"reason": reason},
+                        )
+                    )
+                    return True
+            else:
+                try:
+                    if not await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
+                        await self._block_node_for_budget(task, node, "llm_calls")
+                        return True
+                    await self._persist_llm_request(
+                        task_id, "NODE_RESOLVER", context, NodeDecision, node.id
+                    )
+                    decision = await self._call_llm(self.llm.decide(context), time_remaining)
+                except (HTTPError, ValidationError, ValueError, KeyError, TypeError, TimeoutError, RuntimeError) as error:
+                    reason = f"node resolution failed: {error}"
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            node_id=node.id,
+                            event_type="LLM_ERROR",
+                            payload={
+                                "role": "NODE_RESOLVER",
+                                "error_type": type(error).__name__,
+                                "error": str(error),
+                                "request": getattr(self.llm, "last_request", {}),
+                                "usage": getattr(self.llm, "last_usage", {}),
+                            },
+                        )
+                    )
+                    await self._fail_node(task, node, reason)
+                    await self._attempt_recovery(task, node, reason, graph, time_remaining)
+                    return True
             if cancellation.is_set():
                 node.status = NodeStatus.CANCELLED
                 await self.repository.save_node(node)
@@ -2636,7 +2695,6 @@ class TaskService:
                 )
                 return True
             operation = decision.operation
-            operation_hint = node.runtime.operation_hint
             if operation_hint:
                 operation = Operation.model_validate(operation_hint)
             if operation.tool == "project" and operation.method == "audit":

@@ -43,9 +43,13 @@ RULES
   arguments in a plan; the resolver supplies typed arguments.
 - Include acceptance evidence when observable. Inputs and outputs are declarations,
   not operation arguments.
-- Audit, review, inspect, and analyze are read-only. A plain project audit is one
-  `project.audit` operation with `run_tests=false`; do not add a verification node.
-  Set `run_tests=true` only when the user explicitly requests test execution.
+- Audit, review, inspect, and analyze are read-only. Use one `project.audit`
+  operation for a general audit unless the user explicitly requests separate
+  user-visible stages. Pass the user's requested profile, scope, depth,
+  accepted constraints, include/exclude filters, and scoring preference when
+  known. Keep `run_tests=false` unless test execution is explicitly requested.
+  Do not invent a software-only scope: audits may target workspaces,
+  documentation, deployments, devices, or other project types.
 - Do not infer implementation, scaffolding, deployment, browser work, tests, or
   reports unless the request requires them.
 - New projects always use `project.initialize` with a meaningful kind, objective,

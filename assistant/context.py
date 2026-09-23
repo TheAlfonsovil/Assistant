@@ -21,7 +21,13 @@ class ContextBuilder:
     def _typed_task_context(task: Task) -> dict[str, Any]:
         context: dict[str, Any] = {}
         if task.contract is not None:
-            context["contract"] = task.contract.model_dump(mode="json", exclude_none=True)
+            contract = task.contract.model_dump(mode="json", exclude_none=True)
+            context["contract"] = {
+                key: value
+                for key, value in contract.items()
+                if value not in (None, [], {}, "")
+                and key != "schema_version"
+            }
         working_memory = task.working_memory.model_dump(mode="json")
         if any(
             value
@@ -104,9 +110,7 @@ class ContextBuilder:
                 "id": project.id,
                 "name": project.name,
                 "path": project.path,
-                "description": project.description,
                 "project_type": project.project_type,
-                "audit_prompt": project.audit_prompt,
                 "codegraph_version": project.codegraph_version,
                 "codegraph_available": project.codegraph is not None,
                 "codegraph": self._codegraph_summary(project.codegraph),
@@ -346,27 +350,29 @@ class ContextBuilder:
             definition for definition in definitions
             if definition not in primary and definition.name in optional_names
         ]
-        def describe(definition):
-            return {
+        def describe(definition, *, include_args: bool = True):
+            item = {
                 "name": definition.name,
                 "methods": definition.methods,
-                "args": {
+            }
+            if include_args:
+                item["args"] = {
                     name: {
                         key: value
                         for key, value in schema.items()
-                        if key in {"type", "required", "default", "enum", "description"}
+                        if key in {"type", "required", "default", "enum"}
                     }
                     if isinstance(schema, dict)
                     else {"type": schema}
                     for name, schema in definition.argument_schema.items()
-                },
-            }
+                }
+            return item
         return [
             {"group": "primary", "tools": [describe(definition) for definition in primary]},
             {
                 "group": "optional",
                 "when": "Use only if the request or discovered evidence requires it.",
-                "tools": [describe(definition) for definition in optional],
+                "tools": [describe(definition, include_args=False) for definition in optional],
             },
         ]
 
@@ -377,13 +383,6 @@ class ContextBuilder:
             selected = await self.repository.search_memory(query, limit=8)
         except TypeError:
             selected = await self.repository.search_memory(query)
-        if hasattr(self.repository, "list_memory"):
-            stable = await self.repository.list_memory(limit=20)
-            selected_ids = {item.id for item in selected}
-            selected.extend(
-                item for item in stable
-                if item.kind == "user_profile" and item.id not in selected_ids
-            )
         return [
             {
                 "kind": item.kind,

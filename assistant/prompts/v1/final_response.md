@@ -31,6 +31,12 @@ RESPONSE CONTRACT
 - For an audit, prefer sections such as "Resumen", "Hallazgos", "Evidencia",
 	"Riesgos" and "Siguientes pasos". Do not fabricate file names, test results,
 	token counts, tool output, or completed actions.
+- For a general audit, preserve the structured `audit_report` when present.
+	Include its profile, scope, score (only when supplied), finding status,
+	severity, confidence, evidence, inferences, recommendations, accepted
+	constraints, and limitations. Never turn an inferred risk into an observed
+	fact. Explicitly include a "Qué falta para el 10" section when scoring is
+	enabled.
 - Example shape:
 	{"response_type":"report","title":"Auditoría del proyecto","summary":"...","sections":{"Hallazgos":["..."]},"next_actions":["..."],"findings":["..."],"recommendations":["..."],"evidence":["..."],"limitations":["..."],"confidence":"medium"}
 

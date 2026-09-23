@@ -1,4 +1,4 @@
-const state = { data: null, selectedTask: null, view: "overview" };
+const state = { data: null, selectedTask: null, taskDetails: {}, view: "overview" };
 const $ = (selector) => document.querySelector(selector);
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[char]));
 const date = (value) => value ? new Date(value).toLocaleString("es-ES", { dateStyle: "short", timeStyle: "medium" }) : "-";
@@ -40,7 +40,11 @@ function render(data) {
   const tokenLabel = displayTokens.source === "ollama" ? "TOKENS REALES" : displayTokens.source === "ollama_partial" ? "TOKENS REALES*" : "TOKENS EST.";
   $("#stats").innerHTML = [["ACTIVAS", active.length], ["COMPLETADAS", tasks.filter((task) => task.status === "SUCCEEDED").length], ["INCIDENTES", failed.length], [tokenLabel, displayTokens.total ? formatNumber(displayTokens.total) : 0]].map(([label, value]) => `<div class="stat"><small>${label}</small><strong>${value}</strong></div>`).join("");
   renderMetrics(metrics); renderOperationalHealth(health, runtime); renderChart(data.status_counts || {}); renderAnalytics(data.analytics || {}); renderPerformanceMetrics(data); renderTasks(tasks); renderEvents(data.events || []); renderResources(data); renderCollections(data); renderChat(tasks); fillProjects(data.projects || []); renderIdle(runtime.idle || {});
-  if (state.selectedTask) { renderInspector(state.selectedTask); renderTrace(state.selectedTask); }
+  if (state.selectedTask) {
+    renderInspector(state.selectedTask);
+    renderTrace(state.selectedTask);
+    loadTaskDetail(state.selectedTask);
+  }
 }
 function renderMetrics(metrics) {
   const values = [["Pasadas", metrics.passes], ["Despachos", metrics.tasks_dispatched], ["Errores", metrics.task_errors], ["Pasadas idle", metrics.idle_passes], ["Sin LLM", metrics.not_ready_passes], ["Errores runtime", metrics.runtime_errors]];
@@ -162,7 +166,11 @@ function fillProjects(projects) {
   const options = `<option value="">Selecciona una tarea</option>` + (state.data?.tasks || []).map((task) => `<option value="${task.id}">${esc(task.goal)} · ${esc(task.status)}</option>`).join("");
   [$("#trace-task")].forEach((select) => { if (!select) return; const current = select.value; select.innerHTML = options; select.value = current || state.selectedTask || ""; });
 }
-function taskEvents(taskId) { return state.data?.task_events?.[taskId] || (state.data?.events || []).filter((event) => event.task_id === taskId); }
+function taskEvents(taskId) {
+  return state.taskDetails[taskId]?.events
+    || state.data?.task_events?.[taskId]
+    || (state.data?.events || []).filter((event) => event.task_id === taskId);
+}
 function traceEvents(taskId) { return taskEvents(taskId); }
 function objectValue(value) {
   if (value && typeof value === "object") return value;
@@ -230,7 +238,9 @@ function renderTrace(taskId) {
     const body = isRequest ? `<div class="trace-block"><label>PROMPT EFECTIVO ENVIADO AL LLM</label><pre>${esc(renderedPromptFrom(payload) || "El prompt efectivo no está disponible en la persistencia de este evento.")}</pre></div>` : isError ? `<div class="trace-block trace-error"><label>${event.event_type === "LLM_SKIPPED" ? "LLAMADA OMITIDA" : "ERROR REAL DEL PROVEEDOR"}</label><pre>${esc(json({ type: payload.error_type, error: payload.error || payload.reason }))}</pre></div>` : `<div class="trace-block"><label>${isResponse ? "RESPUESTA VALIDADA" : "DETALLE DEL EVENTO"}</label><pre>${esc(json(response))}</pre></div>`;
     const title = isRequest ? "REQUEST / prompt efectivo enviado" : isResponse ? "RESPONSE / respuesta recibida" : isError ? "ERROR / llamada fallida" : event.event_type.replaceAll("_", " ");
     const characterCount = payload.context_chars || payload.response_chars || requestPayload.prompt_chars || renderedPrompt.length || 0;
-    return `<article class="llm-card ${isError ? "llm-error" : ""}"><header><span class="trace-number">${String(index + 1).padStart(2, "0")}</span><div><strong>${title}</strong><small>${esc(payload.role || (event.node_id ? `nodo ${shortId(event.node_id)}` : "tarea"))} · ${date(event.created_at)} · ${characterCount} caracteres</small></div><em>${isRequest ? "OUT" : isError ? "ERR" : isResponse ? "IN" : "LOG"}</em></header><div class="trace-meta"><span>${isRequest ? "Prompt efectivo enviado" : isResponse ? "Respuesta validada" : event.event_type}</span><span>${payload.usage ? `${payload.usage.prompt_eval_count || 0} prompt · ${payload.usage.eval_count || 0} response tokens` : "evento persistido"}</span></div>${body}${prompt}</article>`;
+    const visibleCount = isRequest ? renderedPromptFrom(payload).length : 0;
+    const visibleLabel = isRequest ? ` · visible ${visibleCount}` : "";
+    return `<article class="llm-card ${isError ? "llm-error" : ""}"><header><span class="trace-number">${String(index + 1).padStart(2, "0")}</span><div><strong>${title}</strong><small>${esc(payload.role || (event.node_id ? `nodo ${shortId(event.node_id)}` : "tarea"))} · ${date(event.created_at)} · ${characterCount} caracteres${visibleLabel}</small></div><em>${isRequest ? "OUT" : isError ? "ERR" : isResponse ? "IN" : "LOG"}</em></header><div class="trace-meta"><span>${isRequest ? "Prompt efectivo enviado" : isResponse ? "Respuesta validada" : event.event_type}</span><span>${payload.usage ? `${payload.usage.prompt_eval_count || 0} prompt · ${payload.usage.eval_count || 0} response tokens` : "evento persistido"}</span></div>${body}${prompt}</article>`;
   }).join("") || `<div class="empty">Esta tarea aún no tiene intercambios LLM persistidos.</div>`;
 }
 function renderInspector(taskId) {
@@ -254,12 +264,39 @@ function renderInspector(taskId) {
   $("#task-inspector").innerHTML = `<div class="inspector-head"><div><p class="kicker">TASK INSPECTOR</p><h3>${esc(task.goal)}</h3><small>${shortId(task.id)} · ${esc(task.status)}</small></div><span class="badge status-${esc(task.status)}">${esc(task.status)}</span></div><div class="inspector-activity"><span class="activity-pulse"></span><div><strong>${esc(activity.label)}</strong><small>${esc(activity.detail)}</small></div></div>${recovery}${report}<div class="inspector-actions">${approvalNode ? `<button class="button primary" data-action="approval" data-node-id="${esc(approvalNode.id)}">Aprobar nodo</button>` : ""}${["WAITING", "BLOCKED"].includes(task.status) ? `<button class="button primary" data-action="input">Resolver</button>` : ""}${["BLOCKED", "FAILED"].includes(task.status) ? `<button class="button" data-action="replan">Replanificar</button>` : ""}${task.status === "WAITING" ? `<button class="button" data-action="resume">Reanudar</button>` : ""}${!["SUCCEEDED", "FAILED", "CANCELLED"].includes(task.status) ? `<button class="button ghost" data-action="cancel">Cancelar</button>` : ""}<button class="button ghost" data-action="trace">Ver traza</button></div><div class="usage-strip"><span>LLM <b>${usage?.llm_calls || 0}</b></span><span>TOOLS <b>${usage?.tool_calls || 0}</b></span><span>NODOS <b>${nodes.length}</b></span><span>${tokenLabel} <b>${tokenValue}</b></span></div><p class="kicker">GRAFO DE DECISIONES · ${edges.length} DEPENDENCIAS</p><div class="graph-canvas">${nodes.map((node, index) => `<div class="decision-node status-${esc(node.status)}"><span>${String(index + 1).padStart(2, "0")}</span><strong>${esc(node.description || node.type)}</strong><small>${esc(node.type)} · ${esc(node.status)}</small>${edges.filter((edge) => edge.to_node === node.id).map((edge) => `<i>← ${esc(nodes.find((candidate) => candidate.id === edge.from_node)?.description || shortId(edge.from_node))}</i>`).join("")}</div>`).join("") || "<div class=empty>Sin nodos planificados.</div>"}</div><p class="kicker inspector-events-title">HISTORIAL COMPLETO · ${events.length} EVENTOS</p><div class="inspector-events">${eventRows || "<div class=empty>Sin eventos.</div>"}</div>`;
   $("#task-inspector").querySelectorAll("[data-action]").forEach((button) => button.addEventListener("click", () => taskAction(button.dataset.action, task, button.dataset.nodeId)));
 }
-function selectTask(taskId) { state.selectedTask = taskId; renderTasks(state.data.tasks); renderInspector(taskId); renderTrace(taskId); }
+async function loadTaskDetail(taskId, force = false) {
+  if (!taskId || (!force && state.taskDetails[taskId])) return;
+  try {
+    state.taskDetails[taskId] = await api(`/dashboard/tasks/${encodeURIComponent(taskId)}`);
+    if (state.selectedTask === taskId) {
+      renderInspector(taskId);
+      renderTrace(taskId);
+    }
+  } catch (error) {
+    toast(`No se pudo cargar la traza completa: ${error.message}`, true);
+  }
+}
+function selectTask(taskId) {
+  state.selectedTask = taskId;
+  renderTasks(state.data.tasks);
+  renderInspector(taskId);
+  renderTrace(taskId);
+  loadTaskDetail(taskId);
+}
 async function taskAction(action, task, nodeId = "") { try { if (action === "cancel") await api(`/tasks/${task.id}/cancel`, { method: "POST" }); if (action === "resume") await api(`/tasks/${task.id}/resume`, { method: "POST" }); if (action === "replan") await api(`/tasks/${task.id}/replan`, { method: "POST" }); if (action === "approval") await api(`/tasks/${task.id}/nodes/${nodeId}/approval`, { method: "POST", body: JSON.stringify({ approved: true }) }); if (action === "trace") { setView("trace"); return; } if (action === "input") { const prompt = task.metadata?.clarification?.prompt || "Input JSON para la tarea"; const value = window.prompt(`${prompt}\n\nFormato JSON`, "{}"); if (value === null) return; await api(`/tasks/${task.id}/input`, { method: "POST", body: JSON.stringify({ input: JSON.parse(value) }) }); } toast(action === "replan" ? "Nueva estrategia solicitada" : "Orden actualizada"); await load(); } catch (error) { toast(`No se pudo actualizar: ${error.message}`, true); } }
 function formatNumber(value) { return new Intl.NumberFormat("es-ES").format(value || 0); }
 function formatSeconds(value) { const seconds = Number(value || 0); return seconds < 60 ? `${seconds.toFixed(1)}s` : `${(seconds / 60).toFixed(1)}m`; }
 function timingRatio(value, total) { return total ? Math.max(4, Number(value || 0) / total * 100) : 4; }
-async function load() { try { const data = await api("/dashboard/data"); render(data); $("#last-refresh").textContent = `Actualizado ${new Date().toLocaleTimeString("es-ES")}`; } catch (error) { toast(`No se pudo leer el runtime: ${error.message}`, true); } }
+async function load() {
+  try {
+    const data = await api("/dashboard/data");
+    render(data);
+    if (state.selectedTask) await loadTaskDetail(state.selectedTask, true);
+    $("#last-refresh").textContent = `Actualizado ${new Date().toLocaleTimeString("es-ES")}`;
+  } catch (error) {
+    toast(`No se pudo leer el runtime: ${error.message}`, true);
+  }
+}
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
 $("#refresh").addEventListener("click", load);
@@ -267,7 +304,11 @@ $("#idle-toggle").addEventListener("click", async () => { try { const enabled = 
 $("#reset-memory").addEventListener("click", async () => { if (!window.confirm("Borrar tareas, grafos, eventos, leases, resultados y memoria? Los proyectos se conservan.")) return; try { const result = await api("/runtime/reset", { method: "POST" }); state.selectedTask = null; toast(`Estado limpio: ${result.total} registros eliminados`); await load(); } catch (error) { toast(error.message, true); } });
 $("#task-filter").addEventListener("input", () => state.data && renderTasks(state.data.tasks));
 $("#task-status-filter").addEventListener("change", () => state.data && renderTasks(state.data.tasks));
-$("#trace-task").addEventListener("change", (event) => { state.selectedTask = event.target.value || null; renderTrace(state.selectedTask); });
+$("#trace-task").addEventListener("change", (event) => {
+  state.selectedTask = event.target.value || null;
+  renderTrace(state.selectedTask);
+  loadTaskDetail(state.selectedTask);
+});
 $("#metrics-task-filter").addEventListener("change", () => state.data && renderPerformanceMetrics(state.data));
 $("#new-task").addEventListener("click", () => $("#modal").classList.remove("hidden")); $("#close-modal").addEventListener("click", () => $("#modal").classList.add("hidden"));
 $("#task-form").addEventListener("submit", async (event) => { event.preventDefault(); try { const [target_type, target_id] = $("#task-target").value.split(":"); const body = { goal: $("#goal").value, target_type, target_id, priority: $("#priority").value || "Medium" }; const task = await api("/tasks", { method: "POST", body: JSON.stringify(body) }); $("#modal").classList.add("hidden"); $("#goal").value = ""; await load(); selectTask(task.id); setView("tasks"); } catch (error) { toast(error.message, true); } });

@@ -116,7 +116,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.3.2", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.3.3", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parents[2] / "dashboard"
 
 
@@ -706,6 +706,7 @@ async def create_chat_message(request: Request, chat_request: ChatRequest):
             metadata={"interaction": "chat", "requested_format": "answer"},
         )
     )
+    request.app.state.runtime.wake()
     return task.model_dump(mode="json")
 
 
@@ -754,6 +755,7 @@ async def chat_agent_command(request: Request, chat_request: ChatRequest):
             target_id=chat_request.target_id,
             metadata={"interaction": "chat", "mode": "agent"},
         ))
+        request.app.state.runtime.wake()
         return {"action": "create", "message": f"Tarea creada ({task.id[:8]})", "task": _task_json(task)}
 
     operations = {
@@ -809,6 +811,7 @@ async def _chat_fast_stream(request: Request, chat_request: ChatFastRequest):
         )
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
+    request.app.state.runtime.wake()
 
     async def events():
         terminal = {"SUCCEEDED", "FAILED", "CANCELLED", "BLOCKED"}
@@ -858,6 +861,7 @@ async def create_task(request: Request, task_request: TaskRequest):
         task = await service(request).service.create_task(task_request)
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
+    request.app.state.runtime.wake()
     return {"id": task.id, "status": task.status}
 
 
@@ -905,6 +909,7 @@ async def audit_project(request: Request, project_id: str, run_tests: bool = Fal
     task = await service(request).service.create_project_audit_task(project_id, run_tests=run_tests)
     if not task:
         raise HTTPException(404, "Project not found or disabled")
+    request.app.state.runtime.wake()
     return {
         "id": task.id,
         "status": task.status,
@@ -955,6 +960,7 @@ async def resume_task(request: Request, task_id: str):
         raise HTTPException(409, str(error)) from error
     if not task:
         raise HTTPException(404, "Task not found")
+    request.app.state.runtime.wake()
     return task.model_dump(mode="json")
 
 
@@ -973,6 +979,7 @@ async def redefine_task(
         raise HTTPException(409, str(error)) from error
     if not task:
         raise HTTPException(404, "Task not found")
+    request.app.state.runtime.wake()
     return task.model_dump(mode="json")
 
 
@@ -984,6 +991,7 @@ async def replan_task(request: Request, task_id: str):
         raise HTTPException(409, str(error)) from error
     if not task:
         raise HTTPException(404, "Task not found")
+    request.app.state.runtime.wake()
     return task.model_dump(mode="json")
 
 
@@ -1008,6 +1016,7 @@ async def submit_task_input(request: Request, task_id: str, task_input: TaskInpu
         raise HTTPException(409, str(error)) from error
     if not task:
         raise HTTPException(404, "Task not found")
+    request.app.state.runtime.wake()
     return task.model_dump(mode="json")
 
 
@@ -1021,6 +1030,7 @@ async def approve_action(request: Request, task_id: str, node_id: str, body: dic
         raise HTTPException(409, str(error)) from error
     if not task:
         raise HTTPException(404, "Task or node not found")
+    request.app.state.runtime.wake()
     return task.model_dump(mode="json")
 
 

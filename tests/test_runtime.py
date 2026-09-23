@@ -925,6 +925,19 @@ def test_project_audit_plan_removes_generic_verification_node():
     assert normalized.nodes[0].dependencies == []
 
 
+def test_project_audit_plan_repairs_direct_answer_into_audit_operation():
+    task = Task(goal="audita el proyecto")
+    task.runtime.workflow = "project_audit"
+    normalized = TaskService._normalize_project_audit_plan(
+        task,
+        PlanProposal(answer="The requested information is already available."),
+    )
+
+    assert len(normalized.nodes) == 1
+    assert normalized.nodes[0].operation_hint.tool == "project"
+    assert normalized.nodes[0].operation_hint.method == "audit"
+
+
 def test_final_response_template_receives_execution_evidence():
     template = (Path(__file__).parents[1] / "assistant" / "prompts" / "v1" / "final_response.md").read_text(
         encoding="utf-8"
@@ -1615,11 +1628,19 @@ async def test_all_llm_contexts_match_their_role_templates_and_stay_bounded():
     assert "system_graph" not in contexts["node_resolver"]
     assert "graph" not in contexts["replanner"]
     assert "failed_node" in contexts["replanner"]["failure_context"]
+    action_groups = contexts["planner"]["available_actions"]
+    assert {group["group"] for group in action_groups} == {"primary", "optional"}
     assert all(
-        set(action) == {"name", "description", "methods"}
-        for action in contexts["planner"]["available_actions"]
+        set(action) >= {"name", "methods"}
+        for group in action_groups
+        for action in group["tools"]
     )
-    assert any("argument_schema" in action for action in contexts["node_resolver"]["available_actions"])
+    assert any(
+        "args" in action
+        for group in contexts["node_resolver"]["available_actions"]
+        if group["group"] == "primary"
+        for action in group["tools"]
+    )
     assert "available_actions" not in contexts["replanner"]
     assert len(contexts["final_response"]["events"][0]["payload"]["output"]) == 1200 + len("... [truncated]")
 
