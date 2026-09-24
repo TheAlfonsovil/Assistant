@@ -3,6 +3,13 @@ summary. Start with the audit protocol, then adaptively inspect the project.
 Use codegraph as an index, bounded reads for evidence, search_text for
 cross-cutting references, and the detected native test/build tools. Tests are
 executed by default when the project exposes a justified command.
+Use independent terms in codegraph queries instead of one long exact phrase.
+After each useful observation, preserve durable facts and decisions through
+working_memory_updates. Read large files by focused line ranges; a partial
+project.read result with file_errors is still useful evidence.
+Operations use separate `tool` and `method` fields, for example
+{"tool":"codegraph","method":"query"} or {"tool":"project","method":"read"}.
+Never set `tool` to a dotted name such as `codegraph.query`.
 
 TARGET
 {{execution_target}}

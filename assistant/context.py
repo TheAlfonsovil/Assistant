@@ -19,33 +19,112 @@ class ContextBuilder:
         self.projects_root = projects_root
 
     @staticmethod
+    def _slim_codegraph(codegraph: Any) -> dict[str, Any] | None:
+        if not isinstance(codegraph, dict):
+            return None
+        return {
+            key: codegraph.get(key)
+            for key in (
+                "root",
+                "project_kind",
+                "file_count",
+                "key_files",
+                "languages",
+                "truncated",
+                "module_count",
+                "symbol_count",
+                "edge_count",
+                "entry_modules",
+                "query",
+            )
+            if codegraph.get(key) not in (None, [], {})
+        }
+
+    @staticmethod
+    def _slim_extra_context(extra: Any) -> dict[str, Any]:
+        if not isinstance(extra, dict):
+            return {}
+        dropped = {
+            "modules_sample",
+            "symbols_sample",
+            "edges_sample",
+            "languages",
+            "file_count",
+            "module_count",
+            "symbol_count",
+            "edge_count",
+            "key_files",
+            "query_note",
+            "project_kind",
+        }
+        return {key: value for key, value in extra.items() if key not in dropped}
+
+    @staticmethod
     def _bound_agent_context(context: dict[str, Any], limit: int = 48_000) -> dict[str, Any]:
-        """Keep every agent turn below a predictable prompt-side evidence budget."""
+        """Keep every agent turn below a predictable prompt-side evidence budget.
+
+        Variable index dumps are trimmed first. Turn-local evidence, tools, and
+        the last observation stay available so the worker can change course.
+        """
         def serialized(value: Any) -> int:
             return len(json.dumps(value, ensure_ascii=False, default=str))
+
+        def compact_actions(actions: Any) -> Any:
+            if not isinstance(actions, list):
+                return []
+            compacted = []
+            for item in actions[:6]:
+                if not isinstance(item, dict):
+                    continue
+                tools = item.get("tools", [])
+                compacted_tools = []
+                if isinstance(tools, list):
+                    for tool in tools[:6]:
+                        if isinstance(tool, dict):
+                            compacted_tools.append({
+                                "name": tool.get("name"),
+                                "methods": tool.get("methods", []),
+                                "args": {
+                                    key: {
+                                        field: value
+                                        for field, value in schema.items()
+                                        if field in {"type", "required", "enum"}
+                                    }
+                                    for key, schema in (tool.get("args") or {}).items()
+                                    if isinstance(schema, dict)
+                                },
+                                "method_args": tool.get("method_args", {}),
+                            })
+                        else:
+                            compacted_tools.append({"name": str(tool), "methods": []})
+                compacted.append({
+                    "group": item.get("group"),
+                    "when": item.get("when"),
+                    "tools": compacted_tools,
+                })
+            return compacted
 
         if serialized(context) <= limit:
             return context
         bounded = dict(context)
+        bounded["extra_context"] = ContextBuilder._slim_extra_context(bounded.get("extra_context"))
+        if isinstance(bounded.get("codegraph"), dict):
+            bounded["codegraph"] = ContextBuilder._slim_codegraph(bounded["codegraph"])
+        if isinstance(bounded.get("project"), dict) and bounded["project"].get("codegraph"):
+            bounded["project"] = dict(bounded["project"])
+            bounded["project"]["codegraph"] = ContextBuilder._slim_codegraph(
+                bounded["project"]["codegraph"]
+            )
         bounded["evidence"] = list(context.get("evidence", []))[-4:]
         bounded["last_observation"] = compact(context.get("last_observation"), 1200)
-        bounded["available_actions"] = [
-            {"group": item.get("group"), "tools": item.get("tools", [])[:8]}
-            for item in context.get("available_actions", [])
-        ]
-        if serialized(bounded) > limit:
-            bounded["available_actions"] = []
-        if serialized(bounded) > limit and isinstance(bounded.get("project"), dict):
-            bounded["project"] = dict(bounded["project"])
-            bounded["project"]["codegraph"] = None
-        if serialized(bounded) > limit:
-            bounded["evidence"] = []
-        if serialized(bounded) > limit:
-            bounded["last_observation"] = None
-        if serialized(bounded) > limit:
-            bounded["working_memory"] = {}
         if serialized(bounded) > limit:
             bounded["audit_protocol"] = None
+        if serialized(bounded) > limit:
+            bounded["available_actions"] = compact_actions(context.get("available_actions"))
+        if serialized(bounded) > limit:
+            bounded["evidence"] = bounded["evidence"][-1:]
+        if serialized(bounded) > limit:
+            bounded["last_observation"] = compact(context.get("last_observation"), 400)
         if serialized(bounded) > limit:
             bounded["task"] = {
                 key: value
@@ -55,17 +134,32 @@ class ContextBuilder:
         if serialized(bounded) > limit:
             bounded["user_prompt"] = str(bounded.get("user_prompt", ""))[:2000]
         if serialized(bounded) > limit:
-            # Keep the stable envelope and trim only variable string leaves.
-            def trim(value: Any) -> Any:
-                if isinstance(value, str):
-                    return value[:512]
-                if isinstance(value, list):
-                    return [trim(item) for item in value[:8]]
-                if isinstance(value, dict):
-                    return {key: trim(item) for key, item in list(value.items())[:16]}
-                return value
-
-            bounded = trim(bounded)
+            bounded["long_term_memory"] = []
+        if serialized(bounded) > limit:
+            bounded["project"] = None
+        if serialized(bounded) > limit:
+            bounded["codegraph"] = None
+        if serialized(bounded) > limit:
+            bounded["working_memory"] = {}
+        if serialized(bounded) > limit:
+            bounded["constraints"] = {
+                key: value
+                for key, value in bounded.get("constraints", {}).items()
+                if key in {"max_llm_calls", "remaining_llm_calls", "max_tool_calls", "remaining_tool_calls"}
+            }
+        if serialized(bounded) > limit:
+            bounded["available_actions"] = [{"group": "core", "tools": ["read", "write", "search"]}]
+        if serialized(bounded) > limit:
+            bounded["task"] = {
+                "id": bounded.get("task", {}).get("id"),
+                "goal": str(bounded.get("task", {}).get("goal", ""))[:200],
+            }
+        if serialized(bounded) > limit:
+            bounded = {
+                "phase": bounded.get("phase"),
+                "user_prompt": str(bounded.get("user_prompt", ""))[:400],
+                "task": bounded.get("task", {}),
+            }
         return bounded
 
     @staticmethod
@@ -124,20 +218,22 @@ class ContextBuilder:
             "root": codegraph.get("root"),
             "project_kind": codegraph.get("project_kind", []),
             "file_count": codegraph.get("file_count"),
-            "file_tree": (codegraph.get("files_analyzed") or [])[:200],
-            "key_files": (codegraph.get("key_files") or [])[:80],
+            "key_files": (codegraph.get("key_files") or [])[:20],
             "languages": codegraph.get("languages", {}),
             "truncated": codegraph.get("truncated") or graph.get("truncated", False),
             "module_count": len(modules),
             "symbol_count": len(symbols),
             "edge_count": len(edges),
-            "modules": modules[:120],
-            "symbols": symbols[:120],
-            "edges": edges[:160],
+            "entry_modules": [
+                item.get("id") or item.get("file")
+                for item in modules[:12]
+                if item.get("id") or item.get("file")
+            ],
             "query": {
-                "tool": "codegraph.query",
+                "tool": "codegraph",
+                "method": "query",
                 "args": ["root", "query", "kind", "limit"],
-                "note": "Query relevant files or symbols instead of embedding the graph.",
+                "note": "Call {\"tool\":\"codegraph\",\"method\":\"query\"}. Do not set tool to codegraph.query.",
             },
         }
 
@@ -274,7 +370,7 @@ class ContextBuilder:
             "worker": task.metadata.get("worker"),
             "template": task.metadata.get("template"),
             "working_memory": compact(task.working_memory.model_dump(mode="json")),
-            "extra_context": task.metadata.get("extra_context", {}),
+            "extra_context": self._slim_extra_context(task.metadata.get("extra_context", {})),
             "acceptance_criteria": task.metadata.get("acceptance_criteria", []),
             "long_term_memory": await self._memory_context(task.goal, task),
             "last_observation": compact(last_observation),
@@ -350,7 +446,7 @@ class ContextBuilder:
             "orchestration_stage": task.metadata.get("orchestration_stage", "ROUTE"),
             "worker_completion": task.metadata.get("worker_completion"),
             "execution_evidence": review_evidence,
-            "extra_context": task.metadata.get("extra_context", {}),
+            "extra_context": self._slim_extra_context(task.metadata.get("extra_context", {})),
             "acceptance_criteria": task.metadata.get("acceptance_criteria", []),
             "intent": task.metadata.get("orchestrator_intent"),
             "worker": task.metadata.get("worker"),
@@ -457,7 +553,7 @@ class ContextBuilder:
             "dependency_results": dependency_results,
             "completed_artifacts": completed_artifacts[-20:],
             **({"resolved_inputs": resolved_inputs} if resolved_inputs else {}),
-            "available_actions": self._available_actions(),
+            "available_actions": self._available_actions(compact=True),
             "constraints": {
                 "deadline": task.deadline,
                 "cancelled": task.status.value == "CANCELLED",
@@ -574,7 +670,9 @@ class ContextBuilder:
                 )
         return missing
 
-    def _available_actions(self, intent: str = "general") -> list[dict[str, Any]]:
+    def _available_actions(
+        self, intent: str = "general", *, compact: bool = False
+    ) -> list[dict[str, Any]]:
         definitions = self.tools.definitions()
         preferred = {
             "audit": {"project", "codegraph", "git"},
@@ -594,15 +692,47 @@ class ContextBuilder:
                 "methods": definition.methods,
             }
             if include_args:
-                item["args"] = {
+                if compact:
+                    item["args"] = {}
+                    item["method_args"] = {
+                        method: {
+                            name: {
+                                "type": schema.get("type") if isinstance(schema, dict) else schema,
+                                "required": True,
+                                **(
+                                    {"enum": schema["enum"]}
+                                    if isinstance(schema, dict) and schema.get("enum")
+                                    else {}
+                                ),
+                            }
+                            for name, schema in definition.arguments_for(method).items()
+                            if isinstance(schema, dict) and schema.get("required")
+                        }
+                        for method in definition.methods
+                    }
+                    return item
+                item["args"] = {} if compact else {
                     name: {
                         key: value
                         for key, value in schema.items()
-                        if key in {"type", "required", "default", "enum"}
+                        if key in {"type", "required", "default", "enum", "description"}
                     }
                     if isinstance(schema, dict)
                     else {"type": schema}
                     for name, schema in definition.argument_schema.items()
+                }
+                item["method_args"] = {
+                    method: {
+                        name: {
+                            key: value
+                            for key, value in schema.items()
+                            if key in {"type", "required", "default", "enum"}
+                        }
+                        if isinstance(schema, dict)
+                        else {"type": schema}
+                        for name, schema in definition.arguments_for(method).items()
+                    }
+                    for method in definition.methods
                 }
             return item
         return [

@@ -69,6 +69,13 @@ def test_device_registry_exposes_four_branches_and_computer_actions():
     assert {"device.mobile", "device.home", "device.robot"} <= definitions
 
 
+def test_operation_keeps_registered_tool_names_with_explicit_method():
+    operation = Operation(tool="mock.success", method="run")
+
+    assert operation.tool == "mock.success"
+    assert operation.method == "run"
+
+
 @pytest.mark.asyncio
 async def test_computer_filesystem_info_and_search(tmp_path):
     nested = tmp_path / "src" / "main.py"
@@ -394,6 +401,23 @@ async def test_project_read_and_edit_support_contextual_bounded_changes(tmp_path
     assert not (root / "package.json").exists()
 
 
+@pytest.mark.asyncio
+async def test_project_read_keeps_valid_files_when_one_path_is_missing(tmp_path):
+    (tmp_path / "README.md").write_text("# Project\n", encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="read",
+            args={"root": str(tmp_path), "files": ["missing.py", "README.md"]},
+        )
+    )
+
+    assert result.success is True
+    assert "README.md" in result.output["files"]
+    assert result.output["file_errors"] == [{"path": "missing.py", "error": "file not found"}]
+
+
 def test_tool_evidence_replaces_prose_acceptance_for_structured_results():
     result = OperationResult(
         success=True,
@@ -421,6 +445,31 @@ async def test_tool_registry_rejects_arguments_with_wrong_declared_type():
     assert result.success is False
     assert result.error_type is ErrorType.INVALID_ARGUMENT
     assert "root" in result.error
+
+
+@pytest.mark.asyncio
+async def test_tool_registry_rejects_unknown_and_invalid_enum_arguments():
+    registry = build_tool_registry()
+
+    unknown = await registry.execute(
+        Operation(
+            tool="filesystem",
+            method="search_text",
+            args={"path": ".", "query": "x", "unexpected": True},
+        )
+    )
+    invalid_enum = await registry.execute(
+        Operation(
+            tool="filesystem",
+            method="search_text",
+            args={"path": ".", "query": "x", "mode": "maybe"},
+        )
+    )
+
+    assert unknown.success is False
+    assert "unsupported argument" in unknown.error
+    assert invalid_enum.success is False
+    assert "must be one of" in invalid_enum.error
 
 
 @pytest.mark.asyncio
@@ -570,6 +619,30 @@ async def test_codegraph_query_returns_only_matching_nodes(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_codegraph_query_matches_independent_terms(tmp_path):
+    (tmp_path / "runtime.py").write_text("class Scheduler: pass\n", encoding="utf-8")
+    (tmp_path / "other.py").write_text("def unrelated(): pass\n", encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="codegraph",
+            method="query",
+            args={
+                "root": str(tmp_path),
+                "query": "runtime scheduler",
+                "kind": "module",
+                "limit": 10,
+            },
+        )
+    )
+
+    assert result.success is True
+    assert result.output["query_terms"] == ["runtime", "scheduler"]
+    assert result.output["nodes"]
+    assert result.output["nodes"][0]["file"] == "runtime.py"
+
+
+@pytest.mark.asyncio
 async def test_project_read_supports_bounded_line_ranges(tmp_path):
     (tmp_path / "module.py").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
 
@@ -620,7 +693,8 @@ async def test_planner_context_includes_registered_codegraph_as_bounded_evidence
     assert planner_context["project"]["codegraph_version"] == 4
     assert planner_context["project"]["codegraph"]["module_count"] == 1
     assert planner_context["project"]["codegraph"]["symbol_count"] == 0
-    assert planner_context["project"]["codegraph"]["query"]["tool"] == "codegraph.query"
+    assert planner_context["project"]["codegraph"]["query"]["tool"] == "codegraph"
+    assert planner_context["project"]["codegraph"]["query"]["method"] == "query"
 
 
 @pytest.mark.asyncio
@@ -1854,6 +1928,25 @@ async def test_runtime_can_disable_idle_without_stopping_task_dispatch():
     assert runtime.metrics_snapshot()["idle_skipped"] == 1
 
 
+@pytest.mark.asyncio
+async def test_runtime_dispatches_verification_and_finalization_phases():
+    tasks = [
+        Task(goal="verify", status=TaskStatus.VERIFYING),
+        Task(goal="finalize", status=TaskStatus.FINALIZING),
+    ]
+    called = []
+
+    async def execute(task_id):
+        called.append(task_id)
+
+    class Repository:
+        async def list_tasks(self):
+            return tasks
+
+    assert await TaskRuntime(Repository(), execute).run_once() == 2
+    assert called == [tasks[0].id, tasks[1].id]
+
+
 async def _record_task(called, task_id):
     called.append(task_id)
 
@@ -2714,6 +2807,36 @@ async def test_recovery_requeues_interrupted_verification(tmp_path):
         assert recovered == 1
         assert (await repository.get_task(task.id)).status is TaskStatus.READY
         assert (await repository.get_node(node.id)).status is NodeStatus.READY
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_resumes_interrupted_final_response(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'recovery-finalizing.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        task = Task(
+            goal="recover final response",
+            status=TaskStatus.FINALIZING,
+            runtime={
+                "final_status": TaskStatus.SUCCEEDED.value,
+                "final_response_pending": True,
+            },
+        )
+        await repository.save_task(task)
+
+        recovered = await RecoveryManager(session).recover()
+
+        restored = await repository.get_task(task.id)
+        assert recovered == 1
+        assert restored.status is TaskStatus.FINALIZING
+        assert restored.runtime.final_status == TaskStatus.SUCCEEDED.value
+        assert restored.runtime.final_response_pending is True
+        assert any(
+            event.event_type == "TASK_FINALIZATION_RECOVERED"
+            for event in await repository.list_events(task.id)
+        )
     await database.close()
 
 

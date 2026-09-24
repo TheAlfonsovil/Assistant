@@ -37,6 +37,32 @@ class FilesystemTool(Tool):
             "mode": {"type": "string", "enum": ["all", "any"]},
             "context_lines": {"type": "integer"},
         },
+        method_argument_schema={
+            "read": {"path": {"type": "string", "required": True}},
+            "write": {
+                "path": {"type": "string", "required": True},
+                "content": {"type": "string", "required": True},
+            },
+            "create": {"path": {"type": "string", "required": True}, "content": {"type": "string"}},
+            "delete": {"path": {"type": "string", "required": True}},
+            "list": {"path": {"type": "string", "required": True}},
+            "exists": {"path": {"type": "string", "required": True}},
+            "info": {"path": {"type": "string", "required": True}},
+            "search": {
+                "path": {"type": "string", "required": True},
+                "pattern": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "search_text": {
+                "path": {"type": "string", "required": True},
+                "query": {"type": "string", "required": True},
+                "pattern": {"type": "string"},
+                "limit": {"type": "integer"},
+                "case_sensitive": {"type": "boolean"},
+                "mode": {"type": "string", "enum": ["all", "any"]},
+                "context_lines": {"type": "integer"},
+            },
+        },
         permissions=["filesystem"],
     )
 
@@ -452,6 +478,10 @@ class ProjectTool(Tool):
                     "Relative paths or {path,start_line,end_line} ranges, bounded by the project root."
                 ),
             },
+            "max_chars": {
+                "type": "integer",
+                "description": "Optional total character budget for returned file contents.",
+            },
             "timeout": {"type": "number"},
             "run_tests": {
                 "type": "boolean",
@@ -513,6 +543,44 @@ class ProjectTool(Tool):
             },
             "deletions": {"type": "array", "description": "Relative files to delete, bounded by the project root."},
             "commands": {"type": "array", "description": "Optional validation commands to run after modification."},
+        },
+        method_argument_schema={
+            "analyze": {"root": {"type": "string", "required": True}, "max_files": {"type": "integer"}},
+            "read": {
+                "root": {"type": "string", "required": True},
+                "files": {"type": "array", "required": True},
+                "max_chars": {"type": "integer"},
+            },
+            "audit": {
+                "root": {"type": "string", "required": True},
+                "max_files": {"type": "integer"}, "timeout": {"type": "number"},
+                "run_tests": {"type": "boolean"}, "profile": {"type": "string"},
+                "objective": {"type": "string"}, "scope": {"type": "array"},
+                "depth": {"type": "string", "enum": ["shallow", "standard", "deep"]},
+                "accepted_constraints": {"type": "array"}, "include": {"type": "array"},
+                "exclude": {"type": "array"}, "scoring": {"type": "boolean"},
+            },
+            "validate": {
+                "root": {"type": "string", "required": True},
+                "checks": {"type": "array"}, "commands": {"type": "array"},
+                "timeout": {"type": "number"},
+            },
+            "create": {
+                "root": {"type": "string", "required": True},
+                "name": {"type": "string", "required": True}, "template": {"type": "string"},
+            },
+            "initialize": {
+                "root": {"type": "string", "required": True},
+                "name": {"type": "string", "required": True}, "kind": {"type": "string"},
+                "description": {"type": "string"}, "directories": {"type": "array"},
+                "files": {"type": "array"},
+            },
+            "edit": {
+                "root": {"type": "string", "required": True},
+                "feature": {"type": "string", "required": True}, "changes": {"type": "array"},
+                "edit_operations": {"type": "array"}, "deletions": {"type": "array"},
+                "commands": {"type": "array"}, "timeout": {"type": "number"},
+            },
         },
         permissions=["filesystem.read", "filesystem.write", "project.analysis", "project.edit"],
     )
@@ -726,11 +794,13 @@ class ProjectTool(Tool):
         if not project_root.is_dir():
             return OperationResult(success=False, error=f"project directory does not exist: {project_root}", error_type=ErrorType.NOT_FOUND)
         contents: dict[str, str] = {}
-        try:
-            total_bytes = 0
-            for item in files:
-                relative = item if isinstance(item, str) else item["path"]
-                path = (project_root / relative).resolve()
+        errors: list[dict[str, str]] = []
+        total_bytes = 0
+        max_chars = min(max(int(args.get("max_chars", 120_000)), 1_000), 500_000)
+        for item in files:
+            relative = item if isinstance(item, str) else item["path"]
+            path = (project_root / relative).resolve()
+            try:
                 if project_root not in path.parents or not path.is_file():
                     raise FileNotFoundError(relative)
                 if path.stat().st_size > 200_000:
@@ -745,17 +815,34 @@ class ProjectTool(Tool):
                         raise ValueError(f"invalid line range for: {relative}")
                     lines = text.splitlines(keepends=True)
                     text = "".join(lines[start - 1:end])
+                remaining = max_chars - sum(len(value) for value in contents.values())
+                if remaining <= 0:
+                    errors.append({"path": str(relative), "error": "read character budget exhausted"})
+                    continue
+                if len(text) > remaining:
+                    text = text[:remaining]
+                    errors.append({"path": str(relative), "error": "content truncated by max_chars"})
                 total_bytes += len(text.encode("utf-8"))
                 contents[str(path.relative_to(project_root))] = text
-        except (OSError, ValueError) as error:
+            except FileNotFoundError:
+                errors.append({"path": str(relative), "error": "file not found"})
+            except (OSError, ValueError) as error:
+                errors.append({"path": str(relative), "error": str(error)})
+        if not contents:
             return OperationResult(
                 success=False,
-                error=str(error),
-                error_type=ErrorType.NOT_FOUND if isinstance(error, FileNotFoundError) else ErrorType.INVALID_ARGUMENT,
+                error="project.read could not read any requested file",
+                error_type=ErrorType.NOT_FOUND,
+                metadata={"file_errors": errors},
             )
         return OperationResult(
             success=True,
-            output={"root": str(project_root), "files": contents, "source_bytes": total_bytes},
+            output={
+                "root": str(project_root),
+                "files": contents,
+                "source_bytes": total_bytes,
+                "file_errors": errors,
+            },
         )
 
     async def _validate(self, args: dict[str, Any], timeout: float) -> OperationResult:

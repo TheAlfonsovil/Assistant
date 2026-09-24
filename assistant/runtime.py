@@ -125,6 +125,8 @@ class TaskRuntime:
                 TaskStatus.PLANNING,
                 TaskStatus.READY,
                 TaskStatus.RUNNING,
+                TaskStatus.VERIFYING,
+                TaskStatus.FINALIZING,
             }
         ]
         for task in sorted(active, key=lambda item: (-item.priority, item.created_at)):

@@ -19,10 +19,14 @@ class ToolDefinition(BaseModel):
     description: str
     methods: list[str]
     argument_schema: dict[str, Any] = Field(default_factory=dict)
+    method_argument_schema: dict[str, dict[str, Any]] = Field(default_factory=dict)
     permissions: list[str] = Field(default_factory=list)
     timeout: float = 60.0
     idempotent: bool = True
     evidence: dict[str, Any] = Field(default_factory=dict)
+
+    def arguments_for(self, method: str) -> dict[str, Any]:
+        return self.method_argument_schema.get(method, self.argument_schema)
 
 
 class Tool(ABC):
@@ -130,13 +134,24 @@ class ToolRegistry:
             return f"Unknown tool: {operation.tool}"
         if operation.method not in definition.methods:
             return f"Unknown method: {operation.tool}.{operation.method}"
-        return self._arguments_match_schema(definition, operation.args)
+        return self._arguments_match_schema(definition, operation.args, operation.method)
 
     @staticmethod
-    def _arguments_match_schema(definition: ToolDefinition, args: dict[str, Any]) -> str | None:
-        for name, schema in definition.argument_schema.items():
-            expected = schema.get("type") if isinstance(schema, dict) else schema
-            required = isinstance(schema, dict) and schema.get("required", False)
+    def _arguments_match_schema(
+        definition: ToolDefinition, args: dict[str, Any], method: str | None = None
+    ) -> str | None:
+        schema = definition.arguments_for(method) if method else definition.argument_schema
+        unknown = sorted(
+            key for key in args
+            if schema
+            and key not in schema
+            and not key.startswith("_")
+        )
+        if unknown:
+            return f"unsupported argument(s) for {definition.name}: {', '.join(unknown)}"
+        for name, item_schema in schema.items():
+            expected = item_schema.get("type") if isinstance(item_schema, dict) else item_schema
+            required = isinstance(item_schema, dict) and item_schema.get("required", False)
             if name not in args:
                 if required:
                     return f"argument '{name}' is required"
@@ -153,6 +168,9 @@ class ToolRegistry:
             )
             if not valid:
                 return f"argument '{name}' must be of type {expected}"
+            enum = item_schema.get("enum") if isinstance(item_schema, dict) else None
+            if enum is not None and value not in enum:
+                return f"argument '{name}' must be one of: {', '.join(map(str, enum))}"
         return None
 
     async def execute(self, operation: Operation) -> OperationResult:
@@ -169,7 +187,7 @@ class ToolRegistry:
                 error=f"Unknown method: {operation.method}",
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
-        schema_error = self._arguments_match_schema(tool.definition, operation.args)
+        schema_error = self._arguments_match_schema(tool.definition, operation.args, operation.method)
         if schema_error:
             return OperationResult(
                 success=False,

@@ -389,7 +389,9 @@ class OllamaLLMProvider:
             instructions = (
                 "Worker decision policy: use EXECUTE for one safe tool operation, DELEGATE "
                 "for bounded independent child tasks, COMPLETE only with evidence, and "
-                "WAIT, ASK_USER, or FAIL when progress cannot continue safely.\n\n"
+                "WAIT, ASK_USER, or FAIL when progress cannot continue safely. "
+                "Each EXECUTE operation must use registered fields tool and method separately "
+                "(example: tool=codegraph, method=query), never a dotted tool name.\n\n"
                 + instructions
             )
         output_schema = (

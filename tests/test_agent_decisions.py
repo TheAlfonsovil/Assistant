@@ -36,6 +36,35 @@ def test_agent_decision_accepts_llm_action_alias_and_typed_operation():
     assert isinstance(decision.operation, Operation)
 
 
+def test_operation_accepts_dotted_tool_shorthand():
+    operation = Operation.model_validate(
+        {"tool": "codegraph.query", "method": "query", "args": {"query": "assistant"}}
+    )
+    assert operation.tool == "codegraph"
+    assert operation.method == "query"
+
+    inferred = Operation.model_validate({"tool": "project.read", "args": {"files": ["README.md"]}})
+    assert inferred.tool == "project"
+    assert inferred.method == "read"
+
+
+def test_agent_decision_normalizes_dotted_execute_tool():
+    decision = parse_agent_decision(
+        {
+            "decision_type": "EXECUTE",
+            "reason": "Start with a codegraph query",
+            "operation": {
+                "tool": "codegraph.query",
+                "method": "query",
+                "args": {"root": "C:\\projects\\Assistant", "query": "assistant", "kind": "module"},
+            },
+        }
+    )
+    assert decision.operation is not None
+    assert decision.operation.tool == "codegraph"
+    assert decision.operation.method == "query"
+
+
 def test_agent_decision_rejects_execute_without_operation():
     with pytest.raises(ValidationError, match="require an operation"):
         AgentDecision(type="EXECUTE")

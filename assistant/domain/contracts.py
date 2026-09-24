@@ -5,11 +5,36 @@ from enum import StrEnum
 from typing import Any
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 def contract_now() -> datetime:
     return datetime.now(UTC)
+
+
+def split_registered_tool_name(payload: Any) -> Any:
+    """Accept LLM shorthand like ``codegraph.query`` as tool + method.
+
+    The shorthand is only a convenience when the dotted suffix matches the
+    explicit method or when the method was omitted entirely. Registered names
+    such as ``mock.success`` remain valid when the method is a different
+    action, such as ``run``.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    tool = payload.get("tool")
+    method = payload.get("method")
+    if not isinstance(tool, str) or "." not in tool:
+        return payload
+    name, suffix = tool.split(".", 1)
+    if not name.strip() or not suffix.strip() or "." in name:
+        return payload
+    if method not in (None, "", suffix):
+        return payload
+    updated = dict(payload)
+    updated["tool"] = name
+    updated["method"] = suffix
+    return updated
 
 
 class ContractScope(StrEnum):
@@ -166,6 +191,11 @@ class OperationHint(BaseModel):
     method: str
     args: dict[str, Any] = Field(default_factory=dict)
     timeout: float | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_dotted_tool(cls, payload: Any) -> Any:
+        return split_registered_tool_name(payload)
 
 
 class BranchConfig(BaseModel):

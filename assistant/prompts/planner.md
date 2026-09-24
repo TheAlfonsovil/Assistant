@@ -63,12 +63,14 @@ RULES
 - Existing-project changes use `project.analyze`, bounded `project.read`, then
   `project.edit`; add dependent `project.validate` for requested or necessary
   validation. Never claim a change without changed files.
-- Use the codegraph summary as an index only. Use `codegraph.query` for specific
-  files or symbols and refresh with `codegraph.build` when stale or insufficient.
+- Use the codegraph summary as an index only. Query with
+  `{"tool":"codegraph","method":"query"}` for specific files or symbols and
+  refresh with `{"tool":"codegraph","method":"build"}` when stale or insufficient.
+  Never set `tool` to a dotted name such as `codegraph.query`.
 - Do not commit or push unless explicitly requested.
 - `project.read` accepts relative file paths or bounded line ranges using
   `{path,start_line,end_line}`. Prefer ranges around lines returned by
-  `codegraph.query` instead of reading a whole large file.
+  `codegraph` `query` instead of reading a whole large file.
 - Tools are grouped as `primary` and `optional`. Use primary tools by default;
   use optional tools when the request or discovered evidence requires them.
 - Query and source budgets are intentionally generous for this local prototype,
@@ -79,7 +81,7 @@ RULES
   framework markers, test annotations, routes, TODOs, configuration keys,
   citations, or domain terms across files; use `mode=all` for a multi-word
   concept and keep results bounded. Follow useful matches with bounded
-  `project.read` or `codegraph.query` calls. Stop when the requested scope is
+  `project.read` or `codegraph` `query` calls. Stop when the requested scope is
   evidenced or record the remaining unknowns. An `audit.md` artifact may
   present the synthesis, but never replaces persisted tool evidence.
 

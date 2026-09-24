@@ -16,6 +16,7 @@ from .contracts import (
     TaskContract,
     TaskRuntimeState,
     WorkingMemory,
+    split_registered_tool_name,
 )
 
 
@@ -154,6 +155,11 @@ class Operation(BaseModel):
     retry_policy: dict[str, Any] = Field(default_factory=dict)
     idempotency_key: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_dotted_tool(cls, payload: Any) -> Any:
+        return split_registered_tool_name(payload)
 
 
 class AgentDecisionType(StrEnum):

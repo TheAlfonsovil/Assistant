@@ -1237,6 +1237,79 @@ class TaskService:
             return proposal
         return fallback
 
+    @staticmethod
+    def _is_repeated_failed_operation(events: list[TaskEvent], operation: Operation) -> bool:
+        """Detect the same operation being retried after a failure without new evidence."""
+        target_tool = operation.tool
+        target_method = operation.method
+        target_args = {
+            key: value for key, value in operation.args.items() if key != "root"
+        }
+
+        for event in reversed(events):
+            if event.event_type != "AGENT_OBSERVATION":
+                continue
+            payload = event.payload or {}
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("success") is not False:
+                continue
+            if payload.get("error") is None:
+                continue
+            repeated = payload.get("repeated_operation")
+            if isinstance(repeated, dict):
+                same_tool = repeated.get("tool") == target_tool
+                same_method = repeated.get("method") == target_method
+                same_args = repeated.get("args") == target_args
+                if same_tool and same_method and same_args:
+                    return True
+            if payload.get("tool") == target_tool and payload.get("method") == target_method:
+                same_args = payload.get("args") == target_args
+                if same_args:
+                    return True
+        return False
+
+    @staticmethod
+    def _agent_observation(operation: Operation, observation: Any) -> dict[str, Any]:
+        """Keep the next agent turn useful without copying large file bodies."""
+        if not isinstance(observation, dict):
+            return {"success": True, "output": compact(observation, 1600)}
+        output = observation.get("output")
+        if operation.tool == "project" and operation.method == "read" and isinstance(output, dict):
+            files = output.get("files", {})
+            digest = {}
+            if isinstance(files, dict):
+                for path, content in files.items():
+                    text = str(content)
+                    digest[path] = {
+                        "chars": len(text),
+                        "lines": len(text.splitlines()),
+                        "head": text[:600],
+                        "tail": text[-600:] if len(text) > 600 else "",
+                    }
+            return {
+                "success": observation.get("success"),
+                "root": output.get("root"),
+                "files": digest,
+                "file_errors": output.get("file_errors", []),
+                "source_bytes": output.get("source_bytes", 0),
+            }
+        return compact(observation, 2400)
+
+    @staticmethod
+    def _normalize_agent_operation(operation: Operation) -> Operation:
+        """Keep shorthand forms like ``codegraph.query`` while preserving explicit tool IDs."""
+        if not isinstance(operation, Operation):
+            return operation
+        if "." not in operation.tool:
+            return operation
+        name, suffix = operation.tool.split(".", 1)
+        if not name or not suffix or "." in name:
+            return operation
+        if operation.method not in ("", suffix):
+            return operation
+        return operation.model_copy(update={"tool": name, "method": suffix})
+
     async def _normalize_project_modification(
         self, task: Task, proposal: PlanProposal
     ) -> PlanProposal:
@@ -1637,6 +1710,9 @@ class TaskService:
                         "LLM_ERROR",
                         "PLAN_REPAIRED",
                         "BUDGET_EXHAUSTED",
+                        "AGENT_OBSERVATION",
+                        "WORKER_COMPLETED",
+                        "AGENT_DELEGATION_RESULT",
                     }
                 ],
             )
@@ -2140,8 +2216,39 @@ class TaskService:
             )
             return True
 
-        operation = decision.operation
+        operation = self._normalize_agent_operation(decision.operation)
         if self.tools.definition(operation.tool) is None:
+            task.status = TaskStatus.BLOCKED
+            task.failure_reason = f"unknown tool: {operation.tool}"
+            task.finished_at = datetime.now(UTC)
+            await self.repository.save_task(task)
+            return False
+        if self._is_repeated_failed_operation(events, operation):
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="AGENT_OBSERVATION",
+                    payload={
+                        "success": False,
+                        "error": (
+                            "Repeated the previous failed operation with the same tool, "
+                            "method, and arguments. Change the call using LAST OBSERVATION."
+                        ),
+                        "repeated_operation": {
+                            "tool": operation.tool,
+                            "method": operation.method,
+                            "args": {
+                                key: value
+                                for key, value in operation.args.items()
+                                if key != "root"
+                            },
+                        },
+                    },
+                )
+            )
+            task.status = TaskStatus.READY
+            await self.repository.save_task(task)
+            return True
             task.status = TaskStatus.BLOCKED
             task.failure_reason = f"unknown tool: {operation.tool}"
             task.finished_at = datetime.now(UTC)
@@ -2175,6 +2282,7 @@ class TaskService:
                 raise ValueError(operation_error)
             output = await self.tools.execute(operation)
             observation = output.model_dump(mode="json") if hasattr(output, "model_dump") else output
+            agent_observation = self._agent_observation(operation, observation)
             node.output_data = observation if isinstance(observation, dict) else {"value": observation}
             node.status = NodeStatus.SUCCEEDED
             node.finished_at = datetime.now(UTC)
@@ -2185,7 +2293,12 @@ class TaskService:
                 TaskEvent(task_id=task.id, node_id=node.id, event_type="TOOL_RESULT", payload=node.output_data)
             )
             await self.repository.save_event(
-                TaskEvent(task_id=task.id, node_id=node.id, event_type="AGENT_OBSERVATION", payload=node.output_data)
+                TaskEvent(
+                    task_id=task.id,
+                    node_id=node.id,
+                    event_type="AGENT_OBSERVATION",
+                    payload=agent_observation,
+                )
             )
         except Exception as error:
             node.status = NodeStatus.FAILED
@@ -2337,14 +2450,16 @@ class TaskService:
         decision = await self._call_llm(
             self.llm.orchestrate(context), time_remaining
         )
-        if self.context_builder._planner_intent(task.goal) == "audit":
-            decision = decision.model_copy(
-                update={
-                    "intent": "audit",
-                    "worker": "AUDIT_WORKER",
-                    "template": "audit",
-                }
-            )
+        if self.context_builder._planner_intent(task.goal) == "audit" and (not decision.worker or decision.worker == "GENERAL_WORKER"):
+            decision = decision.model_copy(update={"worker": "AUDIT_WORKER", "template": "audit"})
+        elif not decision.worker:
+            decision = decision.model_copy(update={"worker": "GENERAL_WORKER"})
+        if self.context_builder._planner_intent(task.goal) == "audit" and (not decision.template or decision.template == "general"):
+            decision = decision.model_copy(update={"template": "audit"})
+        elif not decision.template:
+            decision = decision.model_copy(update={"template": "general"})
+        if self.context_builder._planner_intent(task.goal) == "audit" and not decision.intent:
+            decision = decision.model_copy(update={"intent": "audit"})
         await self.repository.save_event(
             TaskEvent(
                 task_id=task.id,
@@ -2382,7 +2497,9 @@ class TaskService:
             if decision.template:
                 task.metadata["template"] = decision.template
             if decision.extra_context:
-                task.metadata["extra_context"] = decision.extra_context
+                task.metadata["extra_context"] = self.context_builder._slim_extra_context(
+                    decision.extra_context
+                )
             if decision.acceptance_criteria:
                 task.metadata["acceptance_criteria"] = decision.acceptance_criteria
             task.status = TaskStatus.READY
@@ -2421,7 +2538,9 @@ class TaskService:
         task.metadata["worker"] = decision.worker
         task.metadata["template"] = decision.template
         task.metadata["orchestrator_intent"] = decision.intent
-        task.metadata["extra_context"] = decision.extra_context
+        task.metadata["extra_context"] = self.context_builder._slim_extra_context(
+            decision.extra_context
+        )
         task.metadata["acceptance_criteria"] = decision.acceptance_criteria
         task.metadata["orchestration_stage"] = "WORK"
         task.runtime.workflow = "agent"
@@ -2483,6 +2602,21 @@ class TaskService:
             TaskStatus.SUCCEEDED,
             TaskStatus.FAILED,
         }:
+            return False
+        if task.status is TaskStatus.FINALIZING:
+            final_status = task.runtime.final_status
+            if final_status in {
+                TaskStatus.SUCCEEDED.value,
+                TaskStatus.FAILED.value,
+                TaskStatus.BLOCKED.value,
+                TaskStatus.CANCELLED.value,
+            }:
+                task.status = TaskStatus(final_status)
+            else:
+                task.status = TaskStatus.FAILED
+                task.failure_reason = task.failure_reason or "task finalization state is invalid"
+            await self.repository.save_task(task)
+            await self._ensure_final_response(task)
             return False
         cancellation = self._cancellation_event(task_id)
         if cancellation.is_set():

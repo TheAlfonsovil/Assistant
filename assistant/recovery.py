@@ -58,6 +58,37 @@ class RecoveryManager:
                     row.status = TaskStatus.READY.value
                     row.finished_at = None
                     row.failure_reason = "node recovered after process restart"
+        finalizing = await self.session.execute(
+            select(TaskRow).where(TaskRow.status == TaskStatus.FINALIZING.value)
+        )
+        for row in finalizing.scalars():
+            runtime = row.runtime_json or {}
+            final_status = runtime.get("final_status")
+            if final_status not in {
+                TaskStatus.SUCCEEDED.value,
+                TaskStatus.FAILED.value,
+                TaskStatus.BLOCKED.value,
+                TaskStatus.CANCELLED.value,
+            }:
+                final_status = TaskStatus.FAILED.value
+                row.failure_reason = row.failure_reason or "finalization recovered after process restart"
+            row.status = TaskStatus.FINALIZING.value
+            row.finished_at = None
+            runtime["final_status"] = final_status
+            runtime["final_response_pending"] = True
+            row.runtime_json = runtime
+            event_id = f"recovery-finalizing-{row.id}"
+            if await self.session.get(EventRow, event_id) is None:
+                self.session.add(
+                    EventRow(
+                        id=event_id,
+                        task_id=row.id,
+                        event_type="TASK_FINALIZATION_RECOVERED",
+                        payload={"reason": "process restart", "next_status": final_status},
+                        created_at=now,
+                    )
+                )
+            recovered += 1
         planning = await self.session.execute(
             select(TaskRow).where(TaskRow.status == TaskStatus.PLANNING.value)
         )

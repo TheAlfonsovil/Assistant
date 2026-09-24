@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from assistant.domain.models import ErrorType, OperationResult
@@ -17,9 +18,26 @@ class CodeGraphTool(Tool):
         argument_schema={
             "root": {"type": "string"},
             "max_files": {"type": "integer"},
-            "query": {"type": "string", "description": "Optional text to match files, modules, or symbols."},
+            "query": {"type": "string", "description": "Space-separated terms matched independently against files, modules, and symbols."},
             "kind": {"type": "string", "description": "Optional node kind filter: module or symbol."},
             "limit": {"type": "integer", "description": "Maximum matching nodes to return (1-500)."},
+        },
+        method_argument_schema={
+            "build": {
+                "root": {"type": "string", "required": True},
+                "max_files": {"type": "integer"},
+            },
+            "system": {
+                "root": {"type": "string", "required": True},
+                "max_files": {"type": "integer"},
+            },
+            "query": {
+                "root": {"type": "string", "required": True},
+                "max_files": {"type": "integer"},
+                "query": {"type": "string"},
+                "kind": {"type": "string", "enum": ["module", "symbol"]},
+                "limit": {"type": "integer"},
+            },
         },
         permissions=["filesystem.read", "project.analysis"],
     )
@@ -72,16 +90,21 @@ class CodeGraphTool(Tool):
             query = str(args.get("query") or "").casefold()
             kind = str(args.get("kind") or "").casefold()
             limit = min(max(int(args.get("limit", 100)), 1), 500)
-            nodes = [
-                node for node in graph.get("nodes", [])
-                if (not kind or str(node.get("kind", "")).casefold() == kind)
-                and (
-                    not query
-                    or query in str(node.get("id", "")).casefold()
-                    or query in str(node.get("name", "")).casefold()
-                    or query in str(node.get("file", "")).casefold()
+            terms = [term for term in re.findall(r"[a-z0-9_]+", query) if len(term) > 1]
+            candidates = []
+            for node in graph.get("nodes", []):
+                if kind and str(node.get("kind", "")).casefold() != kind:
+                    continue
+                haystack = " ".join(
+                    str(node.get(field, "")).casefold()
+                    for field in ("id", "name", "file")
                 )
-            ][:limit]
+                matched = [term for term in terms if term in haystack]
+                if terms and not matched:
+                    continue
+                candidates.append((len(matched), node))
+            candidates.sort(key=lambda item: (-item[0], str(item[1].get("id", ""))))
+            nodes = [node for _, node in candidates[:limit]]
             node_ids = {node.get("id") for node in nodes}
             edges = [
                 edge for edge in graph.get("edges", [])
@@ -90,6 +113,7 @@ class CodeGraphTool(Tool):
             result.output = {
                 "root": result.output.get("root"),
                 "query": query,
+                "query_terms": terms,
                 "kind": kind or None,
                 "nodes": nodes,
                 "edges": edges,
