@@ -2137,6 +2137,18 @@ class TaskService:
                 task, TaskStatus.BLOCKED, "LLM call budget exhausted", "TASK_BUDGET_EXHAUSTED"
             ) is not None
         events = await self.repository.list_events(task.id)
+        intent = self.context_builder._planner_intent(task.goal)
+        worker = task.metadata.get("worker")
+        template = task.metadata.get("template")
+        if not worker or worker == "GENERAL_WORKER" and intent == "audit":
+            task.metadata["worker"] = "AUDIT_WORKER" if intent == "audit" else "GENERAL_WORKER"
+        if not template or template == "general" and intent == "audit":
+            task.metadata["template"] = "audit" if intent == "audit" else "general"
+        if not task.metadata.get("orchestration_intent"):
+            task.metadata["orchestration_intent"] = intent
+        if not task.metadata.get("orchestration_stage"):
+            task.metadata["orchestration_stage"] = "WORK"
+        await self.repository.save_task(task)
         last_observation = next(
             (
                 event.payload
@@ -2291,7 +2303,16 @@ class TaskService:
             if isinstance(observation, dict):
                 await self._persist_project_operation_result(task, operation, observation)
             await self.repository.save_event(
-                TaskEvent(task_id=task.id, node_id=node.id, event_type="TOOL_RESULT", payload=node.output_data)
+                TaskEvent(
+                    task_id=task.id,
+                    node_id=node.id,
+                    event_type="TOOL_RESULT",
+                    payload={
+                        **node.output_data,
+                        "tool": operation.tool,
+                        "method": operation.method,
+                    },
+                )
             )
             await self.repository.save_event(
                 TaskEvent(

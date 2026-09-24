@@ -117,7 +117,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.4.4", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.4.5", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parents[2] / "dashboard"
 
 
@@ -161,10 +161,15 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         payload = event.payload or {}
         status_counts[event.event_type] = status_counts.get(event.event_type, 0) + 1
         if event.event_type == "TOOL_RESULT":
-            tool = payload.get("tool", "unknown")
-            tool_counts[tool] = tool_counts.get(tool, 0) + 1
+            tool = payload.get("tool")
+            if tool:
+                tool_counts[tool] = tool_counts.get(tool, 0) + 1
             if isinstance(payload.get("duration"), (int, float)):
                 tool_latency.append(payload["duration"])
+        if event.event_type == "TOOL_CALLED":
+            tool = payload.get("tool")
+            if tool:
+                tool_counts[tool] = tool_counts.get(tool, 0) + 1
         if event.event_type in {"LLM_REQUEST", "LLM_RESPONSE"}:
             phase = payload.get("role", "unknown")
             phase_counts[phase] = phase_counts.get(phase, 0) + 1
@@ -260,6 +265,7 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
                 {
                     "llm_calls": 0,
                     "tool_calls": 0,
+                    "tool_methods": [],
                     "retry_count": 0,
                     "estimated_tokens": 0,
                     "actual_tokens": 0,
@@ -280,6 +286,9 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
                 usage["actual_tokens_available"] = bool(measured)
             elif event.event_type == "TOOL_CALLED":
                 usage["tool_calls"] += 1
+                tool_method = f"{payload.get('tool', 'unknown')}.{payload.get('method', 'unknown')}"
+                if tool_method not in usage["tool_methods"]:
+                    usage["tool_methods"].append(tool_method)
             elif event.event_type in {"RETRY_SCHEDULED", "NODE_RETRY"}:
                 usage["retry_count"] += 1
         node_map = {node.id: node for node in task_nodes.get(task.id, [])}
@@ -289,7 +298,7 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         for node_id, node in node_map.items():
             if node_id not in node_usage:
                 node_usage[node_id] = {
-                    "llm_calls": 0, "tool_calls": 0, "retry_count": 0,
+                    "llm_calls": 0, "tool_calls": 0, "tool_methods": [], "retry_count": 0,
                     "estimated_tokens": 0, "actual_tokens": 0,
                     "actual_tokens_available": False,
                 }
