@@ -794,9 +794,10 @@ class ProjectTool(Tool):
         if not project_root.is_dir():
             return OperationResult(success=False, error=f"project directory does not exist: {project_root}", error_type=ErrorType.NOT_FOUND)
         contents: dict[str, str] = {}
+        file_metadata: dict[str, dict[str, Any]] = {}
         errors: list[dict[str, str]] = []
         total_bytes = 0
-        max_chars = min(max(int(args.get("max_chars", 120_000)), 1_000), 500_000)
+        max_chars = min(max(int(args.get("max_chars", 120_000)), 1), 500_000)
         for item in files:
             relative = item if isinstance(item, str) else item["path"]
             path = (project_root / relative).resolve()
@@ -806,6 +807,8 @@ class ProjectTool(Tool):
                 if path.stat().st_size > 200_000:
                     raise ValueError(f"file is too large to read: {relative}")
                 text = path.read_text(encoding="utf-8")
+                requested_start = 1
+                requested_end = None
                 if isinstance(item, dict):
                     start = item.get("start_line", 1)
                     end = item.get("end_line")
@@ -813,17 +816,44 @@ class ProjectTool(Tool):
                         end is not None and (not isinstance(end, int) or end < start)
                     ):
                         raise ValueError(f"invalid line range for: {relative}")
+                    requested_start = start
+                    requested_end = end
                     lines = text.splitlines(keepends=True)
                     text = "".join(lines[start - 1:end])
+                source_text = text
+                source_lines = source_text.splitlines(keepends=True)
                 remaining = max_chars - sum(len(value) for value in contents.values())
                 if remaining <= 0:
                     errors.append({"path": str(relative), "error": "read character budget exhausted"})
                     continue
-                if len(text) > remaining:
-                    text = text[:remaining]
-                    errors.append({"path": str(relative), "error": "content truncated by max_chars"})
+                truncated = len(text) > remaining
+                truncated_at_line = None
+                if truncated:
+                    consumed = 0
+                    selected_lines = []
+                    for offset, line in enumerate(source_lines):
+                        if consumed + len(line) > remaining:
+                            truncated_at_line = requested_start + offset
+                            break
+                        selected_lines.append(line)
+                        consumed += len(line)
+                    text = "".join(selected_lines)
+                    errors.append({
+                        "path": str(relative),
+                        "error": f"content truncated at line {truncated_at_line} by max_chars",
+                    })
                 total_bytes += len(text.encode("utf-8"))
                 contents[str(path.relative_to(project_root))] = text
+                file_metadata[str(path.relative_to(project_root))] = {
+                    "source_chars": len(source_text),
+                    "returned_chars": len(text),
+                    "source_lines": len(source_lines),
+                    "returned_lines": len(text.splitlines()),
+                    "requested_start_line": requested_start,
+                    "requested_end_line": requested_end,
+                    "truncated": truncated,
+                    "truncated_at_line": truncated_at_line,
+                }
             except FileNotFoundError:
                 errors.append({"path": str(relative), "error": "file not found"})
             except (OSError, ValueError) as error:
@@ -840,6 +870,7 @@ class ProjectTool(Tool):
             output={
                 "root": str(project_root),
                 "files": contents,
+                "file_metadata": file_metadata,
                 "source_bytes": total_bytes,
                 "file_errors": errors,
             },

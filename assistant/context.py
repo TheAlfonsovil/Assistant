@@ -60,7 +60,7 @@ class ContextBuilder:
         return {key: value for key, value in extra.items() if key not in dropped}
 
     @staticmethod
-    def _bound_agent_context(context: dict[str, Any], limit: int = 48_000) -> dict[str, Any]:
+    def _bound_agent_context(context: dict[str, Any], limit: int = 32_000) -> dict[str, Any]:
         """Keep every agent turn below a predictable prompt-side evidence budget.
 
         Variable index dumps are trimmed first. Turn-local evidence, tools, and
@@ -326,7 +326,8 @@ class ContextBuilder:
             for event in events[-8:]
             if event.event_type in {"AGENT_DECISION", "TOOL_RESULT", "NODE_COMPLETED", "NODE_FAILED"}
         ]
-        intent = task.metadata.get("orchestrator_intent") or self._planner_intent(task.goal)
+        raw_intent = task.metadata.get("orchestrator_intent") or self._planner_intent(task.goal)
+        intent = self._planner_intent(str(raw_intent))
         audit_protocol = None
         if intent == "audit":
             audit_protocol = {
@@ -674,12 +675,13 @@ class ContextBuilder:
         self, intent: str = "general", *, compact: bool = False
     ) -> list[dict[str, Any]]:
         definitions = self.tools.definitions()
+        normalized_intent = self._planner_intent(str(intent))
         preferred = {
             "audit": {"project", "codegraph", "git"},
             "create": {"project", "filesystem"},
             "edit": {"project", "codegraph"},
             "browser": {"browser", "web"},
-        }.get(intent)
+        }.get(normalized_intent)
         primary = [definition for definition in definitions if not preferred or definition.name in preferred]
         optional_names = {"web", "browser", "deployment", "filesystem", "shell", "process", "git", "codegraph", "project"}
         optional = [

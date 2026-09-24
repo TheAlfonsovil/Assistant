@@ -21,6 +21,7 @@ class CodeGraphTool(Tool):
             "query": {"type": "string", "description": "Space-separated terms matched independently against files, modules, and symbols."},
             "kind": {"type": "string", "description": "Optional node kind filter: module or symbol."},
             "limit": {"type": "integer", "description": "Maximum matching nodes to return (1-500)."},
+            "detail": {"type": "string", "enum": ["summary", "full"]},
         },
         method_argument_schema={
             "build": {
@@ -30,6 +31,7 @@ class CodeGraphTool(Tool):
             "system": {
                 "root": {"type": "string", "required": True},
                 "max_files": {"type": "integer"},
+                "detail": {"type": "string", "enum": ["summary", "full"]},
             },
             "query": {
                 "root": {"type": "string", "required": True},
@@ -37,6 +39,7 @@ class CodeGraphTool(Tool):
                 "query": {"type": "string"},
                 "kind": {"type": "string", "enum": ["module", "symbol"]},
                 "limit": {"type": "integer"},
+                "detail": {"type": "string", "enum": ["summary", "full"]},
             },
         },
         permissions=["filesystem.read", "project.analysis"],
@@ -50,9 +53,45 @@ class CodeGraphTool(Tool):
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
         if method == "system":
-            return await SystemGraphAnalyzer().analyze(
+            result = await SystemGraphAnalyzer().analyze(
                 args["root"], int(args.get("max_files", 300))
             )
+            if not result.success or args.get("detail", "summary") == "full":
+                return result
+            graph = result.output.get("graph", {})
+            nodes = graph.get("nodes", [])
+            edges = graph.get("edges", [])
+            modules = [node for node in nodes if node.get("kind") == "module"]
+            symbols = [node for node in nodes if node.get("kind") == "symbol"]
+            edge_kinds: dict[str, int] = {}
+            for edge in edges:
+                kind = str(edge.get("kind", "unknown"))
+                edge_kinds[kind] = edge_kinds.get(kind, 0) + 1
+            result.output = {
+                "root": result.output.get("root"),
+                "file_count": len(result.output.get("files_analyzed", [])),
+                "files_sample": result.output.get("files_analyzed", [])[:40],
+                "graph": {
+                    "nodes": [*modules[:40], *symbols[:40]],
+                    "edges": edges[:60],
+                    "truncated": graph.get("truncated", False),
+                },
+                "graph_summary": {
+                    "module_count": len(modules),
+                    "symbol_count": len(symbols),
+                    "edge_count": len(edges),
+                    "edge_kinds": edge_kinds,
+                    "truncated": graph.get("truncated", False),
+                    "module_sample": modules[:40],
+                    "symbol_sample": symbols[:40],
+                    "edge_sample": edges[:60],
+                },
+                "next": {
+                    "query": "Use codegraph.query with a distinctive term for more detail.",
+                    "detail": "full is available only when the complete graph is necessary.",
+                },
+            }
+            return result
         persisted = args.get("_persisted_graph")
         if (
             method == "query"

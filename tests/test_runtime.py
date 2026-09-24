@@ -663,6 +663,39 @@ async def test_project_read_supports_bounded_line_ranges(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_project_read_reports_line_metadata_when_content_is_truncated(tmp_path):
+    (tmp_path / "long.py").write_text("".join(f"line {index}\n" for index in range(1, 20)), encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="read",
+            args={"root": str(tmp_path), "files": ["long.py"], "max_chars": 25},
+        )
+    )
+
+    metadata = result.output["file_metadata"]["long.py"]
+    assert result.success is True
+    assert metadata["truncated"] is True
+    assert metadata["truncated_at_line"] is not None
+    assert "truncated at line" in result.output["file_errors"][0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_codegraph_system_returns_summary_by_default(tmp_path):
+    (tmp_path / "main.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(tool="codegraph", method="system", args={"root": str(tmp_path)})
+    )
+
+    assert result.success is True
+    assert "graph_summary" in result.output
+    assert "edges" not in result.output["graph_summary"]
+    assert result.output["graph_summary"]["module_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_planner_context_includes_registered_codegraph_as_bounded_evidence(tmp_path):
     repository = TaskRepository.__new__(TaskRepository)
     project = Project(

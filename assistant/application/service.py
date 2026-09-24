@@ -1291,6 +1291,7 @@ class TaskService:
                 "success": observation.get("success"),
                 "root": output.get("root"),
                 "files": digest,
+                "file_metadata": output.get("file_metadata", {}),
                 "file_errors": output.get("file_errors", []),
                 "source_bytes": output.get("source_bytes", 0),
             }
