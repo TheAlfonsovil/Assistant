@@ -117,7 +117,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.4.3", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.4.4", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parents[2] / "dashboard"
 
 
@@ -333,6 +333,73 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         1 for task in tasks
         if task.status.value in {"SUCCEEDED", "FAILED", "BLOCKED", "CANCELLED"}
     )
+    llm_exchange_count = llm_response_events
+    measured_exchange_count = actual_usage_events
+    estimated_request_count = sum(1 for event in events if event.event_type == "LLM_REQUEST")
+    phase_metrics: dict[str, dict[str, float | int]] = {}
+    tool_method_counts: dict[str, int] = {}
+    transition_counts: dict[str, int] = {}
+    task_type_counts: dict[str, int] = {}
+    node_type_counts: dict[str, int] = {}
+    for event in events:
+        payload = event.payload or {}
+        if event.event_type in {"LLM_REQUEST", "LLM_RESPONSE"}:
+            role = str(payload.get("role") or "unknown")
+            bucket = phase_metrics.setdefault(role, {
+                "requests": 0, "responses": 0, "estimated_prompt_tokens": 0,
+                "estimated_response_tokens": 0, "actual_prompt_tokens": 0,
+                "actual_response_tokens": 0, "prefill_seconds": 0.0,
+                "generation_seconds": 0.0,
+            })
+            if event.event_type == "LLM_REQUEST":
+                bucket["requests"] += 1
+                bucket["estimated_prompt_tokens"] += int((payload.get("context_chars", 0) or 0) / 4)
+            else:
+                bucket["responses"] += 1
+                bucket["estimated_response_tokens"] += int((payload.get("response_chars", 0) or 0) / 4)
+                usage = payload.get("usage") or {}
+                bucket["actual_prompt_tokens"] += int(usage.get("prompt_eval_count", 0) or 0)
+                bucket["actual_response_tokens"] += int(usage.get("eval_count", 0) or 0)
+                bucket["prefill_seconds"] += float(usage.get("prompt_eval_duration", 0) or 0) / 1_000_000_000
+                bucket["generation_seconds"] += float(usage.get("eval_duration", 0) or 0) / 1_000_000_000
+        if event.event_type == "TOOL_RESULT":
+            key = f"{payload.get('tool', 'unknown')}.{payload.get('method', 'unknown')}"
+            tool_method_counts[key] = tool_method_counts.get(key, 0) + 1
+        if event.event_type.startswith(("TASK_", "NODE_")) or event.event_type in {"RETRY_SCHEDULED", "USER_INPUT_REQUIRED"}:
+            transition_counts[event.event_type] = transition_counts.get(event.event_type, 0) + 1
+    for task in tasks:
+        task_type = str(
+            task.runtime.workflow
+            or task.metadata.get("orchestrator_intent")
+            or task.metadata.get("execution_mode")
+            or "general"
+        )
+        task_type_counts[task_type] = task_type_counts.get(task_type, 0) + 1
+        for node in task_nodes.get(task.id, []):
+            node_type = node.type.value
+            node_type_counts[node_type] = node_type_counts.get(node_type, 0) + 1
+    llm_per_request = {
+        "requests": estimated_request_count,
+        "responses": llm_exchange_count,
+        "estimated_prompt_tokens": round(estimated_prompt_tokens / max(1, estimated_request_count)),
+        "estimated_response_tokens": round(estimated_response_tokens / max(1, llm_exchange_count)),
+        "estimated_total_tokens": round((estimated_prompt_tokens + estimated_response_tokens) / max(1, llm_exchange_count)),
+        "actual_prompt_tokens": round(actual_prompt_tokens / max(1, measured_exchange_count)),
+        "actual_response_tokens": round(actual_response_tokens / max(1, measured_exchange_count)),
+        "actual_total_tokens": round((actual_prompt_tokens + actual_response_tokens) / max(1, measured_exchange_count)),
+        "actual_available": bool(measured_exchange_count),
+        "average_prefill_seconds": round(prefill_seconds / max(1, measured_exchange_count), 3),
+        "average_generation_seconds": round(generation_seconds / max(1, measured_exchange_count), 3),
+        "average_generation_tokens_per_second": round(
+            actual_response_tokens / generation_seconds, 2
+        ) if generation_seconds else 0,
+    }
+    for bucket in phase_metrics.values():
+        responses = max(1, int(bucket["responses"]))
+        measured = int(bucket["actual_prompt_tokens"] or bucket["actual_response_tokens"])
+        bucket["average_prefill_seconds"] = round(float(bucket["prefill_seconds"]) / responses, 3)
+        bucket["average_generation_seconds"] = round(float(bucket["generation_seconds"]) / responses, 3)
+        bucket["actual_available"] = bool(measured)
     return {
         "model": model,
         "event_counts": status_counts,
@@ -378,6 +445,15 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             "generation_tokens_per_second": round(
                 measured_generation_tokens / generation_seconds, 2
             ) if generation_seconds else 0,
+        },
+        "llm_per_request": llm_per_request,
+        "phase_metrics": phase_metrics,
+        "distribution": {
+            "task_types": task_type_counts,
+            "node_types": node_type_counts,
+            "tools": tool_counts,
+            "tool_methods": tool_method_counts,
+            "transitions": transition_counts,
         },
         "throughput": {
             "completed_tasks": completed,
