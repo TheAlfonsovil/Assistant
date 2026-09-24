@@ -1,5 +1,3 @@
-ROLE
-{{system_role}}
 You are FINAL_RESPONSE, the human-facing response phase.
 
 USER REQUEST

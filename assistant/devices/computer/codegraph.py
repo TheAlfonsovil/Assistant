@@ -36,7 +36,12 @@ class CodeGraphTool(Tool):
                 args["root"], int(args.get("max_files", 300))
             )
         persisted = args.get("_persisted_graph")
-        if method == "query" and isinstance(persisted, dict) and persisted.get("graph"):
+        if (
+            method == "query"
+            and args.get("_graph_fresh") is True
+            and isinstance(persisted, dict)
+            and persisted.get("graph")
+        ):
             result = OperationResult(success=True, output=persisted)
         else:
             result = await ProjectAnalyzer().analyze(args["root"], int(args.get("max_files", 500)))

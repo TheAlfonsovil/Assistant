@@ -42,6 +42,15 @@ class SystemInfoTool(Tool):
             output={
                 "os": platform.system(),
                 "os_release": platform.release(),
+                "os_version": platform.win32_ver()[0] if os.name == "nt" else platform.version(),
+                "os_generation": (
+                    "Windows 11"
+                    if os.name == "nt" and platform.win32_ver()[2].isdigit()
+                    and int(platform.win32_ver()[2]) >= 22000
+                    else "Windows"
+                    if os.name == "nt"
+                    else platform.system()
+                ),
                 "architecture": platform.machine(),
                 "python_version": platform.python_version(),
                 "runtime": sys.implementation.name,

@@ -101,18 +101,39 @@ class ContextBuilder:
         if not codegraph:
             return None
         graph = codegraph.get("graph") or {}
-        nodes = graph.get("nodes") or []
-        edges = graph.get("edges") or []
+        nodes = graph.get("nodes") or [
+            *[
+                {"id": item.get("module"), "kind": "module", "file": item.get("file")}
+                for item in codegraph.get("modules", [])
+            ],
+            *[
+                {
+                    "id": f"{item.get('file')}:{item.get('line')}:{item.get('name')}",
+                    "kind": "symbol",
+                    "name": item.get("name"),
+                    "file": item.get("file"),
+                    "line": item.get("line"),
+                }
+                for item in codegraph.get("symbols", [])
+            ],
+        ]
+        edges = graph.get("edges") or codegraph.get("dependency_edges", [])
         modules = [node for node in nodes if node.get("kind") == "module"]
         symbols = [node for node in nodes if node.get("kind") == "symbol"]
         return {
             "root": codegraph.get("root"),
+            "project_kind": codegraph.get("project_kind", []),
             "file_count": codegraph.get("file_count"),
+            "file_tree": (codegraph.get("files_analyzed") or [])[:200],
+            "key_files": (codegraph.get("key_files") or [])[:80],
             "languages": codegraph.get("languages", {}),
             "truncated": codegraph.get("truncated") or graph.get("truncated", False),
             "module_count": len(modules),
             "symbol_count": len(symbols),
             "edge_count": len(edges),
+            "modules": modules[:120],
+            "symbols": symbols[:120],
+            "edges": edges[:160],
             "query": {
                 "tool": "codegraph.query",
                 "args": ["root", "query", "kind", "limit"],
@@ -161,11 +182,14 @@ class ContextBuilder:
                 "id": project.id,
                 "name": project.name,
                 "path": project.path,
+                "description": project.description,
+                "audit_prompt": project.audit_prompt,
                 "project_type": project.project_type,
                 "codegraph_version": project.codegraph_version,
                 "codegraph_available": project.codegraph is not None,
                 "codegraph": self._codegraph_summary(project.codegraph),
             } if project else None,
+            "codegraph": self._codegraph_summary(project.codegraph) if project else None,
             "execution_target": task.runtime.target,
             "constraints": {
                 "max_retries": task.budget.max_retries,
@@ -206,33 +230,27 @@ class ContextBuilder:
             for event in events[-8:]
             if event.event_type in {"AGENT_DECISION", "TOOL_RESULT", "NODE_COMPLETED", "NODE_FAILED"}
         ]
+        intent = task.metadata.get("orchestrator_intent") or self._planner_intent(task.goal)
         audit_protocol = None
-        if self._planner_intent(task.goal) == "audit":
+        if intent == "audit":
             audit_protocol = {
                 "required": True,
-                "purpose": "Establish the audit template before drawing findings.",
-                "first_attempt": [
-                    {
-                        "tool": "project",
-                        "method": "read",
-                        "args": {"files": ["audit.md"]},
-                        "meaning": "Use the project's audit instructions if present.",
-                    },
-                    {
-                        "tool": "project",
-                        "method": "read",
-                        "args": {"files": ["README.md"]},
-                        "meaning": "Fallback orientation when audit.md is absent.",
-                    },
+                "purpose": "Establish an evidence-backed orientation before drawing findings.",
+                "workflow": [
+                    "Inspect the bounded codegraph and project metadata.",
+                    "Choose the most relevant orientation files or queries from the available evidence.",
+                    "Inspect architecture, flows, tools and validation evidence in bounded steps.",
+                    "Synthesize only facts supported by persisted observations.",
                 ],
-                "fallback_template": [
+                "coverage_template": [
                     "scope_and_project_type",
                     "structure_and_entrypoints",
                     "configuration_and_dependencies",
                     "tests_and_validation",
                     "risks_and_unknowns",
                 ],
-                "rule": "Attempt audit.md first; if unavailable, use the general template. Do not claim a file was read unless a tool result proves it.",
+                "codegraph_preflight": "The runtime builds the bounded project codegraph before routing. Use its summary as the structural index and query it when a file or symbol relationship matters.",
+                "rule": "The worker chooses the next evidence operation. Do not assume a conventional filename or claim a file, command, tool result or technology that was not observed.",
             }
         return self._bound_agent_context({
             "phase": "AGENT",
@@ -248,20 +266,21 @@ class ContextBuilder:
                 "name": project.name,
                 "path": project.path,
                 "project_type": project.project_type,
-                "codegraph": self._codegraph_summary(project.codegraph),
+                "codegraph_available": project.codegraph is not None,
+                "codegraph_version": project.codegraph_version,
             } if project else None,
+            "codegraph": self._codegraph_summary(project.codegraph) if project else None,
             "execution_target": task.runtime.target,
             "worker": task.metadata.get("worker"),
             "template": task.metadata.get("template"),
             "working_memory": compact(task.working_memory.model_dump(mode="json")),
             "extra_context": task.metadata.get("extra_context", {}),
             "acceptance_criteria": task.metadata.get("acceptance_criteria", []),
-            "working_memory": compact(task.working_memory.model_dump(mode="json")),
             "long_term_memory": await self._memory_context(task.goal, task),
             "last_observation": compact(last_observation),
             "evidence": evidence,
             "audit_protocol": audit_protocol,
-            "available_actions": self._available_actions(self._planner_intent(task.goal)),
+            "available_actions": self._available_actions(intent),
             "constraints": {
                 "max_llm_calls": task.budget.max_llm_calls,
                 "remaining_llm_calls": max(0, task.budget.max_llm_calls - task.runtime.llm_calls),
@@ -320,10 +339,13 @@ class ContextBuilder:
                 "id": project.id,
                 "name": project.name,
                 "path": project.path,
+                "description": project.description,
+                "audit_prompt": project.audit_prompt,
                 "project_type": project.project_type,
                 "codegraph_available": project.codegraph is not None,
                 "codegraph_version": project.codegraph_version,
             } if project else None,
+            "codegraph": self._codegraph_summary(project.codegraph) if project else None,
             "execution_target": task.runtime.target,
             "orchestration_stage": task.metadata.get("orchestration_stage", "ROUTE"),
             "worker_completion": task.metadata.get("worker_completion"),
@@ -348,6 +370,7 @@ class ContextBuilder:
                 "status": task.status,
                 "workflow": task.runtime.workflow,
                 "turn": task.runtime.agent_turns,
+                "codegraph_error": task.metadata.get("codegraph_error"),
             },
         })
 
@@ -597,6 +620,20 @@ class ContextBuilder:
         if not hasattr(self.repository, "search_memory"):
             return []
         selected = []
+        list_memory = getattr(self.repository, "list_memory", None)
+        if list_memory is not None:
+            try:
+                selected.extend(
+                    item
+                    for item in await list_memory(limit=20, scope=ContractScope.GLOBAL)
+                    if item.kind in {"system", "user_profile"}
+                )
+            except TypeError:
+                selected.extend(
+                    item
+                    for item in await list_memory(limit=20)
+                    if item.kind in {"system", "user_profile"}
+                )
         scopes = [(ContractScope.GLOBAL, None)]
         if task and task.project_id:
             scopes.append((ContractScope.PROJECT, task.project_id))

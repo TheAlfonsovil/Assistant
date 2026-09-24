@@ -128,9 +128,21 @@ class StartupManager:
     @staticmethod
     def _system_facts() -> dict[str, str]:
         """Return stable technical facts; never inspect personal files or secrets."""
+        windows_version = platform.win32_ver()[0] if platform.system() == "Windows" else ""
+        build_number = platform.win32_ver()[2] if platform.system() == "Windows" else ""
+        windows_generation = (
+            "Windows 11"
+            if build_number.isdigit() and int(build_number) >= 22000
+            else "Windows"
+            if platform.system() == "Windows"
+            else ""
+        )
         return {
             "os": platform.system(),
             "os_release": platform.release(),
+            "os_version": windows_version or platform.version(),
+            "os_generation": windows_generation,
+            "device_platform": "windows" if platform.system() == "Windows" else platform.system().lower(),
             "architecture": platform.machine(),
             "python_version": platform.python_version(),
             "assistant_runtime": sys.implementation.name,

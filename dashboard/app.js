@@ -227,6 +227,10 @@ function workflowGraph(taskId, task, nodes, edges, events) {
   const workflow = [];
   const add = (kind, title, detail, status = "READY", meta = "") => workflow.push({ kind, title, detail, status, meta });
   add("start", "Tarea creada", `${shortId(taskId)} · ${date(task.created_at)}`, task.status);
+  const graphReady = events.find((event) => event.event_type === "ORCHESTRATOR_CODEGRAPH_READY");
+  const graphFailed = events.find((event) => event.event_type === "ORCHESTRATOR_CODEGRAPH_FAILED");
+  if (graphReady) add("codegraph", "CODEGRAPH PREFLIGHT", `${graphReady.payload?.file_count || 0} archivos indexados`, "SUCCEEDED", `versión ${graphReady.payload?.version || "-"}`);
+  if (graphFailed) add("codegraph", "CODEGRAPH PREFLIGHT", "índice no disponible", "FAILED", graphFailed.payload?.error || "error desconocido");
   const route = events.find((event) => event.event_type === "ORCHESTRATOR_DECISION");
   if (route) {
     const payload = route.payload || {};

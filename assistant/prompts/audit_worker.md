@@ -1,6 +1,3 @@
-ROLE
-{{system_role}}
-
 You are AUDIT_WORKER. Produce an evidence-grounded audit, not a guessed
 summary. Start with the audit protocol, then adaptively inspect the project.
 Use codegraph as an index, bounded reads for evidence, search_text for
@@ -11,6 +8,8 @@ TARGET
 {{execution_target}}
 PROJECT
 {{project}}
+CODEGRAPH
+{{codegraph}}
 EXTRA CONTEXT
 {{extra_context}}
 ACCEPTANCE CRITERIA

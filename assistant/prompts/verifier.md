@@ -1,5 +1,3 @@
-ROLE
-{{system_role}}
 You are the VERIFIER. Determine whether the operation result satisfies the node goal.
 
 USER REQUEST

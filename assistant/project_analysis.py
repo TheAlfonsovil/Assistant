@@ -139,8 +139,8 @@ class ProjectAnalyzer:
         test_files = self._discover_test_files(project_root, files, configuration)
         sensitive_files = [
             path.relative_to(project_root).as_posix()
-            for path in files
-            if path.name in {".env", ".env.local", ".env.production"}
+            for path in project_root.rglob("*")
+            if path.is_file() and path.name in {".env", ".env.local", ".env.production"}
         ]
         documentation_files = [
             path.relative_to(project_root).as_posix()
@@ -658,7 +658,16 @@ class ProjectAnalyzer:
             ".pytest_cache",
             ".ruff_cache",
         }
-        files = [path for path in root.rglob("*") if path.is_file() and not ignored.intersection(path.parts)]
+        files = [
+            path
+            for path in root.rglob("*")
+            if path.is_file()
+            and not ignored.intersection(path.parts)
+            and not any(part.endswith(".egg-info") for part in path.parts)
+            and path.name not in {".env", ".env.local", ".env.production"}
+            and path.suffix.lower() not in {".pyc", ".pyo", ".db", ".log"}
+            and not path.name.lower().endswith((".db-wal", ".db-shm"))
+        ]
         return sorted(files)[: max_files + 1]
 
     @staticmethod

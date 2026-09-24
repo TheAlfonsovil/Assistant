@@ -2076,43 +2076,6 @@ class TaskService:
             self.llm.agent_decide(context), time_remaining
         )
         task.apply_worker_decision(decision)
-        # Audits must establish their evidence protocol before the model can
-        # finish or choose a different operation.
-        if (
-            self.context_builder._planner_intent(task.goal) == "audit"
-            and not any(event.event_type == "TOOL_CALLED" for event in events)
-        ):
-            decision = AgentDecision(
-                decision_type=AgentDecisionType.EXECUTE,
-                reason="read audit template",
-                operation=Operation(
-                    tool="project",
-                    method="read",
-                    args={"files": ["audit.md"]},
-                ),
-            )
-        elif self.context_builder._planner_intent(task.goal) == "audit":
-            audit_failed = any(
-                event.event_type == "AGENT_OBSERVATION"
-                and not event.payload.get("success", False)
-                for event in events
-            )
-            project_read_attempts = sum(
-                event.event_type == "TOOL_CALLED"
-                and event.payload.get("tool") == "project"
-                and event.payload.get("method") == "read"
-                for event in events
-            )
-            if audit_failed and project_read_attempts == 1:
-                decision = AgentDecision(
-                    decision_type=AgentDecisionType.EXECUTE,
-                    reason="read README fallback",
-                    operation=Operation(
-                        tool="project",
-                        method="read",
-                        args={"files": ["README.md"]},
-                    ),
-                )
         await self.repository.save_event(
             TaskEvent(
                 task_id=task.id,
@@ -2362,6 +2325,9 @@ class TaskService:
             return await self._finish_task(
                 task, TaskStatus.BLOCKED, "LLM call budget exhausted", "TASK_BUDGET_EXHAUSTED"
             ) is not None
+        if task.metadata.get("orchestration_stage", "ROUTE") == "ROUTE":
+            if not await self._prepare_audit_codegraph(task, time_remaining):
+                return False
         context = await self.context_builder.for_orchestrator(task)
         await self._persist_llm_request(
             task.id, "ORCHESTRATOR", context, OrchestratorDecision
@@ -2371,6 +2337,14 @@ class TaskService:
         decision = await self._call_llm(
             self.llm.orchestrate(context), time_remaining
         )
+        if self.context_builder._planner_intent(task.goal) == "audit":
+            decision = decision.model_copy(
+                update={
+                    "intent": "audit",
+                    "worker": "AUDIT_WORKER",
+                    "template": "audit",
+                }
+            )
         await self.repository.save_event(
             TaskEvent(
                 task_id=task.id,
@@ -2454,6 +2428,53 @@ class TaskService:
         task.status = TaskStatus.READY
         await self.repository.save_task(task)
         return True
+
+    async def _prepare_audit_codegraph(
+        self, task: Task, time_remaining: float | None = None
+    ) -> bool:
+        if self.context_builder._planner_intent(task.goal) != "audit" or not task.project_id:
+            return True
+        if not await self._consume_budget(task, "codegraph_queries", task.budget.max_codegraph_queries):
+            return False
+        try:
+            project = await self.repository.get_project(task.project_id)
+            if project is None:
+                return True
+            if time_remaining is not None and time_remaining <= 0:
+                raise TimeoutError("audit codegraph preflight exceeded the task time budget")
+            started = monotonic()
+            if time_remaining is None:
+                refreshed = await self.refresh_project_codegraph(project.id)
+            else:
+                refreshed = await asyncio.wait_for(
+                    self.refresh_project_codegraph(project.id), timeout=time_remaining
+                )
+            if refreshed is None:
+                raise ValueError("project disappeared during audit codegraph preflight")
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="ORCHESTRATOR_CODEGRAPH_READY",
+                    payload={
+                        "project_id": project.id,
+                        "version": refreshed.codegraph_version,
+                        "file_count": refreshed.codegraph.get("file_count") if refreshed.codegraph else 0,
+                        "duration_seconds": monotonic() - started,
+                    },
+                )
+            )
+            return True
+        except Exception as error:
+            task.metadata["codegraph_error"] = str(error)
+            await self.repository.save_task(task)
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="ORCHESTRATOR_CODEGRAPH_FAILED",
+                    payload={"error": str(error), "project_id": task.project_id},
+                )
+            )
+            return True
 
     async def execute_once(self, task_id: str, time_remaining: float | None = None) -> bool:
         task = await self.repository.get_task(task_id)
@@ -3209,8 +3230,12 @@ class TaskService:
                 operation.args["root"] = project.path if project else operation.args.get("root", self.context_builder.workspace_root)
             elif operation.tool == "codegraph" and operation.method in {"analyze", "audit", "build", "system", "query"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
-                if operation.method == "query" and project and project.codegraph:
-                    operation.args["_persisted_graph"] = project.codegraph
+                if operation.method == "query" and project:
+                    refreshed = await self.refresh_project_codegraph(project.id)
+                    project = refreshed or project
+                    if project.codegraph:
+                        operation.args["_persisted_graph"] = project.codegraph
+                        operation.args["_graph_fresh"] = True
             budget_key = None
             budget_limit = None
             if operation.tool == "codegraph" and operation.method == "query":

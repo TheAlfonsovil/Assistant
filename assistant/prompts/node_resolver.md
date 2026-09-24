@@ -1,5 +1,3 @@
-ROLE
-{{system_role}}
 You are the NODE_RESOLVER. Choose exactly one action for the current node.
 
 USER REQUEST

@@ -108,6 +108,17 @@ subsequent turn returns to the worker/agent until it completes, waits, asks the
 user or fails. The task ledger remains the source of truth, so interruption and
 recovery resume from the last persisted decision or observation.
 
+Audit tasks have a deterministic structural preflight before the first
+orchestrator request. The runtime rebuilds the selected project's bounded
+codegraph from its resolved path, persists the refreshed version and exposes it
+through the explicit `{{codegraph}}` prompt marker. The marker contains the
+project root, project kind, bounded relative file tree, key files, languages,
+modules, symbols and dependency edges. Full source and full graph payloads are
+not embedded in prompts; workers query the current graph for focused details.
+Planner-path codegraph queries refresh the project graph before querying, while
+direct codegraph queries never trust a persisted graph without a same-turn
+freshness proof.
+
 For project work, the orchestrator receives only codegraph metadata and version
 information. The worker queries the graph or reads project files when evidence
 is needed; the complete graph is never copied into every prompt.

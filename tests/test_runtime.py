@@ -726,7 +726,7 @@ async def test_browser_close_site_refuses_unobservable_tabs(tmp_path, monkeypatc
 
 def test_prompt_template_replaces_context_markers():
     rendered = render(
-        "{{system_role}} {{user_prompt}} {{task}} {{output_schema}}",
+        "{{user_prompt}} {{task}} {{output_schema}}",
         {"user_prompt": "run tests", "task": {"id": "task-1"}},
         {"type": "object"},
     )
@@ -2326,19 +2326,30 @@ async def test_agent_audit_context_requires_template_then_general_fallback(tmp_p
         protocol = context["audit_protocol"]
 
         assert protocol["required"] is True
-        assert protocol["first_attempt"][0]["args"] == {"files": ["audit.md"]}
-        assert protocol["first_attempt"][1]["args"] == {"files": ["README.md"]}
-        assert "tests_and_validation" in protocol["fallback_template"]
+        assert "workflow" in protocol
+        assert "tests_and_validation" in protocol["coverage_template"]
+        assert "first_attempt" not in protocol
         assert len(json.dumps(context, default=str)) < 48_000
+        assert context["available_actions"]
+        assert context["constraints"]["max_llm_calls"] > 0
+        assert context["project"]["path"] == str(tmp_path / "project")
 
 
 @pytest.mark.asyncio
 async def test_agent_audit_persists_one_tool_observation_per_turn(tmp_path):
     class AuditAgent(MockLLMProvider):
         async def agent_decide(self, context):
+            if context["last_observation"] is None:
+                return AgentDecision(
+                    decision_type="EXECUTE",
+                    reason="read audit.md because it is the project audit guide",
+                    operation=Operation(
+                        tool="project", method="read", args={"files": ["audit.md"]}
+                    ),
+                )
             return AgentDecision(
                 decision_type="COMPLETE",
-                reason="model attempted to finish early",
+                reason="audit orientation evidence collected",
             )
 
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'agent-flow.db'}")
@@ -2367,7 +2378,7 @@ async def test_agent_audit_persists_one_tool_observation_per_turn(tmp_path):
         assert result.status is TaskStatus.SUCCEEDED
         assert [event.event_type for event in events].count("AGENT_DECISION") == 2
         assert [event.event_type for event in events].count("AGENT_OBSERVATION") == 1
-        assert any(node.description == "read audit template" for node in nodes)
+        assert any("read audit.md" in node.description for node in nodes)
         assert result.runtime.agent_turns == 4
 
 
@@ -2375,6 +2386,14 @@ async def test_agent_audit_persists_one_tool_observation_per_turn(tmp_path):
 async def test_agent_audit_uses_readme_when_audit_template_is_missing(tmp_path):
     class CompletingAgent(MockLLMProvider):
         async def agent_decide(self, context):
+            if context["last_observation"] is None:
+                return AgentDecision(
+                    decision_type="EXECUTE",
+                    reason="read README for project orientation",
+                    operation=Operation(
+                        tool="project", method="read", args={"files": ["README.md"]}
+                    ),
+                )
             return AgentDecision(decision_type="COMPLETE", reason="done")
 
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'audit-fallback.db'}")
@@ -2399,10 +2418,7 @@ async def test_agent_audit_uses_readme_when_audit_template_is_missing(tmp_path):
         await service.run_task(task.id)
         nodes = await service.repository.list_nodes(task.id)
 
-        assert [node.description for node in nodes][-2:] == [
-            "read audit template",
-            "read README fallback",
-        ]
+        assert nodes[-1].description == "read README for project orientation"
 
 
 @pytest.mark.asyncio
@@ -2444,6 +2460,46 @@ async def test_orchestrator_routes_target_worker_and_template_before_agent(tmp_p
         assert routed.metadata["worker"] == "BROWSER_WORKER"
         assert routed.metadata["template"] == "browser"
         assert routed.runtime.target == {"type": "device", "id": "computer"}
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_audit_builds_codegraph_before_orchestrator_and_selects_audit_worker(tmp_path):
+    class AuditRoutingAgent(MockLLMProvider):
+        async def orchestrate(self, context):
+            assert context["codegraph"] is not None
+            assert context["codegraph"]["file_count"] >= 1
+            return OrchestratorDecision(reason="audit project")
+
+        async def agent_decide(self, context):
+            return AgentDecision(decision_type="COMPLETE", reason="audit evidence ready")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'audit-codegraph.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        (project_path / "main.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+        service = TaskService(
+            session, AuditRoutingAgent(), ToolRegistry(), workspace_root=str(tmp_path)
+        )
+        project = await service.create_project(
+            Project(name="audit-codegraph", path=str(project_path))
+        )
+        task = await service.create_task(
+            TaskRequest(goal="audita el proyecto", project_id=project.id)
+        )
+
+        result = await service.run_task(task.id)
+        routed = await service.get_task(task.id)
+        events = await service.repository.list_events(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert routed.metadata["worker"] == "AUDIT_WORKER"
+        assert routed.metadata["template"] == "audit"
+        assert any(event.event_type == "ORCHESTRATOR_CODEGRAPH_READY" for event in events)
+        refreshed = await service.get_project(project.id)
+        assert refreshed.codegraph is not None
     await database.close()
 
 

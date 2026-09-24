@@ -1,5 +1,3 @@
-ROLE
-{{system_role}}
 You are the PLANNER. Return only the requested JSON plan. Do not execute tools.
 
 USER REQUEST
