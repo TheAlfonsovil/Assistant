@@ -84,21 +84,16 @@ Rules:
 - When the node asks to inspect, review or understand a project, prefer `project.analyze`.
   Do not use `filesystem.exists` as a substitute for analysis. Use `filesystem.read` only
   for a specific file selected by the analysis result.
-- When the node asks to audit a project or report findings with evidence, prefer
-  `project.audit`; it reads bounded configuration safely, detects tests, and runs only
-  a supported test command when one is discoverable.
-- `project.audit` is read-only with respect to project files. It runs a
-  detected test command by default; set `run_tests=false` only when the user
-  explicitly requests an inventory without execution. A plain audit reports the detected test command without executing it.
+- When the node asks to audit a project or report findings with evidence, use
+  the separate `audit.run` tool. It reads project evidence and runs detected
+  tests by default, so it may execute project-defined code. Set
+  `run_tests=false` only when the user asks to skip them.
 - Use the registered project path as the project root. Do not use the assistant
-  workspace as a substitute. `project.create` currently creates only a
-  directory; use `project.initialize` when the user asks for a new project with
-  artifacts.
-- `project.initialize` creates a stack-neutral workspace with a durable
-  manifest and optional initial files. Use it for books, chemistry, research,
-  data, content, automation, API integrations, or mixed projects. `project.edit`
-  applies bounded file changes for a
-  named feature and may run explicitly supplied validation commands. Preserve
+  workspace as a substitute. `project.create` takes the directories and files
+  that make up a new project and does not scaffold anything, so a call with no
+  `files` yields an empty directory and is only correct when that is what was
+  asked for. `project.edit` applies bounded file changes for a named feature
+  and may run explicitly supplied validation commands. Preserve
   `device` and `os` as target metadata; do not confuse the target platform with
   the Assistant's own runtime.
 - `project.analyze` example: {"tool":"project","method":"analyze","args":{"root":"C:/project","max_files":500}}
@@ -110,8 +105,9 @@ Rules:
   all changed file contents or `edit_operations` using `write`, `append`,
   `prepend`, or `json_merge`, and validation commands only when justified by
   the stack and request.
-- `project.validate` runs stack-aware build/test/syntax checks and validates
-  Docker Compose configuration when present. Use it after every edit; a
+- `project.validate` executes only the explicit `commands` supplied by the
+  planner/worker. It never guesses a stack or adds build, test, or Docker checks.
+  Use it only when the requested outcome needs command-based evidence; a
   successful write alone is not implementation evidence.
 - A successful edit is not sufficient evidence for the user's final goal.
   Prefer a separate dependent build/test/smoke operation for verification. If

@@ -92,10 +92,12 @@ async def lifespan(app: FastAPI):
 
     runtime = TaskRuntime(
         context.service.repository,
-        lambda task_id: context.service.run_task(task_id, wait_for_retry=False),
+        lambda task_id: context.service.run_task(
+            task_id, wait_for_retry=False, single_step=True
+        ),
         idle_cycle=IdleCycle(
             on_idle=context.service.reconcile_idle,
-            supervise=lambda has_work: context.service.reconcile_idle(),
+            supervise=lambda has_work: context.service.reconcile_idle(has_work),
             interval=context.settings.maintenance_interval,
             supervision_interval=context.settings.maintenance_interval,
             enabled=context.settings.idle_enabled,
@@ -117,7 +119,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.4.5", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.4.6", lifespan=lifespan)
 dashboard_root = Path(__file__).resolve().parents[2] / "dashboard"
 
 

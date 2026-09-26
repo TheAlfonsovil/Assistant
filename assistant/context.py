@@ -118,8 +118,6 @@ class ContextBuilder:
         bounded["evidence"] = list(context.get("evidence", []))[-4:]
         bounded["last_observation"] = compact(context.get("last_observation"), 1200)
         if serialized(bounded) > limit:
-            bounded["audit_protocol"] = None
-        if serialized(bounded) > limit:
             bounded["available_actions"] = compact_actions(context.get("available_actions"))
         if serialized(bounded) > limit:
             bounded["evidence"] = bounded["evidence"][-1:]
@@ -328,27 +326,6 @@ class ContextBuilder:
         ]
         raw_intent = task.metadata.get("orchestrator_intent") or self._planner_intent(task.goal)
         intent = self._planner_intent(str(raw_intent))
-        audit_protocol = None
-        if intent == "audit":
-            audit_protocol = {
-                "required": True,
-                "purpose": "Establish an evidence-backed orientation before drawing findings.",
-                "workflow": [
-                    "Inspect the bounded codegraph and project metadata.",
-                    "Choose the most relevant orientation files or queries from the available evidence.",
-                    "Inspect architecture, flows, tools and validation evidence in bounded steps.",
-                    "Synthesize only facts supported by persisted observations.",
-                ],
-                "coverage_template": [
-                    "scope_and_project_type",
-                    "structure_and_entrypoints",
-                    "configuration_and_dependencies",
-                    "tests_and_validation",
-                    "risks_and_unknowns",
-                ],
-                "codegraph_preflight": "The runtime builds the bounded project codegraph before routing. Use its summary as the structural index and query it when a file or symbol relationship matters.",
-                "rule": "The worker chooses the next evidence operation. Do not assume a conventional filename or claim a file, command, tool result or technology that was not observed.",
-            }
         return self._bound_agent_context({
             "phase": "AGENT",
             "user_prompt": task.goal,
@@ -376,7 +353,6 @@ class ContextBuilder:
             "long_term_memory": await self._memory_context(task.goal, task),
             "last_observation": compact(last_observation),
             "evidence": evidence,
-            "audit_protocol": audit_protocol,
             "available_actions": self._available_actions(intent),
             "constraints": {
                 "max_llm_calls": task.budget.max_llm_calls,
@@ -677,13 +653,13 @@ class ContextBuilder:
         definitions = self.tools.definitions()
         normalized_intent = self._planner_intent(str(intent))
         preferred = {
-            "audit": {"project", "codegraph", "git"},
+            "audit": {"audit", "project", "codegraph", "git"},
             "create": {"project", "filesystem"},
             "edit": {"project", "codegraph"},
             "browser": {"browser", "web"},
         }.get(normalized_intent)
         primary = [definition for definition in definitions if not preferred or definition.name in preferred]
-        optional_names = {"web", "browser", "deployment", "filesystem", "shell", "process", "git", "codegraph", "project"}
+        optional_names = {"web", "browser", "deployment", "filesystem", "shell", "process", "git", "codegraph", "project", "audit"}
         optional = [
             definition for definition in definitions
             if definition not in primary and definition.name in optional_names

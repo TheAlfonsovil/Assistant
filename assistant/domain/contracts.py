@@ -243,6 +243,7 @@ class TaskRuntimeState(BaseModel):
     source_bytes: int = 0
     recovery_attempts: int = 0
     created_project: dict[str, Any] = Field(default_factory=dict)
+    llm_usage: dict[str, Any] = Field(default_factory=dict)
 
 
 class ArtifactRef(BaseModel):

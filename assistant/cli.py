@@ -164,11 +164,13 @@ def run(
         )
         runtime = TaskRuntime(
             service.repository,
-            lambda task_id: service.run_task(task_id, wait_for_retry=False),
+            lambda task_id: service.run_task(
+                task_id, wait_for_retry=False, single_step=True
+            ),
             interval,
             idle_cycle=IdleCycle(
                 on_idle=service.reconcile_idle,
-                supervise=lambda has_work: service.reconcile_idle(),
+                supervise=lambda has_work: service.reconcile_idle(has_work),
                 interval=context.settings.maintenance_interval,
                 supervision_interval=context.settings.maintenance_interval,
                 enabled=context.settings.idle_enabled,

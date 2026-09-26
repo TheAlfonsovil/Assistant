@@ -1,18 +1,17 @@
 import pytest
 from pathlib import Path
 
-from assistant.audit import (
+from assistant.project_audit import (
     AuditFinding,
     AuditSpec,
     AuditTarget,
     Evidence,
     Facts,
     FindingStatus,
-    ReadOnlyCollector,
     TargetKind,
-    run_audit,
 )
-from assistant.audit.profiles import get_profile
+from assistant.project_audit.evaluator import evaluate
+from assistant.project_audit.profiles import get_profile
 from assistant.project_analysis import ProjectAnalyzer
 
 
@@ -56,6 +55,73 @@ def test_project_analyzer_detects_hybrid_and_non_python_tests(tmp_path: Path):
     assert {item["tool"] for item in candidates} == {"npm", "maven"}
 
 
+def test_project_analyzer_builds_test_candidates_for_nested_manifests(tmp_path: Path):
+    frontend = tmp_path / "frontend"
+    backend = tmp_path / "backend"
+    (frontend / "src").mkdir(parents=True)
+    (backend / "src" / "test" / "java").mkdir(parents=True)
+    package_content = '{"scripts":{"test":"vitest","lint":"eslint ."}}'
+    (frontend / "package.json").write_text(package_content, encoding="utf-8")
+    (frontend / "src" / "App.test.ts").write_text("test('ok', () => {})", encoding="utf-8")
+    (backend / "pom.xml").write_text("<project />", encoding="utf-8")
+    (backend / "src" / "test" / "java" / "AppTest.java").write_text(
+        "class AppTest {}", encoding="utf-8"
+    )
+    files = ProjectAnalyzer._collect_files(tmp_path, 50)
+    tests = ProjectAnalyzer._discover_test_files(tmp_path, files, {})
+    configuration = {"frontend/package.json": package_content}
+
+    candidates = ProjectAnalyzer._test_candidates(tmp_path, configuration, files, tests)
+    quality_tools = ProjectAnalyzer._quality_tools(tmp_path, configuration, files)
+
+    assert {item["command"] for item in candidates} == {
+        'npm --prefix "frontend" test',
+        'mvn -q -f "backend/pom.xml" test',
+    }
+    assert any(
+        item["command"] == 'npm --prefix "frontend" run lint'
+        for item in quality_tools
+    )
+
+
+@pytest.mark.asyncio
+async def test_project_audit_runs_every_detected_hybrid_test_command(
+    tmp_path: Path, monkeypatch
+):
+    frontend = tmp_path / "frontend"
+    backend_test = tmp_path / "backend" / "src" / "test" / "java"
+    (frontend / "src").mkdir(parents=True)
+    backend_test.mkdir(parents=True)
+    (frontend / "package.json").write_text(
+        '{"scripts":{"test":"vitest"}}', encoding="utf-8"
+    )
+    (frontend / "src" / "App.test.ts").write_text("test('ok', () => {})", encoding="utf-8")
+    (tmp_path / "backend" / "pom.xml").write_text("<project />", encoding="utf-8")
+    (backend_test / "AppTest.java").write_text("class AppTest {}", encoding="utf-8")
+    executed = []
+
+    async def fake_run(command: str, cwd: Path, timeout: float) -> dict[str, object]:
+        executed.append(command)
+        return {"available": True, "command": command, "executed": True, "exit_code": 0}
+
+    monkeypatch.setattr(ProjectAnalyzer, "_run_test_command", staticmethod(fake_run))
+
+    result = await ProjectAnalyzer().audit(str(tmp_path), max_files=50, run_tests=True)
+
+    test_result = result.output["audit"]["test_result"]
+    assert executed == [
+        'npm --prefix "frontend" test',
+        'mvn -q -f "backend/pom.xml" test',
+    ]
+    assert test_result["completed"] is True
+    assert len(test_result["results"]) == 2
+    testing_finding = next(
+        item for item in result.output["audit_report"]["findings"]
+        if item["id"] == "testing.execution"
+    )
+    assert testing_finding["status"] == "pass"
+
+
 def test_project_analyzer_does_not_offer_ruff_without_python(tmp_path: Path):
     (tmp_path / "Main.java").write_text("class Main {}", encoding="utf-8")
     files = ProjectAnalyzer._collect_files(tmp_path, 10)
@@ -63,33 +129,9 @@ def test_project_analyzer_does_not_offer_ruff_without_python(tmp_path: Path):
     assert ProjectAnalyzer._quality_tools(tmp_path, {}, files) == []
 
 
-def test_collection_is_read_only_deterministic_and_isolates_failures():
-    calls: list[str] = []
-
-    def reader(spec: AuditSpec) -> Facts:
-        calls.append(spec.target.identifier)
-        return Facts(values={"present": True}, evidence=[
-            Evidence(source="z-reader", value="yes")
-        ])
-
-    def broken(spec: AuditSpec) -> None:
-        raise RuntimeError("no access")
-
-    spec = AuditSpec(target=AuditTarget(identifier="workspace"))
-    report = run_audit(spec, [
-        ReadOnlyCollector("z-reader", reader),
-        ReadOnlyCollector("a-reader", broken),
-    ])
-
-    assert calls == ["workspace"]
-    assert report.facts.values == {"present": True}
-    assert [item.source for item in report.facts.evidence] == ["a-reader", "z-reader"]
-    assert report.spec.read_only is True
-
-
 def test_evaluator_orders_findings_without_global_score():
     spec = AuditSpec(target=AuditTarget(identifier="project"), scoring=True)
-    report = run_audit(spec, findings=[
+    report = evaluate(spec, Facts(), findings=[
         AuditFinding(title="Z", category="quality", status=FindingStatus.PASS, score=1),
         AuditFinding(title="A", category="security", status=FindingStatus.FAIL, score=0),
     ])
@@ -106,7 +148,7 @@ def test_evaluator_does_not_score_deferred_or_out_of_scope_checks():
         accepted_constraints=["local prototype"],
         scoring=True,
     )
-    report = run_audit(spec, findings=[
+    report = evaluate(spec, Facts(), findings=[
         AuditFinding(
             title="Architecture is coherent",
             category="architecture",

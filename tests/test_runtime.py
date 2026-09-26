@@ -65,7 +65,7 @@ def test_device_registry_exposes_four_branches_and_computer_actions():
     assert DEVICE_BRANCHES[1].platform == "android"
     assert DEVICE_BRANCHES[1].transport == "adb"
     definitions = {definition.name for definition in build_tool_registry().definitions()}
-    assert {"filesystem", "shell", "process", "git", "deployment", "project", "codegraph", "system", "web", "browser"} <= definitions
+    assert {"filesystem", "shell", "process", "git", "deployment", "project", "audit", "codegraph", "system", "web", "browser"} <= definitions
     assert {"device.mobile", "device.home", "device.robot"} <= definitions
 
 
@@ -99,7 +99,9 @@ async def test_computer_filesystem_info_and_search(tmp_path):
 
 @pytest.mark.asyncio
 async def test_computer_filesystem_searches_multiple_words_without_reading_env(tmp_path):
-    source = tmp_path / "src.py"
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    source = nested / "src.py"
     source.write_text("def audit_project():\n    return 'ok'\n", encoding="utf-8")
     (tmp_path / ".env").write_text("audit project secret\n", encoding="utf-8")
     registry = build_tool_registry()
@@ -143,15 +145,36 @@ async def test_process_tool_manages_long_running_project_process(tmp_path):
     assert stopped.success is True
     assert stopped.output["stopped"] is True
 
+    restarted = await registry.execute(
+        Operation(
+            tool="process",
+            method="start",
+            args={
+                "command": f'"{sys.executable}" -c "print(\'restarted\')"',
+                "cwd": str(tmp_path),
+                "label": "test-server-restarted",
+            },
+        )
+    )
+    assert restarted.success is True
+    assert restarted.output["stdout"] != started.output["stdout"]
+    await registry.execute(
+        Operation(
+            tool="process",
+            method="stop",
+            args={"process_id": restarted.output["process_id"]},
+        )
+    )
+
 
 @pytest.mark.asyncio
-async def test_project_audit_is_read_only_by_default_and_does_not_read_env(tmp_path):
+async def test_audit_runs_tests_by_default_and_does_not_read_env(tmp_path):
     (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
     (tmp_path / ".env").write_text("API_TOKEN=do-not-read\n", encoding="utf-8")
     (tmp_path / "test_audit.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
 
     result = await build_tool_registry().execute(
-        Operation(tool="project", method="audit", args={"root": str(tmp_path), "max_files": 50})
+        Operation(tool="audit", method="run", args={"root": str(tmp_path), "max_files": 50})
     )
 
     assert result.success is True
@@ -166,14 +189,14 @@ async def test_project_audit_is_read_only_by_default_and_does_not_read_env(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_project_audit_runs_detected_tests_only_when_requested(tmp_path):
+async def test_audit_runs_detected_tests_only_when_requested(tmp_path):
     (tmp_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
     (tmp_path / "test_audit.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
 
     result = await build_tool_registry().execute(
         Operation(
-            tool="project",
-            method="audit",
+            tool="audit",
+            method="run",
             args={"root": str(tmp_path), "max_files": 50, "run_tests": True},
         )
     )
@@ -245,11 +268,11 @@ async def test_project_edit_rolls_back_when_validation_fails(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_project_initialize_supports_stack_neutral_artifact_workspaces(tmp_path):
+async def test_project_create_supports_stack_neutral_artifact_workspaces(tmp_path):
     result = await build_tool_registry().execute(
         Operation(
             tool="project",
-            method="initialize",
+            method="create",
             args={
                 "root": str(tmp_path),
                 "name": "chemistry-notebook",
@@ -283,7 +306,6 @@ async def test_project_validate_runs_custom_check_and_reports_structured_status(
             method="validate",
             args={
                 "root": str(project),
-                "checks": ["build"],
                 "commands": ["python -m compileall -q ."],
             },
         )
@@ -291,7 +313,8 @@ async def test_project_validate_runs_custom_check_and_reports_structured_status(
 
     assert result.success is True
     assert result.output["validation_status"] == "PASS"
-    assert any(item["name"] == "custom_1" and item["status"] == "PASS" for item in result.output["checks"])
+    assert result.output["commands"][0]["id"] == "command-1"
+    assert result.output["commands"][0]["status"] == "PASS"
 
 
 @pytest.mark.asyncio
@@ -747,10 +770,11 @@ async def test_planner_context_filters_actions_and_keeps_argument_shapes(tmp_pat
 
     groups = {item["group"]: item["tools"] for item in planner_context["available_actions"]}
     action_names = {item["name"] for item in groups["primary"]}
-    assert action_names == {"project", "codegraph", "git"}
+    assert action_names == {"audit", "project", "codegraph", "git"}
     project = next(item for item in groups["primary"] if item["name"] == "project")
-    assert "run_tests" in project["args"]
-    assert project["args"]["run_tests"]["type"] == "boolean"
+    assert "run_tests" not in project["args"]
+    audit = next(item for item in groups["primary"] if item["name"] == "audit")
+    assert audit["method_args"]["run"]["run_tests"]["type"] == "boolean"
 
 
 @pytest.mark.asyncio
@@ -872,7 +896,9 @@ async def test_planner_context_includes_resolved_project_and_workflow_guidance(t
             if group["group"] == "primary"
         )
         project_action = next(action for action in primary_tools if action["name"] == "project")
-        assert "audit" in project_action["methods"]
+        audit_action = next(action for action in primary_tools if action["name"] == "audit")
+        assert "audit" not in project_action["methods"]
+        assert audit_action["methods"] == ["run"]
     await database.close()
 
 
@@ -912,7 +938,18 @@ def test_empty_plan_fallback_preserves_codegraph_intent():
         args={"max_files": 500},
         timeout=300,
     )
-    assert proposal.nodes[1].operation_hint.method == "audit"
+    assert proposal.nodes[1].operation_hint == OperationHint(
+        tool="audit",
+        method="run",
+        args={
+            "max_files": 500,
+            "run_tests": False,
+            "objective": "actualiza el codegraph y audita el proyecto",
+            "profile": "general",
+            "depth": "standard",
+        },
+        timeout=300,
+    )
 
 
 def test_plan_reports_missing_goal_coverage():
@@ -985,47 +1022,7 @@ async def test_registered_project_modification_cannot_become_direct_answer(tmp_p
     await database.close()
 
 
-@pytest.mark.asyncio
-async def test_project_mutation_gets_real_validation_operation(tmp_path):
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-validation-plan.db'}")
-    await database.create_all()
-    async with database.sessions() as session:
-        project_path = tmp_path / "test_zone"
-        project_path.mkdir()
-        repository = TaskRepository(session)
-        project = Project(name="test_zone", path=str(project_path))
-        await repository.create_project(project)
-        service = TaskService(session, MockLLMProvider(), ToolRegistry())
-        task = Task(goal="añade una funcionalidad al proyecto", project_id=project.id)
-        proposal = PlanProposal(
-            nodes=[
-                PlanNodeProposal(
-                    id="edit",
-                    description="Edit project files",
-                    type="OPERATION",
-                    operation_hint=OperationHint(
-                        tool="project",
-                        method="edit",
-                        args={"root": str(project_path), "feature": "feature", "changes": []},
-                    ),
-                ),
-                PlanNodeProposal(
-                    id="verify",
-                    description="Verify the change",
-                    type="VERIFY",
-                    dependencies=["edit"],
-                ),
-            ]
-        )
-        normalized = await service._ensure_project_validation(task, proposal)
-        validation = normalized.nodes[-1]
-        assert validation.type == "OPERATION"
-        assert validation.operation_hint.method == "validate"
-        assert validation.dependencies == ["edit", "verify"]
-    await database.close()
-
-
-def test_project_audit_plan_removes_generic_verification_node():
+def test_project_audit_plan_preserves_planner_verification_node():
     task = Task(
         goal="audita el proyecto",
     )
@@ -1037,7 +1034,7 @@ def test_project_audit_plan_removes_generic_verification_node():
                 id="audit",
                 description="Auditar el proyecto",
                 type="OPERATION",
-                operation_hint=OperationHint(tool="project", method="audit"),
+                operation_hint=OperationHint(tool="audit", method="run"),
             ),
             PlanNodeProposal(
                 id="verify",
@@ -1050,11 +1047,11 @@ def test_project_audit_plan_removes_generic_verification_node():
 
     normalized = TaskService._normalize_project_audit_plan(task, proposal)
 
-    assert [node.id for node in normalized.nodes] == ["audit"]
-    assert normalized.nodes[0].dependencies == []
+    assert [node.id for node in normalized.nodes] == ["audit", "verify"]
+    assert normalized.nodes[1].dependencies == ["audit"]
 
 
-def test_project_audit_plan_refreshes_codegraph_before_audit():
+def test_project_audit_plan_does_not_inject_codegraph_or_tests():
     task = Task(goal="audita el proyecto")
     task.runtime.workflow = "project_audit"
     task.metadata["project_path"] = r"C:\projects\sample"
@@ -1064,20 +1061,17 @@ def test_project_audit_plan_refreshes_codegraph_before_audit():
                 id="audit",
                 description="Auditar el proyecto",
                 type="OPERATION",
-                operation_hint=OperationHint(tool="project", method="audit"),
+                operation_hint=OperationHint(tool="audit", method="run"),
             )
         ]
     )
 
     normalized = TaskService._normalize_project_audit_plan(task, proposal)
 
-    assert [node.id for node in normalized.nodes] == [
-        "refresh-codegraph-before-audit",
-        "audit",
-    ]
-    assert normalized.nodes[0].operation_hint.tool == "codegraph"
-    assert normalized.nodes[1].dependencies == ["refresh-codegraph-before-audit"]
-    assert normalized.nodes[1].operation_hint.args["run_tests"] is True
+    assert [node.id for node in normalized.nodes] == ["audit"]
+    assert normalized.nodes[0].operation_hint.tool == "audit"
+    assert normalized.nodes[0].operation_hint.method == "run"
+    assert normalized.nodes[0].operation_hint.args["run_tests"] is False
 
 
 def test_project_audit_plan_preserves_planner_selected_evidence_stages():
@@ -1096,22 +1090,16 @@ def test_project_audit_plan_preserves_planner_selected_evidence_stages():
                 id="audit",
                 description="Auditar el proyecto",
                 type="OPERATION",
-                operation_hint=OperationHint(tool="project", method="audit"),
+                dependencies=["read-manifests"],
+                operation_hint=OperationHint(tool="audit", method="run"),
             ),
         ]
     )
 
     normalized = TaskService._normalize_project_audit_plan(task, proposal)
 
-    assert [node.id for node in normalized.nodes] == [
-        "refresh-codegraph-before-audit",
-        "read-manifests",
-        "audit",
-    ]
-    assert normalized.nodes[-1].dependencies == [
-        "refresh-codegraph-before-audit",
-        "read-manifests",
-    ]
+    assert [node.id for node in normalized.nodes] == ["read-manifests", "audit"]
+    assert normalized.nodes[-1].dependencies == ["read-manifests"]
 
 
 def test_project_audit_plan_repairs_direct_answer_into_audit_operation():
@@ -1123,8 +1111,8 @@ def test_project_audit_plan_repairs_direct_answer_into_audit_operation():
     )
 
     assert len(normalized.nodes) == 1
-    assert normalized.nodes[0].operation_hint.tool == "project"
-    assert normalized.nodes[0].operation_hint.method == "audit"
+    assert normalized.nodes[0].operation_hint.tool == "audit"
+    assert normalized.nodes[0].operation_hint.method == "run"
 
 
 def test_final_response_template_receives_execution_evidence():
@@ -1787,8 +1775,8 @@ def test_project_audit_plan_drops_unverifiable_prose_acceptance():
                     "contains": ["reporte de auditoría", "hallazgos con evidencia"]
                 },
                 operation_hint=OperationHint(
-                    tool="project",
-                    method="audit",
+                    tool="audit",
+                    method="run",
                     args={"run_tests": False},
                 ),
             )
@@ -2217,7 +2205,172 @@ async def test_empty_planner_response_is_retried_before_repair(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_empty_planner_creation_fallback_creates_requested_project(tmp_path):
+async def test_project_create_takes_the_whole_file_tree_from_the_caller(tmp_path):
+    """`create` is `initialize`: the caller supplies every file, nothing is scaffolded."""
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="create",
+            args={
+                "root": str(projects_root),
+                "name": "spa_zone",
+                "kind": "app",
+                "description": "SPA served by nginx inside Docker",
+                "directories": ["src"],
+                "files": [
+                    {"path": "Dockerfile", "content": "FROM nginx:alpine\n"},
+                    {"path": "nginx.conf", "content": "server { listen 80; }\n"},
+                    {"path": "src/main.js", "content": "console.log('hi')\n"},
+                ],
+            },
+        )
+    )
+
+    assert result.success is True
+    project = projects_root / "spa_zone"
+    assert (project / "Dockerfile").is_file()
+    assert (project / "nginx.conf").read_text(encoding="utf-8").startswith("server {")
+    assert (project / "src" / "main.js").is_file()
+    assert (project / ".assistant" / "project.json").is_file()
+    assert result.output["existing"] is False
+    assert result.output["verified"] is True
+    # No prefabricated leftovers: only what the caller asked for exists.
+    assert not (project / "requirements.txt").exists()
+    assert not (project / "src" / "App.jsx").exists()
+    manifest = json.loads((project / ".assistant" / "project.json").read_text())
+    assert manifest["artifacts"] == ["Dockerfile", "nginx.conf", "src/main.js"]
+
+
+@pytest.mark.asyncio
+async def test_project_create_rejects_the_removed_template_argument(tmp_path):
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    error = build_tool_registry().validate_operation(
+        Operation(
+            tool="project",
+            method="create",
+            args={
+                "root": str(projects_root),
+                "name": "templated",
+                "template": "react-vite-docker",
+            },
+        )
+    )
+    assert error is not None
+    assert "template" in error
+
+
+def test_project_create_is_the_only_project_creation_method():
+    registry = build_tool_registry()
+    definition = registry.definition("project")
+
+    assert definition is not None
+    assert "create" in definition.methods
+    assert "initialize" not in definition.methods
+    error = registry.validate_operation(Operation(tool="project", method="initialize"))
+    assert error is not None
+
+
+@pytest.mark.asyncio
+async def test_project_create_completes_a_partial_workspace_without_deleting_it(tmp_path):
+    """A retried call finishes a workspace instead of conflicting or wiping it."""
+    projects_root = tmp_path / "projects"
+    project = projects_root / "spa_zone"
+    project.mkdir(parents=True)
+    (project / "Dockerfile").write_text("# kept from the interrupted call\n", encoding="utf-8")
+
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="create",
+            args={
+                "root": str(projects_root),
+                "name": "spa_zone",
+                "description": "finish the job",
+                "files": [{"path": "nginx.conf", "content": "server { listen 80; }\n"}],
+            },
+        )
+    )
+
+    assert result.success is True
+    assert result.output["existing"] is True
+    assert result.output["files"] == [".assistant/project.json", "nginx.conf"]
+    assert (project / "Dockerfile").read_text(encoding="utf-8").startswith("# kept")
+
+
+@pytest.mark.asyncio
+async def test_project_validate_runs_only_explicit_commands(tmp_path, monkeypatch):
+    project = tmp_path / "test_zone"
+    (project / "frontend").mkdir(parents=True)
+    (project / "backend").mkdir()
+    (project / "docker").mkdir()
+    (project / "frontend" / "package.json").write_text(
+        '{"scripts":{"build":"vite build"}}\n', encoding="utf-8"
+    )
+    (project / "backend" / "pom.xml").write_text("<project />\n", encoding="utf-8")
+    (project / "docker" / "docker-compose.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    commands = []
+
+    class CompletedProcess:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_create_subprocess_shell(command, **kwargs):
+        commands.append((command, kwargs["cwd"]))
+        return CompletedProcess()
+
+    monkeypatch.setattr(
+        "assistant.devices.computer.actions.project_validate.asyncio.create_subprocess_shell",
+        fake_create_subprocess_shell,
+    )
+
+    result = await build_tool_registry().execute(
+        Operation(
+            tool="project",
+            method="validate",
+            args={"root": str(project), "commands": ["custom validation"]},
+        )
+    )
+
+    assert result.success is True
+    assert result.output["validation_status"] == "PASS"
+    assert result.output["commands"][0]["command"] == "custom validation"
+    assert [command for command, _cwd in commands] == ["custom validation"]
+
+
+@pytest.mark.asyncio
+async def test_project_validate_rejects_missing_commands_even_with_manifests(tmp_path):
+    project = tmp_path / "app"
+    project.mkdir()
+    (project / "package.json").write_text('{"scripts":{"build":"vite build"}}\n', encoding="utf-8")
+    (project / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    registry = build_tool_registry()
+
+    error = registry.validate_operation(
+        Operation(tool="project", method="validate", args={"root": str(project)})
+    )
+
+    assert error == "argument 'commands' is required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("goal", "project_name"),
+    [
+        ("Crea un nuevo proyecto, llamado test_zone", "test_zone"),
+        (
+            "Crea un nuevo proyecto llamado recipe_archive para organizar recetas familiares",
+            "recipe_archive",
+        ),
+    ],
+)
+async def test_empty_planner_does_not_create_placeholder_project(tmp_path, goal, project_name):
     class EmptyPlanner(MockLLMProvider):
         async def plan(self, context):
             return PlanProposal()
@@ -2233,58 +2386,12 @@ async def test_empty_planner_creation_fallback_creates_requested_project(tmp_pat
             build_tool_registry(),
             projects_root=str(projects_root),
         )
-        task = await service.create_task(
-            TaskRequest(goal="Crea un nuevo proyecto, llamado test_zone")
-        )
-
-        result = await service.run_task(task.id)
-
-        assert result.status is TaskStatus.SUCCEEDED
-        assert (projects_root / "test_zone").is_dir()
-        nodes = await service.repository.list_nodes(task.id)
-        assert [node.description for node in nodes if node.type is NodeType.OPERATION] == [
-            "Inicializar el workspace test_zone como proyecto de tipo workspace"
-        ]
-        events = await service.repository.list_events(task.id)
-        assert any(
-            event.event_type == "PLAN_REPAIRED"
-            and "fallback-project-initialize" in event.payload.get("nodes", [])
-            for event in events
-        )
-    await database.close()
-
-
-@pytest.mark.asyncio
-async def test_empty_planner_generic_project_creation_stays_stack_neutral(tmp_path):
-    class EmptyPlanner(MockLLMProvider):
-        async def plan(self, context):
-            return PlanProposal()
-
-    projects_root = tmp_path / "projects"
-    projects_root.mkdir()
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'generic-creation.db'}")
-    await database.create_all()
-    async with database.sessions() as session:
-        service = TaskService(
-            session,
-            EmptyPlanner(),
-            build_tool_registry(),
-            projects_root=str(projects_root),
-        )
-        goal = "Crea un nuevo proyecto llamado recipe_archive para organizar recetas familiares"
         task = await service.create_task(TaskRequest(goal=goal))
 
         result = await service.run_task(task.id)
 
-        project = projects_root / "recipe_archive"
-        assert result.status is TaskStatus.SUCCEEDED
-        assert (project / "README.md").is_file()
-        assert (project / ".assistant" / "project.json").is_file()
-        assert not (project / "frontend").exists()
-        assert not (project / "backend").exists()
-        manifest = json.loads((project / ".assistant" / "project.json").read_text())
-        assert manifest["objective"] == goal
-        assert not any("scaffold" in node.description.casefold() for node in await service.repository.list_nodes(task.id))
+        assert result.status is not TaskStatus.SUCCEEDED
+        assert not (projects_root / project_name).exists()
     await database.close()
 
 
@@ -2356,81 +2463,12 @@ async def test_ambiguous_project_selection_waits_for_explicit_input(tmp_path):
         assert task.status is TaskStatus.WAITING
         with pytest.raises(ValueError, match="project selection"):
             await service.resume_task(task.id)
-
-        resumed = await service.submit_task_input(
-            task.id, {"project_id": first.id}
-        )
+        resumed = await service.submit_task_input(task.id, {"project_id": first.id})
         assert resumed.status is TaskStatus.QUEUED
-        assert resumed.project_id == first.id
-        assert "clarification" not in resumed.metadata
-
-        result = await service.run_task(task.id)
-        assert result.status is TaskStatus.SUCCEEDED
-        assert any(
-            node.description == "execute configured mock operation"
-            for node in await service.repository.list_nodes(task.id)
-        )
-    await database.close()
 
 
 @pytest.mark.asyncio
-async def test_device_target_skips_project_selection_and_is_available_in_context(tmp_path):
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'device-target.db'}")
-    await database.create_all()
-    async with database.sessions() as session:
-        service = TaskService(
-            session,
-            MockLLMProvider(),
-            ToolRegistry(),
-            workspace_root=str(tmp_path),
-            projects_root=r"C:\Assistant",
-        )
-        first_path = tmp_path / "first"
-        second_path = tmp_path / "second"
-        first_path.mkdir()
-        second_path.mkdir()
-        await service.create_project(Project(name="first", path=str(first_path)))
-        await service.create_project(Project(name="second", path=str(second_path)))
-
-        task = await service.create_task(
-            TaskRequest(goal="open YouTube", target_type="device", target_id="computer")
-        )
-        context = await service.context_builder.for_planner(task)
-
-        assert task.status is TaskStatus.QUEUED
-        assert task.project_id is None
-        assert task.runtime.target == {"type": "device", "id": "computer"}
-        assert context["execution_target"] == {"type": "device", "id": "computer"}
-        assert context["assistant_state"]["projects_root"] == r"C:\Assistant"
-    await database.close()
-
-
-@pytest.mark.asyncio
-async def test_chat_project_audit_gets_dedicated_workflow_metadata(tmp_path):
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'audit-workflow.db'}")
-    await database.create_all()
-    async with database.sessions() as session:
-        service = TaskService(
-            session,
-            MockLLMProvider(),
-            ToolRegistry(),
-            workspace_root=str(tmp_path),
-            projects_root=r"C:\Assistant",
-        )
-        project_path = tmp_path / "project"
-        project_path.mkdir()
-        project = await service.create_project(Project(name="project", path=str(project_path)))
-
-        task = await service.create_task(
-            TaskRequest(goal="audita el proyecto", project_id=project.id)
-        )
-
-        assert task.runtime.workflow == "project_audit"
-        assert task.runtime.run_tests is True
-
-
-@pytest.mark.asyncio
-async def test_agent_audit_context_requires_template_then_general_fallback(tmp_path):
+async def test_agent_audit_context_exposes_tools_without_forcing_a_protocol(tmp_path):
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'agent-context.db'}")
     await database.create_all()
     async with database.sessions() as session:
@@ -2449,14 +2487,15 @@ async def test_agent_audit_context_requires_template_then_general_fallback(tmp_p
         )
 
         context = await service.context_builder.for_agent_decision(task)
-        protocol = context["audit_protocol"]
+        action_names = {
+            tool["name"]
+            for group in context["available_actions"]
+            for tool in group["tools"]
+        }
 
-        assert protocol["required"] is True
-        assert "workflow" in protocol
-        assert "tests_and_validation" in protocol["coverage_template"]
-        assert "first_attempt" not in protocol
+        assert "audit_protocol" not in context
         assert len(json.dumps(context, default=str)) < 48_000
-        assert context["available_actions"]
+        assert "audit" in action_names
         assert context["constraints"]["max_llm_calls"] > 0
         assert context["project"]["path"] == str(tmp_path / "project")
 
@@ -2511,6 +2550,14 @@ async def test_agent_audit_persists_one_tool_observation_per_turn(tmp_path):
 @pytest.mark.asyncio
 async def test_agent_audit_uses_readme_when_audit_template_is_missing(tmp_path):
     class CompletingAgent(MockLLMProvider):
+        async def orchestrate(self, context):
+            return OrchestratorDecision(
+                worker="AUDIT_WORKER",
+                template="audit",
+                intent="audit",
+                reason="The requested work is a project audit.",
+            )
+
         async def agent_decide(self, context):
             if context["last_observation"] is None:
                 return AgentDecision(
@@ -2542,8 +2589,11 @@ async def test_agent_audit_uses_readme_when_audit_template_is_missing(tmp_path):
         )
 
         await service.run_task(task.id)
+        routed = await service.get_task(task.id)
         nodes = await service.repository.list_nodes(task.id)
 
+        assert routed.metadata["worker"] == "AUDIT_WORKER"
+        assert routed.metadata["template"] == "audit"
         assert nodes[-1].description == "read README for project orientation"
 
 
@@ -2590,30 +2640,30 @@ async def test_orchestrator_routes_target_worker_and_template_before_agent(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_audit_builds_codegraph_before_orchestrator_and_selects_audit_worker(tmp_path):
-    class AuditRoutingAgent(MockLLMProvider):
+async def test_project_task_builds_codegraph_before_orchestrator(tmp_path):
+    class ProjectRoutingAgent(MockLLMProvider):
         async def orchestrate(self, context):
             assert context["codegraph"] is not None
             assert context["codegraph"]["file_count"] >= 1
-            return OrchestratorDecision(reason="audit project")
+            return OrchestratorDecision(reason="implement project feature")
 
         async def agent_decide(self, context):
-            return AgentDecision(decision_type="COMPLETE", reason="audit evidence ready")
+            return AgentDecision(decision_type="COMPLETE", reason="project context ready")
 
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'audit-codegraph.db'}")
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-codegraph.db'}")
     await database.create_all()
     async with database.sessions() as session:
         project_path = tmp_path / "project"
         project_path.mkdir()
         (project_path / "main.py").write_text("def main():\n    return 1\n", encoding="utf-8")
         service = TaskService(
-            session, AuditRoutingAgent(), ToolRegistry(), workspace_root=str(tmp_path)
+            session, ProjectRoutingAgent(), ToolRegistry(), workspace_root=str(tmp_path)
         )
         project = await service.create_project(
-            Project(name="audit-codegraph", path=str(project_path))
+            Project(name="project-codegraph", path=str(project_path))
         )
         task = await service.create_task(
-            TaskRequest(goal="audita el proyecto", project_id=project.id)
+            TaskRequest(goal="implement a feature in the project", project_id=project.id)
         )
 
         result = await service.run_task(task.id)
@@ -2621,11 +2671,65 @@ async def test_audit_builds_codegraph_before_orchestrator_and_selects_audit_work
         events = await service.repository.list_events(task.id)
 
         assert result.status is TaskStatus.SUCCEEDED
-        assert routed.metadata["worker"] == "AUDIT_WORKER"
-        assert routed.metadata["template"] == "audit"
-        assert any(event.event_type == "ORCHESTRATOR_CODEGRAPH_READY" for event in events)
+        assert routed.metadata["worker"] == "GENERAL_WORKER"
+        assert routed.metadata["template"] == "general"
+        assert any(event.event_type == "LLM_CODEGRAPH_READY" for event in events)
         refreshed = await service.get_project(project.id)
         assert refreshed.codegraph is not None
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_project_planner_receives_fresh_codegraph(tmp_path):
+    class GraphCheckingPlanner(MockLLMProvider):
+        def __init__(self):
+            super().__init__()
+            self.graph = None
+
+        async def plan(self, context):
+            self.graph = context["project"]["codegraph"]
+            return PlanProposal(answer="Project structure is available.")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'planner-codegraph.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        project_path = tmp_path / "project"
+        project_path.mkdir()
+        (project_path / "src").mkdir()
+        (project_path / "src" / "main.py").write_text(
+            "def main():\n    return 1\n", encoding="utf-8"
+        )
+        planner = GraphCheckingPlanner()
+        service = TaskService(
+            session,
+            planner,
+            ToolRegistry(),
+            workspace_root=str(tmp_path),
+        )
+        project = await service.create_project(
+            Project(
+                name="planner-codegraph",
+                path=str(project_path),
+                codegraph={"root": str(project_path), "file_count": 0},
+                codegraph_version=1,
+            )
+        )
+        task = await service.create_task(
+            TaskRequest(goal="summarize this project", project_id=project.id)
+        )
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        assert planner.graph["file_count"] >= 1
+        assert planner.graph["module_count"] >= 1
+        assert "src/main.py" in planner.graph["entry_modules"]
+        events = await service.repository.list_events(task.id)
+        assert any(
+            event.event_type == "LLM_CODEGRAPH_READY"
+            and event.payload["phase"] == "planner"
+            for event in events
+        )
     await database.close()
 
 
@@ -3678,7 +3782,7 @@ async def test_project_operations_persist_graph_and_audit_metadata(tmp_path):
         )
         await service._persist_project_operation_result(
             task,
-            Operation(tool="project", method="audit"),
+            Operation(tool="audit", method="run"),
             {"success": True, "output": {"audit": {"test_result": {"available": True}}}},
         )
 
@@ -3690,8 +3794,8 @@ async def test_project_operations_persist_graph_and_audit_metadata(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_project_initialize_registers_created_project(tmp_path):
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-initialize.db'}")
+async def test_project_create_registers_created_project(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'project-create.db'}")
     await database.create_all()
     async with database.sessions() as session:
         service = TaskService(
@@ -3706,7 +3810,7 @@ async def test_project_initialize_registers_created_project(tmp_path):
 
         await service._persist_project_operation_result(
             task,
-            Operation(tool="project", method="initialize"),
+            Operation(tool="project", method="create"),
             {
                 "success": True,
                 "output": {

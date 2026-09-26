@@ -19,6 +19,7 @@ from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from ..context import ContextBuilder
+from ..devices.computer.codegraph import CodeGraphTool
 from ..domain.contracts import (
     ArtifactKind,
     ArtifactRef,
@@ -56,7 +57,6 @@ from ..llm import (
 )
 from ..observability import compact
 from ..planning import plan_coverage_warnings, validate_plan_quality
-from ..project_analysis import ProjectAnalyzer
 from ..scheduler import NodeScheduler
 from ..tools import ToolRegistry
 from ..verifier import DeterministicVerifier
@@ -191,7 +191,6 @@ class TaskService:
         if project and self._is_project_audit_request(task.goal):
             if task.runtime.workflow is None:
                 task.runtime.workflow = "project_audit"
-            task.runtime.run_tests = True
         if self.default_execution_time is not None:
             task.budget.max_execution_time = max(1.0, self.default_execution_time)
         if requires_project_selection:
@@ -337,7 +336,11 @@ class TaskService:
         project = await self.repository.get_project(project_id)
         if project is None:
             return None
-        result = await ProjectAnalyzer().analyze(project.path, max_files)
+        result = await CodeGraphTool().execute(
+            "build",
+            {"root": project.path, "max_files": max_files},
+            300,
+        )
         if not result.success:
             raise ValueError(result.error or "project graph analysis failed")
         project.codegraph = result.output
@@ -408,7 +411,12 @@ class TaskService:
             await self.repository.list_nodes(task_id), await self.repository.list_edges(task_id)
         )
 
-    async def reconcile_idle(self) -> int:
+    async def reconcile_idle(self, has_work: bool = False) -> int:
+        if has_work:
+            # The main dispatcher is actively cycling tasks. Running idle
+            # supervision here would race the scheduler over the same tasks
+            # and burn LLM/tool budget for work already in motion.
+            return 0
         repaired = 0
         purge = getattr(self.repository, "purge_expired_memory", None)
         if purge is not None:
@@ -980,6 +988,10 @@ class TaskService:
         task.runtime.recovery_attempts = attempts + 1
         await self.repository.save_task(task)
         failure = OperationResult(success=False, error=reason, error_type=ErrorType.UNKNOWN)
+        if not await self._refresh_project_codegraph_for_llm(
+            task, "replanner", time_remaining, node
+        ):
+            return False
         context = await self.context_builder.for_replanner(task, node, graph, failure)
         branch_name = f"assistant/recovery/{task.id[:8]}-{attempts + 1}"
         recovery_policy = context["failure_context"]["recovery_policy"]
@@ -1154,21 +1166,17 @@ class TaskService:
 
     @staticmethod
     def _normalize_project_audit_plan(task: Task, proposal: PlanProposal) -> PlanProposal:
-        """Keep audit evidence deterministic while preserving useful agent stages.
-
-        The planner may add bounded reads, graph queries, or applicable
-        validation operations. Those stages are evidence-producing work and
-        must not be discarded merely because the audit operation remains the
-        canonical structured collector.
-        """
+        """Normalize the explicit audit operation without adding plan stages."""
         if task.runtime.workflow != "project_audit":
             return proposal
         audit_nodes = [
             node for node in proposal.nodes
             if (
                 node.operation_hint is not None
-                and node.operation_hint.tool == "project"
-                and node.operation_hint.method == "audit"
+                and (
+                    (node.operation_hint.tool == "audit" and node.operation_hint.method == "run")
+                    or (node.operation_hint.tool == "project" and node.operation_hint.method == "audit")
+                )
             )
             or "auditar el proyecto" in node.description.casefold()
             or "audit the project" in node.description.casefold()
@@ -1179,51 +1187,15 @@ class TaskService:
                 return fallback
             return proposal
         audit = audit_nodes[0]
-        project_path = task.metadata.get("project_path")
-        executable_nodes = [
-            node for node in proposal.nodes
-            if node.operation_hint is not None
-            and node.id != audit.id
-            and node.type == "OPERATION"
-        ]
-        graph = next(
-            (
-                node for node in executable_nodes
-                if node.operation_hint
-                and node.operation_hint.tool == "codegraph"
-                and node.operation_hint.method == "build"
-            ),
-            None,
-        )
-        if graph is None and isinstance(project_path, str) and project_path:
-            graph = PlanNodeProposal(
-                id="refresh-codegraph-before-audit",
-                description="Actualizar el codegraph del proyecto antes de elaborar la auditoría",
-                type="OPERATION",
-                operation_hint=OperationHint(
-                    tool="codegraph",
-                    method="build",
-                    args={"root": project_path, "max_files": 500},
-                    timeout=300,
-                ),
-            )
-            executable_nodes.insert(0, graph)
-        evidence_dependencies = [node.id for node in executable_nodes]
-        dependencies = list(dict.fromkeys([*evidence_dependencies, *audit.dependencies]))
-        # The audit tool returns structured findings; prose acceptance phrases
-        # from the planner cannot be matched reliably against that payload and
-        # would cause the same idempotent audit to retry unnecessarily.
-        audit = audit.model_copy(update={
-            "dependencies": dependencies,
-            "acceptance": {},
-            "operation_hint": audit.operation_hint.model_copy(update={
-                "args": {
-                    **audit.operation_hint.args,
-                    "run_tests": True,
-                }
-            }) if audit.operation_hint else None,
+        hint = audit.operation_hint
+        if hint is not None:
+            args = dict(hint.args)
+            args.setdefault("run_tests", task.runtime.run_tests)
+            hint = hint.model_copy(update={"tool": "audit", "method": "run", "args": args})
+        normalized = audit.model_copy(update={"acceptance": {}, "operation_hint": hint})
+        return proposal.model_copy(update={
+            "nodes": [normalized if node.id == audit.id else node for node in proposal.nodes]
         })
-        return proposal.model_copy(update={"nodes": [*executable_nodes, audit]})
 
     @staticmethod
     def _normalize_browser_intent(task: Task, proposal: PlanProposal) -> PlanProposal:
@@ -1345,81 +1317,6 @@ class TaskService:
             ],
         )
 
-    async def _ensure_project_validation(self, task: Task, proposal: PlanProposal) -> PlanProposal:
-        """Guarantee that project mutations have executable validation evidence."""
-        if proposal.answer is not None or not proposal.nodes:
-            return proposal
-        mutation_methods = {"create", "edit"}
-        mutation_nodes = []
-        validation_present = False
-        project_root = None
-        for node in proposal.nodes:
-            hint = node.operation_hint.model_dump(mode="python") if node.operation_hint else {}
-            method = hint.get("method")
-            if method in mutation_methods:
-                mutation_nodes.append(node)
-                args = hint.get("args", {})
-                if isinstance(args, dict) and args.get("root"):
-                    project_root = str(args["root"])
-            if method == "validate":
-                validation_present = True
-        if not mutation_nodes or validation_present:
-            return proposal
-        if not project_root and task.project_id:
-            project = await self.repository.get_project(task.project_id)
-            project_root = project.path if project else None
-        if not project_root:
-            return proposal
-        validation_id = "auto-project-validation"
-        if any(node.id == validation_id for node in proposal.nodes):
-            return proposal
-        validation = PlanNodeProposal(
-            id=validation_id,
-            description="Build, test and validate the changed project configuration",
-            type="OPERATION",
-            dependencies=[node.id for node in proposal.nodes],
-            acceptance={
-                "fields": {
-                    "root": project_root,
-                    "validation_status": "PASS",
-                }
-            },
-            operation_hint=OperationHint(
-                tool="project",
-                method="validate",
-                args={"root": project_root},
-                timeout=300,
-            ),
-        )
-        structural_verify = next(
-            (
-                node
-                for node in proposal.nodes
-                if node.type == "VERIFY"
-                and node.operation_hint is None
-            ),
-            None,
-        )
-        if structural_verify is not None and len(proposal.nodes) >= task.budget.max_plan_nodes:
-            replacement = structural_verify.model_copy(
-                update={
-                    "description": validation.description,
-                    "type": validation.type,
-                    "dependencies": validation.dependencies,
-                    "acceptance": validation.acceptance,
-                    "operation_hint": validation.operation_hint,
-                }
-            )
-            return proposal.model_copy(
-                update={
-                    "nodes": [
-                        replacement if node.id == structural_verify.id else node
-                        for node in proposal.nodes
-                    ]
-                }
-            )
-        return proposal.model_copy(update={"nodes": [*proposal.nodes, validation]})
-
     @staticmethod
     def _fallback_plan(task: Task) -> PlanProposal | None:
         goal = task.goal.casefold()
@@ -1452,66 +1349,6 @@ class TaskService:
                     )
                 ],
             )
-        creation_match = re.search(
-            r"\b(?:llamado|llamada|named|name[d]?)\s+['\"]?([a-zA-Z0-9_-]+)",
-            task.goal,
-            flags=re.IGNORECASE,
-        )
-        creation_requested = any(
-            term in goal
-            for term in (
-                "crear un nuevo proyecto",
-                "crea un nuevo proyecto",
-                "create a new project",
-                "new project",
-            )
-        )
-        if creation_requested:
-            if not creation_match:
-                return PlanProposal(
-                    task_id=task.id,
-                    coverage=["identify the requested project before creating files"],
-                    nodes=[
-                        PlanNodeProposal(
-                            id="fallback-project-creation-input",
-                            description="Solicitar el nombre exacto del proyecto antes de crearlo",
-                            type="WAIT",
-                        )
-                    ],
-                )
-            project_name = creation_match.group(1)
-            kind = "workspace"
-            if any(term in goal for term in ("libro", "novela", "book", "writing", "manuscrito")):
-                kind = "book"
-            elif any(term in goal for term in ("química", "quimica", "chemistry", "laboratorio", "lab")):
-                kind = "chemistry"
-            elif any(term in goal for term in ("twitter", "x.com", "automatización", "automation", "api")):
-                kind = "automation"
-            elif any(term in goal for term in ("datos", "dataset", "investigación", "research")):
-                kind = "research"
-            return PlanProposal(
-                task_id=task.id,
-                coverage=["initialize a stack-neutral workspace with a durable manifest and artifact folders"],
-                nodes=[
-                    PlanNodeProposal(
-                        id="fallback-project-initialize",
-                        description=f"Inicializar el workspace {project_name} como proyecto de tipo {kind}",
-                        type="OPERATION",
-                        acceptance={"fields": {"name": project_name, "kind": kind}},
-                        operation_hint=OperationHint(
-                            tool="project",
-                            method="initialize",
-                            args={
-                                "name": project_name,
-                                "kind": kind,
-                                "description": task.goal,
-                                "directories": [],
-                            },
-                            timeout=300,
-                        ),
-                    )
-                ],
-            )
         audit_requested = any(
             term in goal
             for term in (
@@ -1527,7 +1364,7 @@ class TaskService:
                 "analyze",
             )
         )
-        tests_requested = True
+        tests_requested = False
         explicit_tests_requested = any(
             term in goal
             for term in (
@@ -1568,8 +1405,8 @@ class TaskService:
                 type="OPERATION",
                 dependencies=["fallback-codegraph-build"] if wants_graph else [],
                 operation_hint=OperationHint(
-                    tool="project",
-                    method="audit",
+                    tool="audit",
+                    method="run",
                     args={
                         "max_files": 500,
                         "run_tests": tests_requested or explicit_tests_requested,
@@ -1688,6 +1525,15 @@ class TaskService:
         )
         try:
             events = await self.repository.list_events(task.id)
+            if not await self._refresh_project_codegraph_for_llm(
+                task, "final response"
+            ):
+                await self._save_fallback_response(
+                    task,
+                    task.failure_reason or "project codegraph refresh failed before final response",
+                )
+                await self._restore_final_status(task)
+                return
             response_context = await self.context_builder.for_final_response(
                 task,
                 [
@@ -1751,6 +1597,9 @@ class TaskService:
                         "request": getattr(self.llm, "last_request", {}),
                         "response_chars": len(json.dumps(response.model_dump(mode="json"), default=str)),
                         "usage": getattr(self.llm, "last_usage", {}),
+                        "usage_total": self._record_llm_usage(
+                            task, getattr(self.llm, "last_usage", {})
+                        ),
                     },
                 )
             )
@@ -1847,7 +1696,7 @@ class TaskService:
         if not isinstance(result.get("output"), dict):
             return
         output = result["output"]
-        if operation.tool == "project" and operation.method == "initialize":
+        if operation.tool == "project" and operation.method == "create":
             path = output.get("path")
             name = output.get("name")
             if not isinstance(path, str) or not isinstance(name, str) or not Path(path).is_dir():
@@ -1864,7 +1713,7 @@ class TaskService:
             project = existing or Project(
                 name=name,
                 path=path,
-                description=str(output.get("manifest", {}).get("description") or f"Project initialized by task {task.id}"),
+                description=str(output.get("manifest", {}).get("description") or f"Project created by task {task.id}"),
                 project_type=str(output.get("kind") or "workspace"),
             )
             if existing is None:
@@ -1897,7 +1746,7 @@ class TaskService:
             project.codegraph_version += 1
             project.codegraph_updated_at = datetime.now(UTC)
             event_type = "PROJECT_CODEGRAPH_UPDATED"
-        if operation.tool == "project" and operation.method == "audit" and output.get("audit") is not None:
+        if operation.tool == "audit" and operation.method == "run" and output.get("audit") is not None:
             project.last_audited_at = datetime.now(UTC)
             event_type = "PROJECT_AUDITED"
         if operation.tool == "project" and operation.method == "edit":
@@ -1922,6 +1771,30 @@ class TaskService:
             return "Task completed without executable node evidence"
         suffix = "" if len(completed) <= 3 else f" (+{len(completed) - 3} more)"
         return f"Completed {len(completed)} node(s): {', '.join(completed[:3])}{suffix}"
+
+    @staticmethod
+    def _record_llm_usage(task, usage: dict | None) -> dict:
+        """Aggregate one provider usage sample into the task's persisted totals.
+
+        The totals survive restarts and event retention, so the dashboard can
+        report real token usage even after raw LLM_RESPONSE events are purged.
+        """
+        usage = usage or {}
+        totals = task.runtime.llm_usage
+        totals["calls"] = int(totals.get("calls", 0)) + 1
+        totals["prompt_tokens"] = int(totals.get("prompt_tokens", 0)) + int(
+            usage.get("prompt_eval_count", 0) or 0
+        )
+        totals["completion_tokens"] = int(totals.get("completion_tokens", 0)) + int(
+            usage.get("eval_count", 0) or 0
+        )
+        totals["prefill_ms"] = int(totals.get("prefill_ms", 0)) + int(
+            int(usage.get("prompt_eval_duration", 0) or 0) / 1_000_000
+        )
+        totals["generation_ms"] = int(totals.get("generation_ms", 0)) + int(
+            int(usage.get("eval_duration", 0) or 0) / 1_000_000
+        )
+        return dict(totals)
 
     @staticmethod
     async def _call_llm(awaitable, timeout: float | None):
@@ -2138,12 +2011,10 @@ class TaskService:
             ) is not None
         events = await self.repository.list_events(task.id)
         intent = self.context_builder._planner_intent(task.goal)
-        worker = task.metadata.get("worker")
-        template = task.metadata.get("template")
-        if not worker or worker == "GENERAL_WORKER" and intent == "audit":
-            task.metadata["worker"] = "AUDIT_WORKER" if intent == "audit" else "GENERAL_WORKER"
-        if not template or template == "general" and intent == "audit":
-            task.metadata["template"] = "audit" if intent == "audit" else "general"
+        if not task.metadata.get("worker"):
+            task.metadata["worker"] = "GENERAL_WORKER"
+        if not task.metadata.get("template"):
+            task.metadata["template"] = "general"
         if not task.metadata.get("orchestration_intent"):
             task.metadata["orchestration_intent"] = intent
         if not task.metadata.get("orchestration_stage"):
@@ -2157,6 +2028,10 @@ class TaskService:
             ),
             None,
         )
+        if not await self._refresh_project_codegraph_for_llm(
+            task, "agent", time_remaining
+        ):
+            return False
         context = await self.context_builder.for_agent_decision(task, last_observation)
         await self._persist_llm_request(task.id, "AGENT", context, AgentDecision)
         task.runtime.llm_calls += 1
@@ -2164,14 +2039,22 @@ class TaskService:
         decision = await self._call_llm(
             self.llm.agent_decide(context), time_remaining
         )
+        usage_totals = self._record_llm_usage(
+            task, getattr(self.llm, "last_usage", {})
+        )
         task.apply_worker_decision(decision)
         await self.repository.save_event(
             TaskEvent(
                 task_id=task.id,
                 event_type="AGENT_DECISION",
-                payload=decision.model_dump(mode="json"),
+                payload={
+                    **decision.model_dump(mode="json"),
+                    "usage": getattr(self.llm, "last_usage", {}),
+                    "usage_total": usage_totals,
+                },
             )
         )
+        await self.repository.save_task(task)
         if decision.decision_type is AgentDecisionType.COMPLETE:
             completion_evidence = [
                 {
@@ -2460,9 +2343,8 @@ class TaskService:
             return await self._finish_task(
                 task, TaskStatus.BLOCKED, "LLM call budget exhausted", "TASK_BUDGET_EXHAUSTED"
             ) is not None
-        if task.metadata.get("orchestration_stage", "ROUTE") == "ROUTE":
-            if not await self._prepare_audit_codegraph(task, time_remaining):
-                return False
+        if not await self._refresh_project_codegraph_for_llm(task, "orchestrator", time_remaining):
+            return False
         context = await self.context_builder.for_orchestrator(task)
         await self._persist_llm_request(
             task.id, "ORCHESTRATOR", context, OrchestratorDecision
@@ -2472,21 +2354,22 @@ class TaskService:
         decision = await self._call_llm(
             self.llm.orchestrate(context), time_remaining
         )
-        if self.context_builder._planner_intent(task.goal) == "audit" and (not decision.worker or decision.worker == "GENERAL_WORKER"):
-            decision = decision.model_copy(update={"worker": "AUDIT_WORKER", "template": "audit"})
-        elif not decision.worker:
+        usage_totals = self._record_llm_usage(
+            task, getattr(self.llm, "last_usage", {})
+        )
+        if not decision.worker:
             decision = decision.model_copy(update={"worker": "GENERAL_WORKER"})
-        if self.context_builder._planner_intent(task.goal) == "audit" and (not decision.template or decision.template == "general"):
-            decision = decision.model_copy(update={"template": "audit"})
-        elif not decision.template:
+        if not decision.template:
             decision = decision.model_copy(update={"template": "general"})
-        if self.context_builder._planner_intent(task.goal) == "audit" and not decision.intent:
-            decision = decision.model_copy(update={"intent": "audit"})
         await self.repository.save_event(
             TaskEvent(
                 task_id=task.id,
                 event_type="ORCHESTRATOR_DECISION",
-                payload=decision.model_dump(mode="json"),
+                payload={
+                    **decision.model_dump(mode="json"),
+                    "usage": getattr(self.llm, "last_usage", {}),
+                    "usage_total": usage_totals,
+                },
             )
         )
         if context.get("orchestration_stage") == "REVIEW":
@@ -2570,19 +2453,21 @@ class TaskService:
         await self.repository.save_task(task)
         return True
 
-    async def _prepare_audit_codegraph(
-        self, task: Task, time_remaining: float | None = None
+    async def _refresh_project_codegraph_for_llm(
+        self,
+        task: Task,
+        phase: str,
+        time_remaining: float | None = None,
+        node: TaskNode | None = None,
     ) -> bool:
-        if self.context_builder._planner_intent(task.goal) != "audit" or not task.project_id:
+        if not task.project_id:
             return True
-        if not await self._consume_budget(task, "codegraph_queries", task.budget.max_codegraph_queries):
-            return False
         try:
             project = await self.repository.get_project(task.project_id)
             if project is None:
-                return True
+                raise ValueError("registered project was not found")
             if time_remaining is not None and time_remaining <= 0:
-                raise TimeoutError("audit codegraph preflight exceeded the task time budget")
+                raise TimeoutError("codegraph refresh exceeded the task time budget")
             started = monotonic()
             if time_remaining is None:
                 refreshed = await self.refresh_project_codegraph(project.id)
@@ -2591,15 +2476,16 @@ class TaskService:
                     self.refresh_project_codegraph(project.id), timeout=time_remaining
                 )
             if refreshed is None:
-                raise ValueError("project disappeared during audit codegraph preflight")
+                raise ValueError("project disappeared during codegraph refresh")
             await self.repository.save_event(
                 TaskEvent(
                     task_id=task.id,
-                    event_type="ORCHESTRATOR_CODEGRAPH_READY",
+                    event_type="LLM_CODEGRAPH_READY",
                     payload={
                         "project_id": project.id,
                         "version": refreshed.codegraph_version,
                         "file_count": refreshed.codegraph.get("file_count") if refreshed.codegraph else 0,
+                        "phase": phase,
                         "duration_seconds": monotonic() - started,
                     },
                 )
@@ -2607,15 +2493,26 @@ class TaskService:
             return True
         except Exception as error:
             task.metadata["codegraph_error"] = str(error)
+            task.status = TaskStatus.BLOCKED
+            task.failure_reason = f"Unable to refresh project codegraph before {phase}: {error}"
+            task.finished_at = datetime.now(UTC)
+            if node is not None:
+                node.status = NodeStatus.BLOCKED
+                node.error = task.failure_reason
+                await self.repository.save_node(node)
             await self.repository.save_task(task)
             await self.repository.save_event(
                 TaskEvent(
                     task_id=task.id,
-                    event_type="ORCHESTRATOR_CODEGRAPH_FAILED",
-                    payload={"error": str(error), "project_id": task.project_id},
+                    event_type="LLM_CODEGRAPH_REFRESH_FAILED",
+                    payload={
+                        "error": str(error),
+                        "project_id": task.project_id,
+                        "phase": phase,
+                    },
                 )
             )
-            return True
+            return False
 
     async def execute_once(self, task_id: str, time_remaining: float | None = None) -> bool:
         task = await self.repository.get_task(task_id)
@@ -2667,6 +2564,10 @@ class TaskService:
             try:
                 if not await self._consume_budget(task, "llm_calls", task.budget.max_llm_calls):
                     return True
+                if not await self._refresh_project_codegraph_for_llm(
+                    task, "planner", time_remaining
+                ):
+                    return False
                 planner_context = await self.context_builder.for_planner(task)
                 try:
                     await self._persist_llm_request(
@@ -2708,6 +2609,9 @@ class TaskService:
                             ],
                             "response_chars": len(json.dumps(proposal.model_dump(mode="json"), default=str)),
                             "usage": getattr(self.llm, "last_usage", {}),
+                            "usage_total": self._record_llm_usage(
+                                task, getattr(self.llm, "last_usage", {})
+                            ),
                         },
                     )
                 )
@@ -2745,12 +2649,14 @@ class TaskService:
                                 "request": getattr(self.llm, "last_request", {}),
                                 "response_chars": len(json.dumps(proposal.model_dump(mode="json"), default=str)),
                                 "usage": getattr(self.llm, "last_usage", {}),
+                                "usage_total": self._record_llm_usage(
+                                    task, getattr(self.llm, "last_usage", {})
+                                ),
                             },
                         )
                     )
                 proposal = self._normalize_browser_intent(task, proposal)
                 proposal = await self._normalize_project_modification(task, proposal)
-                proposal = await self._ensure_project_validation(task, proposal)
                 if proposal.answer is None and not proposal.nodes and not proposal.subtasks:
                     normalized = self._normalize_coverage_plan(task, proposal)
                     if normalized.nodes:
@@ -3142,6 +3048,10 @@ class TaskService:
             )
             if await self._handle_structural_node(task, node, graph):
                 return True
+            if not await self._refresh_project_codegraph_for_llm(
+                task, "node resolver", time_remaining, node
+            ):
+                return False
             context = await self.context_builder.for_resolver(task, node, graph)
             missing_inputs = await self.context_builder.missing_required_inputs(
                 task, node, graph
@@ -3251,6 +3161,9 @@ class TaskService:
                         "reason": decision.reason,
                             "response_chars": len(json.dumps(decision.model_dump(mode="json"), default=str)),
                             "usage": getattr(self.llm, "last_usage", {}),
+                            "usage_total": self._record_llm_usage(
+                                task, getattr(self.llm, "last_usage", {})
+                            ),
                     },
                 )
             )
@@ -3361,8 +3274,8 @@ class TaskService:
             operation = decision.operation
             if operation_hint:
                 operation = Operation.model_validate(operation_hint)
-            if operation.tool == "project" and operation.method == "audit":
-                # project.audit returns the audit report itself. Its structured
+            if operation.tool == "audit" and operation.method == "run":
+                # audit.run returns the audit report itself. Its structured
                 # payload is the acceptance evidence; prose contains checks
                 # from older planner prompts are not verifiable.
                 node.contract.acceptance = {}
@@ -3378,9 +3291,9 @@ class TaskService:
             project = await self.repository.get_project(task.project_id) if task.project_id else None
             if operation.tool == "project" and operation.method == "create":
                 operation.args.setdefault("root", self.projects_root)
-            elif operation.tool == "project" and operation.method == "initialize":
-                operation.args["root"] = self.projects_root
-            elif operation.tool == "project" and operation.method in {"analyze", "read", "audit", "edit", "build", "system"}:
+            elif operation.tool == "audit" and operation.method == "run":
+                operation.args["root"] = project.path if project else self.context_builder.workspace_root
+            elif operation.tool == "project" and operation.method in {"analyze", "read", "edit"}:
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
             elif operation.tool == "project" and operation.method == "validate":
                 operation.args["root"] = project.path if project else operation.args.get("root", self.context_builder.workspace_root)
@@ -3627,6 +3540,10 @@ class TaskService:
                 )
             elif verification.decision.value == "REPLAN":
                 failure = OperationResult.model_validate(result)
+                if not await self._refresh_project_codegraph_for_llm(
+                    task, "verification replanner", time_remaining, node
+                ):
+                    return False
                 replanner_context = await self.context_builder.for_replanner(
                     task, node, graph, failure
                 )
@@ -3766,11 +3683,19 @@ class TaskService:
         return True
 
     async def run_task(
-        self, task_id: str, max_steps: int | None = None, wait_for_retry: bool = True
+        self,
+        task_id: str,
+        max_steps: int | None = None,
+        wait_for_retry: bool = True,
+        single_step: bool = False,
     ) -> Task | None:
         started = monotonic()
         steps = 0
-        step_limit = max(1, max_steps if max_steps is not None else self.max_steps)
+        step_limit = (
+            1
+            if single_step
+            else max(1, max_steps if max_steps is not None else self.max_steps)
+        )
         while steps < step_limit:
             current = await self.repository.get_task(task_id)
             deadline = current.deadline if current else None
@@ -3786,7 +3711,19 @@ class TaskService:
                 )
                 await self._ensure_final_response(current)
                 return current
-            if current and monotonic() - started >= current.budget.max_execution_time:
+            elapsed = monotonic() - started
+            if single_step and current is not None and current.started_at is not None:
+                # Fair-share dispatch re-enters run_task once per turn, so a
+                # per-call monotonic clock would never see the cumulative
+                # wall time. Fall back to the task's persisted start instant.
+                started_at = current.started_at
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=UTC)
+                elapsed = max(
+                    elapsed,
+                    (datetime.now(UTC) - started_at).total_seconds(),
+                )
+            if current and elapsed >= current.budget.max_execution_time:
                 return await self._finish_task(
                     current,
                     TaskStatus.BLOCKED,
@@ -3794,7 +3731,11 @@ class TaskService:
                     "TASK_BUDGET_EXHAUSTED",
                 )
             try:
-                remaining = current.budget.max_execution_time - (monotonic() - started) if current else None
+                remaining = (
+                    current.budget.max_execution_time - elapsed
+                    if current
+                    else None
+                )
                 progressed = await self.execute_once(task_id, max(0.0, remaining) if remaining is not None else None)
             except TimeoutError as error:
                 task = await self.repository.get_task(task_id)
@@ -3836,6 +3777,22 @@ class TaskService:
                     if delay:
                         await asyncio.sleep(delay)
                         continue
+            if (
+                single_step
+                and task is not None
+                and task.status
+                not in {
+                    TaskStatus.SUCCEEDED,
+                    TaskStatus.FAILED,
+                    TaskStatus.BLOCKED,
+                    TaskStatus.WAITING,
+                    TaskStatus.CANCELLED,
+                }
+            ):
+                # Fair-share mode: this task had its one turn for this pass.
+                # Leave it in its current (non-terminal) state so the next
+                # dispatcher pass can round-robin back to it.
+                return task
             if (
                 not progressed
                 or task is None

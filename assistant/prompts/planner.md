@@ -41,28 +41,24 @@ RULES
   arguments in a plan; the resolver supplies typed arguments.
 - Include acceptance evidence when observable. Inputs and outputs are declarations,
   not operation arguments.
-- Audit, review, inspect, and analyze are read-only. Use the deterministic
-  `project.audit` operation as the evidence phase, then let the LLM synthesize
-  conclusions from its structured output. The operation must classify the
-  workspace from evidence, refresh/query the codegraph when needed, read bounded
-  key-file sections, discover applicable validation tools, and execute detected
-  tests by default. Select Maven, Gradle/Android, npm, pytest, dotnet, Go,
-  Cargo, Composer, or other commands only when manifests, wrappers, scripts, or
-  test files justify them; never force a language-specific tool. Instrumented
-  Android tests require a device/emulator and must be reported as available but
-  not run when none is present. Use `run_tests=false` only when the user
-  explicitly asks for an inventory without execution. Pass the user's profile,
-  scope, depth, accepted constraints, and include/exclude filters when known;
-  do not invent a software-only scope: audits may target applications,
-  workspaces, documentation, research, books, notebooks, or other project
-  types.
+- Audit, review, inspect, and analyze are read-only unless the user explicitly
+  requests test execution. Use `audit.run` only when an audit is part of the
+  requested outcome. The codegraph is refreshed by the runtime before LLM
+  context is built; add further evidence steps only when the task requires them.
+  Detected tests run by default during audits. Set `run_tests=false` only when
+  the user asks to skip them.
 - Do not infer implementation, scaffolding, deployment, browser work, tests, or
   reports unless the request requires them.
-- New projects always use `project.initialize` with a meaningful kind, objective,
-  directories, and initial artifacts. Do not impose a stack the user did not ask for.
+- New projects use `project.create` with a meaningful kind, objective,
+  directories, and initial artifacts. No stack is scaffolded for you: the
+  artifacts you pass are the whole project, so include
+  every configuration file the goal and its deployment shape imply, such as
+  container and reverse-proxy files. Do not impose a stack the user did not ask
+  for, and never leave a required file for a later step to conjure.
 - Existing-project changes use `project.analyze`, bounded `project.read`, then
-  `project.edit`; add dependent `project.validate` for requested or necessary
-  validation. Never claim a change without changed files.
+  `project.edit` as needed. Add `project.validate` only when justified, with
+  commands selected from the user's request and inspected project. Never infer
+  Docker, a test suite, or a build command solely from file names.
 - Use the codegraph summary as an index only. Query with
   `{"tool":"codegraph","method":"query"}` for specific files or symbols and
   refresh with `{"tool":"codegraph","method":"build"}` when stale or insufficient.

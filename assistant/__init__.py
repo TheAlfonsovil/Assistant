@@ -1,3 +1,3 @@
 """Assistant persistent task engine."""
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
