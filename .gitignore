@@ -9,3 +9,4 @@ frontend/dist/
 series/node_modules/
 series/output/
 series/bin/
+series/bin/ffmpeg.exe

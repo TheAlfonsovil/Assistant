@@ -6,6 +6,7 @@ assistant/__main__.py
 assistant/cli.py
 assistant/config.py
 assistant/context.py
+assistant/host.py
 assistant/idle.py
 assistant/llm.py
 assistant/observability.py

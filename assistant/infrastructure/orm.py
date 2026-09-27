@@ -164,7 +164,6 @@ class MemoryRow(Base):
 
 class ProjectRow(Base):
     __tablename__ = "projects"
-
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     path: Mapped[str] = mapped_column(Text, nullable=False)
@@ -180,3 +179,55 @@ class ProjectRow(Base):
     codegraph: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     codegraph_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     codegraph_version: Mapped[int] = mapped_column(Integer, default=0)
+
+
+
+# --- series -----------------------------------------------------------------
+# Additive tables for the programmatic video generator. They are new tables,
+# not new columns on existing ones, so ``create_all`` adds them to an existing
+# database without a schema migration and without bumping CURRENT_SCHEMA_VERSION
+# (bumping it would make the existing database fail the startup check).
+
+
+class SeriesCharacterRow(Base):
+    __tablename__ = "series_characters"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    # Visual identity: palette and style notes reused by every scene so a
+    # character stays recognisable across shots.
+    palette: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    style_notes: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SeriesSceneRow(Base):
+    __tablename__ = "series_scenes"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    character_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    duration: Mapped[float] = mapped_column(default=0.0)
+    # A scene body as the worker emits it: elements, camera, background.
+    # Stored verbatim so it can be re-rendered without calling the model again.
+    spec_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    # Issues reported by the authoritative JavaScript validator at last render.
+    issues: Mapped[list[Any]] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SeriesRenderRow(Base):
+    __tablename__ = "series_renders"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    scene_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    format: Mapped[str] = mapped_column(String(16), default="mp4")
+    video_path: Mapped[str | None] = mapped_column(Text)
+    duration: Mapped[float] = mapped_column(default=0.0)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

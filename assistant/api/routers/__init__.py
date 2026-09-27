@@ -5,6 +5,7 @@ from .dashboard import router as dashboard_router
 from .memory import router as memory_router
 from .projects import router as projects_router
 from .runtime import router as runtime_router
+from .series import router as series_router
 from .system import router as system_router
 from .tasks import router as tasks_router
 
@@ -14,6 +15,7 @@ __all__ = [
     "memory_router",
     "projects_router",
     "runtime_router",
+    "series_router",
     "system_router",
     "tasks_router",
 ]

@@ -48,6 +48,7 @@ from ..domain.models import (
 )
 from ..infrastructure.orm import IdempotencyRow, LeaseRow
 from ..infrastructure.repositories import TaskRepository
+from ..infrastructure.series_repository import SeriesRepository
 from ..llm import (
     AssistantResponse,
     LLMProvider,
@@ -61,6 +62,7 @@ from ..planning import plan_coverage_warnings, validate_plan_quality
 from ..scheduler import NodeScheduler
 from ..tools import ToolRegistry
 from ..verifier import DeterministicVerifier
+from .series_service import SeriesService
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +87,10 @@ class TaskService:
         self.session = session
         self.llm = llm
         self.tools = tools
+        # Series content is authored data, not task state, so it gets its own
+        # repository over the same session. A runtime reset clears tasks and
+        # memory but must not delete characters or scenes.
+        self.series = SeriesService(SeriesRepository(session))
         self.verifier = verifier or DeterministicVerifier()
         self.scheduler = NodeScheduler()
         self.context_builder = ContextBuilder(
