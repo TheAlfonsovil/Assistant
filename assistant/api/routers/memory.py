@@ -19,6 +19,17 @@ async def export_memory(request: Request):
     return await get_context(request).service.repository.export_memory()
 
 
+@router.get("/summary")
+async def memory_summary(request: Request) -> dict:
+    """Row counts per SQLite table so the memory view can show DB state."""
+    repository = get_context(request).service.repository
+    tables = await repository.table_summary()
+    return {
+        "tables": tables,
+        "total_rows": sum(int(table["rows"]) for table in tables),
+    }
+
+
 @router.post("/reset")
 async def reset_memory(request: Request) -> dict:
     return await perform_reset(request)

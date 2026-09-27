@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from ...domain.models import Operation
 from ..deps import get_context, get_runtime
@@ -56,6 +56,15 @@ async def observability(request: Request, limit: int = 200) -> dict:
             "idle": runtime.idle_snapshot(),
         },
     }
+
+
+@router.get("/observability/events/{event_id}")
+async def observability_event(request: Request, event_id: str) -> dict:
+    """Full detail for one event, including the rendered LLM prompt."""
+    event = await get_context(request).service.repository.get_event(event_id)
+    if event is None:
+        raise HTTPException(404, "Event not found")
+    return _event_json(event, include_prompt=True)
 
 
 @router.get("/resources")

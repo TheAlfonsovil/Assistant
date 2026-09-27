@@ -1,0 +1,27 @@
+{
+  "name": "test_zone",
+  "kind": "web",
+  "description": "Vue frontend with Java 25 Spring Boot 4 backend, deployed as single SPA in Docker",
+  "objective": "Vue frontend with Java 25 Spring Boot 4 backend, deployed as single SPA in Docker",
+  "created_by": "assistant.project.create",
+  "artifacts": [
+    "README.md",
+    "backend/pom.xml",
+    "backend/src/main/java/com/testzone/TestZoneApplication.java",
+    "backend/src/main/java/com/testzone/controller/HelloController.java",
+    "backend/src/main/resources/application.properties",
+    "docker/Dockerfile.backend",
+    "docker/Dockerfile.frontend",
+    "docker/docker-compose.yml",
+    "docker/launch.sh",
+    "docker/nginx.conf",
+    "frontend/index.html",
+    "frontend/package.json",
+    "frontend/src/App.vue",
+    "frontend/src/main.js",
+    "frontend/src/router/index.js",
+    "frontend/src/views/AboutView.vue",
+    "frontend/src/views/HomeView.vue",
+    "frontend/vite.config.js"
+  ]
+}

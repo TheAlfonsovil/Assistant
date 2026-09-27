@@ -2,7 +2,7 @@ import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, inspect, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -166,6 +166,19 @@ class TaskRepository:
             select(TaskRow.status, func.count(TaskRow.id)).group_by(TaskRow.status)
         )
         return {str(status): int(count) for status, count in result.all()}
+
+    async def table_summary(self) -> list[dict[str, object]]:
+        """Row count digest of every physical table in the store."""
+
+        def _table_names(connection) -> list[str]:
+            return sorted(inspect(connection).get_table_names())
+
+        connection = await self.session.connection()
+        summary: list[dict[str, object]] = []
+        for name in await connection.run_sync(_table_names):
+            count = await self.session.scalar(text(f'SELECT COUNT(*) FROM "{name}"'))
+            summary.append({"name": name, "rows": int(count or 0)})
+        return summary
 
     async def save_worker_heartbeat(
         self,
@@ -698,6 +711,10 @@ class TaskRepository:
             query = query.where(EventRow.task_id == task_id)
         result = await self.session.execute(query)
         return [TaskEvent.model_validate(row.__dict__) for row in result.scalars()]
+
+    async def get_event(self, event_id: str) -> TaskEvent | None:
+        row = await self.session.get(EventRow, event_id)
+        return TaskEvent.model_validate(row.__dict__) if row else None
 
     async def clear_edges(self, task_id: str) -> None:
         await self.session.execute(delete(EdgeRow).where(EdgeRow.task_id == task_id))

@@ -139,6 +139,16 @@ async def get_graph(request: Request, task_id: str) -> dict:
     }
 
 
+@router.get("/{task_id}/nodes/{node_id}")
+async def get_task_node(request: Request, task_id: str, node_id: str) -> dict:
+    """Detail for a single node of a task (used by observability drill-down)."""
+    repository = get_context(request).service.repository
+    node = await repository.get_node(node_id)
+    if node is None or node.task_id != task_id:
+        raise HTTPException(404, "Node not found")
+    return node.model_dump(mode="json")
+
+
 @router.get("/{task_id}/events")
 async def get_events(request: Request, task_id: str) -> list:
     events = await get_context(request).service.repository.list_events(task_id)

@@ -6,11 +6,15 @@ import { date, prettyJson } from '@/utils/format'
 
 const system = useSystemStore()
 const items = ref([])
+const summary = ref(null)
 const open = ref(null)
 
 async function load() {
-  try { items.value = await api.listMemory() }
-  catch (error) { system.notify(error.message, 'error') }
+  try {
+    const [memories, tables] = await Promise.all([api.listMemory(), api.memorySummary()])
+    items.value = memories
+    summary.value = tables
+  } catch (error) { system.notify(error.message, 'error') }
 }
 async function redact(m) { try { await api.redactMemory(m.id); system.notify('Memoria redactada', 'ok'); await load() } catch (e) { system.notify(e.message, 'error') } }
 async function remove(m) { try { await api.deleteMemory(m.id); system.notify('Memoria eliminada', 'ok'); await load() } catch (e) { system.notify(e.message, 'error') } }
@@ -31,6 +35,20 @@ onMounted(load)
     <button class="btn" @click="exportAll">Exportar</button>
     <button class="btn" @click="purge">Purgar caducadas</button>
     <span class="grow" /><span class="muted">{{ items.length }} registros</span>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="row">
+      <h2 style="margin:0">Tablas SQLite</h2>
+      <span class="grow" />
+      <span class="muted">{{ summary?.total_rows ?? 0 }} filas en total</span>
+    </div>
+    <div v-if="!summary" class="empty">Cargando resumen…</div>
+    <div v-else class="grid cols-4" style="margin-top:12px">
+      <div v-for="t in summary.tables" :key="t.name" class="metric">
+        <small class="mono">{{ t.name }}</small><b>{{ t.rows }}</b>
+      </div>
+    </div>
   </div>
 
   <div class="card" style="padding:0;overflow:hidden">

@@ -22,6 +22,8 @@ export const api = {
   // dashboard read models
   overview: () => request('/overview'),
   observability: (limit = 200) => request(`/observability?limit=${limit}`),
+  getEvent: (id) => request(`/observability/events/${id}`),
+  getNode: (taskId, nodeId) => request(`/tasks/${taskId}/nodes/${nodeId}`),
   resources: () => request('/resources'),
   metrics: (limit = 500) => request(`/metrics?limit=${limit}`),
   // tasks
@@ -48,6 +50,7 @@ export const api = {
   refreshCodegraph: (id) => request(`/projects/${id}/codegraph/refresh`, { method: 'POST' }),
   // memory
   listMemory: () => request('/memory'),
+  memorySummary: () => request('/memory/summary'),
   exportMemory: () => request('/memory/export'),
   redactMemory: (id) => request(`/memory/${id}/redact`, { method: 'POST' }),
   deleteMemory: (id) => request(`/memory/${id}`, { method: 'DELETE' }),

@@ -606,3 +606,39 @@ async def test_project_analyzer_emits_inheritance_and_composition_edges(tmp_path
     assert result.success is True
     kinds = {edge["kind"] for edge in result.output["dependency_edges"]}
     assert {"inherits", "composes"}.issubset(kinds)
+
+
+@pytest.mark.asyncio
+async def test_table_summary_counts_rows_per_table(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'summary.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        await repository.save_task(Task(goal="count me"))
+        await repository.save_event(TaskEvent(task_id="t", event_type="TASK_CREATED"))
+
+        summary = {row["name"]: row["rows"] for row in await repository.table_summary()}
+
+        assert summary["tasks"] == 1
+        assert summary["task_events"] == 1
+        assert summary["memories"] == 0
+        assert summary["projects"] == 0
+        assert "schema_version" in summary
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_get_event_returns_stored_event_or_none(tmp_path):
+    database = Database(f"sqlite:///{tmp_path / 'event-lookup.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        stored = TaskEvent(task_id="t", event_type="NODE_READY", payload={"node": "n1"})
+        await repository.save_event(stored)
+
+        found = await repository.get_event(stored.id)
+        assert found is not None
+        assert found.event_type == "NODE_READY"
+        assert found.payload == {"node": "n1"}
+        assert await repository.get_event("missing-event") is None
+    await database.close()

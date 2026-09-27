@@ -2,10 +2,11 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '@/api/client'
 import { useSystemStore } from '@/stores/system'
-import { date } from '@/utils/format'
+import { date, shortId, prettyJson } from '@/utils/format'
 
 const system = useSystemStore()
 const data = ref(null)
+const expanded = ref(null) // { kind: 'event'|'node', eventId, data, loading }
 let timer = null
 
 const runtime = computed(() => data.value?.runtime ?? {})
@@ -16,6 +17,26 @@ async function load() {
   try { data.value = await api.observability(200) }
   catch (error) { system.notify(error.message, 'error') }
 }
+
+function isExpanded(e) { return expanded.value?.eventId === e.id }
+
+async function toggleEvent(e) {
+  if (isExpanded(e)) { expanded.value = null; return }
+  expanded.value = { kind: 'event', eventId: e.id, data: null, loading: true }
+  try { expanded.value.data = await api.getEvent(e.id) }
+  catch (error) { system.notify(error.message, 'error'); expanded.value = null; return }
+  expanded.value.loading = false
+}
+
+async function toggleNode(e) {
+  if (!e.node_id || !e.task_id) return
+  if (expanded.value?.kind === 'node' && expanded.value.eventId === e.id) { expanded.value = null; return }
+  expanded.value = { kind: 'node', eventId: e.id, data: null, loading: true }
+  try { expanded.value.data = await api.getNode(e.task_id, e.node_id) }
+  catch (error) { system.notify(error.message, 'error'); expanded.value = null; return }
+  expanded.value.loading = false
+}
+
 async function toggleIdle() {
   try { const r = await api.setIdle(!idle.value.enabled); system.notify(r.enabled ? 'Idle activado' : 'Idle detenido', 'ok'); await load() }
   catch (e) { system.notify(e.message, 'error') }
@@ -58,12 +79,42 @@ onUnmounted(() => window.clearInterval(timer))
     <table class="table">
       <thead><tr><th>Tiempo</th><th>Tipo</th><th>Tarea</th><th>Nodo</th></tr></thead>
       <tbody>
-        <tr v-for="e in events" :key="e.id">
-          <td class="muted" style="white-space:nowrap">{{ date(e.created_at) }}</td>
-          <td>{{ e.event_type }}</td>
-          <td class="mono muted">{{ e.task_id ? e.task_id.slice(0,8) : '—' }}</td>
-          <td class="mono muted">{{ e.node_id ? e.node_id.slice(0,8) : '—' }}</td>
-        </tr>
+        <template v-for="e in events" :key="e.id">
+          <tr :class="{ selected: isExpanded(e) }" @click="toggleEvent(e)">
+            <td class="muted" style="white-space:nowrap">{{ date(e.created_at) }}</td>
+            <td>{{ e.event_type }}</td>
+            <td class="mono muted">{{ e.task_id ? shortId(e.task_id) : '—' }}</td>
+            <td>
+              <span v-if="e.node_id" class="mono node-link" @click.stop="toggleNode(e)">{{ shortId(e.node_id) }}</span>
+              <span v-else class="muted">—</span>
+            </td>
+          </tr>
+          <tr v-if="isExpanded(e)">
+            <td colspan="4" style="background:var(--bg-elev)">
+              <div v-if="expanded.loading" class="empty">Cargando detalle…</div>
+              <template v-else-if="expanded.kind === 'node'">
+                <div class="row" style="margin-bottom:8px">
+                  <span class="chip">{{ expanded.data.type }}</span>
+                  <span class="chip">{{ expanded.data.status }}</span>
+                  <span class="mono muted" style="font-size:12px">nodo {{ shortId(expanded.data.id) }}</span>
+                  <span class="mono muted" style="font-size:12px">tarea {{ shortId(expanded.data.task_id) }}</span>
+                </div>
+                <p class="muted" style="margin:0 0 8px">{{ expanded.data.description }}</p>
+                <pre class="code" style="max-height:320px">{{ prettyJson(expanded.data) }}</pre>
+              </template>
+              <template v-else>
+                <div class="row" style="margin-bottom:8px">
+                  <span class="chip">{{ expanded.data.event_type }}</span>
+                  <span class="mono muted" style="font-size:12px">evento {{ shortId(expanded.data.id) }}</span>
+                  <span class="mono muted" style="font-size:12px">tarea {{ shortId(expanded.data.task_id) }}</span>
+                  <span v-if="expanded.data.node_id" class="mono muted" style="font-size:12px">nodo {{ shortId(expanded.data.node_id) }}</span>
+                  <span class="muted" style="font-size:12px">{{ date(expanded.data.created_at) }}</span>
+                </div>
+                <pre class="code" style="max-height:320px">{{ prettyJson(expanded.data) }}</pre>
+              </template>
+            </td>
+          </tr>
+        </template>
       </tbody>
     </table>
     <div v-if="!events.length" class="empty">Sin eventos.</div>
