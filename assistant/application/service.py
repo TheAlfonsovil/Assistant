@@ -348,6 +348,18 @@ class TaskService:
         project.codegraph_updated_at = datetime.now(UTC)
         return await self.repository.update_project(project)
 
+    def _workspace_paths(self) -> set[Path]:
+        roots = {Path(self.context_builder.workspace_root).expanduser().resolve()}
+        if self.projects_root:
+            roots.add(Path(self.projects_root).expanduser().resolve())
+        return roots
+
+    def _guards_workspace(self, path: Path) -> bool:
+        for protected in self._workspace_paths():
+            if path == protected or protected.is_relative_to(path):
+                return True
+        return False
+
     async def delete_project(self, project_id: str) -> bool:
         project = await self.repository.get_project(project_id)
         if project is None:
@@ -356,6 +368,8 @@ class TaskService:
         projects_root = Path(self.projects_root).expanduser().resolve()
         if project_path == projects_root or project_path.parent != projects_root:
             raise ValueError("project deletion is limited to a direct child of projects_root")
+        if self._guards_workspace(project_path):
+            raise ValueError(f"project deletion would remove the workspace root: {project_path}")
         if project_path.exists():
             if not project_path.is_dir():
                 raise ValueError("project path is not a directory")
@@ -2153,7 +2167,9 @@ class TaskService:
         if not await self._consume_budget(task, "tool_calls", task.budget.max_tool_calls):
             return False
         project = await self.repository.get_project(task.project_id) if task.project_id else None
-        if operation.tool in {"project", "codegraph"} and project:
+        if operation.tool == "project" and operation.method == "create":
+            operation.args["root"] = str(Path(self.projects_root).expanduser().resolve())
+        elif operation.tool in {"project", "codegraph"} and project:
             operation.args["root"] = project.path
         node = TaskNode(
             task_id=task.id,

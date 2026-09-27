@@ -30,6 +30,7 @@ La configuración mínima usa SQLite local y Ollama en `http://localhost:11434`.
 - `ASSISTANT_OLLAMA_URL`: dirección del servidor Ollama.
 - `ASSISTANT_OLLAMA_MODEL`: modelo que Planner, Resolver y respuesta final utilizarán.
 - `ASSISTANT_WORKSPACE_ROOT`: raíz permitida para analizar el proyecto local.
+- `ASSISTANT_PROJECTS_ROOT`: directorio padre donde se crean los proyectos nuevos.
 - `ASSISTANT_USER_*`: perfil explícito opcional que se conserva como memoria estructurada.
 
 Antes de levantar la API, inicia Ollama y asegúrate de que el modelo configurado existe:

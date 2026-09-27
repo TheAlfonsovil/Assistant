@@ -924,6 +924,56 @@ async def test_delete_project_removes_directory_and_persistent_registration(tmp_
     await database.close()
 
 
+@pytest.mark.asyncio
+async def test_delete_project_refuses_the_workspace_itself(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'guard-workspace.db'}")
+    await database.create_all()
+    projects_root = tmp_path / "projects"
+    workspace = projects_root / "Assistant"
+    (workspace / "frontend" / "dist").mkdir(parents=True)
+    (workspace / "frontend" / "dist" / "index.html").write_text("<html>", encoding="utf-8")
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            ToolRegistry(),
+            workspace_root=str(workspace),
+            projects_root=str(projects_root),
+        )
+        project = await service.create_project(Project(name="Assistant", path=str(workspace)))
+
+        with pytest.raises(ValueError, match="workspace root"):
+            await service.delete_project(project.id)
+
+        assert (workspace / "frontend" / "dist" / "index.html").is_file()
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_delete_project_still_removes_a_sibling_project(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'guard-sibling.db'}")
+    await database.create_all()
+    projects_root = tmp_path / "projects"
+    workspace = projects_root / "Assistant"
+    workspace.mkdir(parents=True)
+    sibling = projects_root / "test_zone"
+    sibling.mkdir()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            ToolRegistry(),
+            workspace_root=str(workspace),
+            projects_root=str(projects_root),
+        )
+        project = await service.create_project(Project(name="test_zone", path=str(sibling)))
+
+        assert await service.delete_project(project.id) is True
+        assert not sibling.exists()
+        assert workspace.is_dir()
+    await database.close()
+
+
 def test_empty_plan_fallback_preserves_codegraph_intent():
     proposal = TaskService._fallback_plan(Task(goal="actualiza el codegraph y audita el proyecto"))
 
