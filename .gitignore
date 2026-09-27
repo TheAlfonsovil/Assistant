@@ -1,3 +1,4 @@
 data/processes/
 data/browser-interactions.jsonl
-test_zone/
+frontend/node_modules/
+frontend/dist/
