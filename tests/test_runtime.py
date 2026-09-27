@@ -3835,6 +3835,54 @@ async def test_project_create_registers_created_project(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_project_create_uses_configured_projects_root_not_llm_root(tmp_path):
+    class CreateProjectAgent(MockLLMProvider):
+        async def orchestrate(self, context):
+            return OrchestratorDecision(
+                target_type="device",
+                target_id="computer",
+                worker="CODE_WORKER",
+                template="implementation",
+            )
+
+        async def agent_decide(self, context):
+            if context["last_observation"] is None:
+                return AgentDecision(
+                    decision_type="EXECUTE",
+                    reason="Create the requested empty project workspace.",
+                    operation=Operation(
+                        tool="project",
+                        method="create",
+                        args={"root": "test_zone", "name": "test_zone", "files": []},
+                    ),
+                )
+            return AgentDecision(decision_type="COMPLETE", reason="Workspace created.")
+
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'authoritative-project-root.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            CreateProjectAgent(),
+            build_tool_registry(),
+            workspace_root=str(tmp_path),
+            projects_root=str(projects_root),
+        )
+        task = await service.create_task(TaskRequest(goal="create test_zone"))
+
+        result = await service.run_task(task.id)
+
+        created = await service.get_project(result.project_id)
+        assert result.status is TaskStatus.SUCCEEDED
+        assert Path(created.path) == (projects_root / "test_zone").resolve()
+        assert (projects_root / "test_zone" / ".assistant" / "project.json").is_file()
+        assert not (tmp_path / "test_zone" / "test_zone").exists()
+    await database.close()
+
+
+@pytest.mark.asyncio
 async def test_list_projects_recovers_previous_workspace(tmp_path):
     project_path = tmp_path / "legacy_zone"
     (project_path / ".assistant").mkdir(parents=True)

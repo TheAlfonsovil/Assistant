@@ -3290,7 +3290,7 @@ class TaskService:
                 operation.metadata.setdefault("expected", acceptance)
             project = await self.repository.get_project(task.project_id) if task.project_id else None
             if operation.tool == "project" and operation.method == "create":
-                operation.args.setdefault("root", self.projects_root)
+                operation.args["root"] = str(Path(self.projects_root).expanduser().resolve())
             elif operation.tool == "audit" and operation.method == "run":
                 operation.args["root"] = project.path if project else self.context_builder.workspace_root
             elif operation.tool == "project" and operation.method in {"analyze", "read", "edit"}:

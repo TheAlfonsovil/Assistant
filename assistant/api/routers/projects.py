@@ -1,0 +1,73 @@
+﻿from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException, Request
+
+from ...domain.models import Project, ProjectRequest
+from ..deps import get_context, get_runtime
+
+router = APIRouter(prefix="/projects", tags=["projects"])
+
+
+@router.get("")
+async def list_projects(request: Request) -> list:
+    projects = await get_context(request).service.list_projects()
+    return [project.model_dump(mode="json") for project in projects]
+
+
+@router.post("")
+async def create_project(request: Request, project_request: ProjectRequest) -> dict:
+    project = await get_context(request).service.create_project(
+        Project.model_validate(project_request.model_dump())
+    )
+    return project.model_dump(mode="json")
+
+
+@router.get("/{project_id}")
+async def get_project(request: Request, project_id: str) -> dict:
+    project = await get_context(request).service.get_project(project_id)
+    if not project:
+        raise HTTPException(404, "Project not found")
+    return project.model_dump(mode="json")
+
+
+@router.put("/{project_id}")
+async def update_project(request: Request, project_id: str, project_request: ProjectRequest) -> dict:
+    project = Project(id=project_id, **project_request.model_dump())
+    try:
+        updated = await get_context(request).service.update_project(project)
+    except KeyError:
+        raise HTTPException(404, "Project not found") from None
+    return updated.model_dump(mode="json")
+
+
+@router.delete("/{project_id}")
+async def delete_project(request: Request, project_id: str) -> dict:
+    try:
+        deleted = await get_context(request).service.delete_project(project_id)
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from error
+    if not deleted:
+        raise HTTPException(404, "Project not found")
+    return {"deleted": True, "id": project_id}
+
+
+@router.post("/{project_id}/audit")
+async def audit_project(request: Request, project_id: str, run_tests: bool = False) -> dict:
+    task = await get_context(request).service.create_project_audit_task(
+        project_id, run_tests=run_tests
+    )
+    if not task:
+        raise HTTPException(404, "Project not found or disabled")
+    get_runtime(request).wake()
+    return {"id": task.id, "status": task.status, "project_id": task.project_id, "run_tests": run_tests}
+
+
+@router.post("/{project_id}/codegraph/refresh")
+async def refresh_project_codegraph(request: Request, project_id: str) -> dict:
+    try:
+        project = await get_context(request).service.refresh_project_codegraph(project_id)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    if not project:
+        raise HTTPException(404, "Project not found")
+    return project.model_dump(mode="json")
