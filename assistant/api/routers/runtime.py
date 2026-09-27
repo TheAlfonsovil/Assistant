@@ -4,7 +4,9 @@ import asyncio
 
 from fastapi import APIRouter, Request
 
+from ...config import get_settings
 from ...domain.models import IdleConfigurationRequest
+from ...startup.manager import seed_durable_memory
 from ..deps import get_context, get_runtime
 
 router = APIRouter(prefix="/runtime", tags=["runtime"])
@@ -19,12 +21,23 @@ async def perform_reset(request: Request) -> dict:
         await worker
     except asyncio.CancelledError:
         pass
-    deleted = await get_context(request).service.repository.reset_state()
+    context = get_context(request)
+    deleted = await context.service.repository.reset_state()
+    # A reset clears learned state, not the assistant's own identity. Without
+    # re-seeding, the host facts and user profile stay deleted until the next
+    # restart, and workers lose the only reliable record of the host
+    # interpreter, which is how a Windows host ends up with a POSIX script.
+    reseeded = await seed_durable_memory(context.service.repository, get_settings())
     runtime.stop_requested = False
     request.app.state.worker = asyncio.create_task(
         runtime.run_forever(), name="assistant-task-runtime"
     )
-    return {"reset": True, "deleted": deleted, "total": sum(deleted.values())}
+    return {
+        "reset": True,
+        "deleted": deleted,
+        "total": sum(deleted.values()),
+        "reseeded": reseeded["system_facts"] and reseeded["checks"],
+    }
 
 
 @router.post("/reset")

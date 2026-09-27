@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from assistant import host
 from assistant.application import TaskService
 from assistant.config import Settings
 from assistant.context import ContextBuilder
@@ -42,8 +43,8 @@ from assistant.llm import (
     FinalReport,
     MockLLMProvider,
     NodeDecision,
-    OrchestratorDecision,
     OllamaLLMProvider,
+    OrchestratorDecision,
     PlanNodeProposal,
     PlanProposal,
     VerificationResult,
@@ -53,7 +54,7 @@ from assistant.project_analysis import ProjectAnalyzer
 from assistant.prompts.template import render
 from assistant.recovery import RecoveryManager
 from assistant.runtime import TaskRuntime
-from assistant.startup.manager import StartupManager
+from assistant.startup.manager import StartupManager, seed_durable_memory
 from assistant.tools import MockTool, NotificationTool, Tool, ToolDefinition, ToolRegistry
 from assistant.verifier import DeterministicVerifier
 
@@ -1183,6 +1184,75 @@ async def test_orchestrator_criteria_reach_the_root_node_contract(tmp_path):
             "Docker script added",
         ]
     await database.close()
+
+
+@pytest.mark.asyncio
+async def test_reset_reseeds_host_facts_and_profile(tmp_path):
+    """A reset clears learned state but must restore the assistant's identity.
+
+    The host facts are the only reliable record of the machine's interpreter.
+    Losing them is how a Windows host ended up with a POSIX launch script, so a
+    memory reset cannot be allowed to leave the memory empty.
+    """
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'reset-reseed.db'}")
+    await database.create_all()
+    settings = Settings(
+        collect_system_facts=True,
+        persist_system_facts=True,
+        persist_user_profile=True,
+        user_name="Tester",
+    )
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        await seed_durable_memory(repository, settings)
+        assert await repository.list_memory(), "seeding should write the host facts"
+
+        deleted = await repository.reset_state()
+        assert deleted["memories"] > 0, "the reset should have cleared memory"
+
+        await seed_durable_memory(repository, settings)
+        keys = {item.key for item in await repository.list_memory()}
+        assert "script_extension" in keys, "the host facts must come back after a reset"
+        assert any(item.kind == "user_profile" for item in await repository.list_memory())
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_reseeding_does_not_duplicate_memory(tmp_path):
+    """Re-seeding updates in place; the same key is never stored twice."""
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'reseed-idempotent.db'}")
+    await database.create_all()
+    settings = Settings(collect_system_facts=True, persist_system_facts=True, persist_user_profile=False)
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        await seed_durable_memory(repository, settings)
+        first = len(await repository.list_memory())
+        await seed_durable_memory(repository, settings)
+        second = len(await repository.list_memory())
+        assert first == second, "re-seeding must not add rows"
+    await database.close()
+
+
+def test_host_facts_describe_a_runnable_launch_script():
+    """The facts must name a real interpreter, not a guessed family."""
+    facts = host.system_facts()
+    assert facts["script_extension"] in {".ps1", ".sh"}
+    assert facts["default_shell"]
+    assert facts["script_interpreter"]
+    if facts["shell_family"] == "windows":
+        assert facts["script_extension"] == ".ps1"
+        assert ".ps1" in facts["script_interpreter"]
+    else:
+        assert facts["script_extension"] == ".sh"
+
+
+def test_prompt_facts_are_a_subset_of_system_facts():
+    """Prompts and memory read from the same source, so they cannot disagree."""
+    subset = host.prompt_facts()
+    full = host.system_facts()
+    assert set(subset) <= set(full)
+    for key in ("default_shell", "script_extension", "script_interpreter"):
+        assert subset[key] == full[key]
 
 
 @pytest.mark.asyncio

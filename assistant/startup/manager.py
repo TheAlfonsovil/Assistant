@@ -1,19 +1,55 @@
 from __future__ import annotations
 
-import os
-import platform
-import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 from httpx import HTTPError
 from sqlalchemy.exc import SQLAlchemyError
 
-from assistant import __version__
+from assistant import __version__, host
 from assistant.domain.models import Project, TaskStatus, UserProfile
 from assistant.infrastructure.repositories import TaskRepository
 from assistant.recovery import RecoveryManager
 from assistant.startup.models import ReadinessStatus, StartupReport
+
+
+async def seed_durable_memory(repository, settings) -> dict:
+    """Persist the host identity and user profile into long-term memory.
+
+    Both are derived from configuration, not learned from use, so they are
+    re-seeded idempotently: an existing row is updated in place, never
+    duplicated. This is also called after a runtime reset, because a reset
+    clears learned state but must not leave the assistant without a record of
+    which machine it is running on. Without that record, workers emitting a
+    launch script have no reliable source for the host interpreter and fall
+    back to a POSIX script on Windows.
+    """
+    checks: list[str] = []
+    system_facts: dict[str, str] = {}
+    if getattr(settings, "collect_system_facts", True):
+        system_facts = host.system_facts()
+        if getattr(settings, "persist_system_facts", True):
+            for key, value in system_facts.items():
+                await repository.upsert_memory(
+                    kind="system", key=key, value=value, source="SYSTEM", confidence=1.0
+                )
+            checks.append("Long-term memory loaded and system facts synchronized")
+        else:
+            checks.append("System facts collected but not persisted")
+    else:
+        checks.append("Long-term memory loaded; system facts disabled")
+
+    profile = StartupManager._user_profile_for(settings)
+    if profile and getattr(settings, "persist_user_profile", True):
+        await repository.upsert_memory(
+            kind="user_profile",
+            key="primary",
+            value=profile.model_dump(mode="json"),
+            source="USER_ENV",
+            confidence=1.0,
+        )
+        checks.append("User profile loaded from environment")
+    return {"system_facts": system_facts, "checks": checks}
 
 
 class StartupManager:
@@ -67,28 +103,10 @@ class StartupManager:
                 for task in unfinished
             )
 
-            if getattr(self.settings, "collect_system_facts", True):
-                report.system_facts = self._system_facts()
-                if getattr(self.settings, "persist_system_facts", True):
-                    for key, value in report.system_facts.items():
-                        await repository.upsert_memory(
-                            kind="system", key=key, value=value, source="SYSTEM", confidence=1.0
-                        )
-                    report.loaded_memories = await repository.list_memory()
-                    report.checks.append("Long-term memory loaded and system facts synchronized")
-            else:
-                report.checks.append("Long-term memory loaded; system facts disabled")
-
-            if report.user_profile and getattr(self.settings, "persist_user_profile", True):
-                await repository.upsert_memory(
-                    kind="user_profile",
-                    key="primary",
-                    value=report.user_profile.model_dump(mode="json"),
-                    source="USER_ENV",
-                    confidence=1.0,
-                )
-                report.loaded_memories = await repository.list_memory()
-                report.checks.append("User profile loaded from environment")
+            seeded = await seed_durable_memory(repository, self.settings)
+            report.system_facts = seeded["system_facts"]
+            report.loaded_memories = await repository.list_memory()
+            report.checks.extend(seeded["checks"])
 
         report.status = ReadinessStatus.READY if report.llm_ready else ReadinessStatus.DEGRADED
         report.finished_at = datetime.now(UTC)
@@ -128,68 +146,27 @@ class StartupManager:
 
     @staticmethod
     def _default_shell() -> tuple[str, str, str]:
-        """Detect the command interpreter the host actually uses.
-
-        Generated scripts and one-off commands must match the host interpreter;
-        emitting a POSIX ``.sh`` on Windows produces a file the host cannot run.
-        """
-        if platform.system() != "Windows":
-            return "posix", "sh", ""
-        root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-        for name in ("pwsh.exe", "powershell.exe"):
-            if (root / "System32" / "WindowsPowerShell" / "v1.0" / name).is_file() or (
-                root / name
-            ).is_file():
-                shell = "powershell" if name == "powershell.exe" else "pwsh"
-                return "windows", shell, (
-                    "Write launch scripts as .ps1 and run them with pwsh -File."
-                    if shell == "pwsh"
-                    else "Write launch scripts as .ps1 and run them with powershell -File."
-                )
-        return "windows", "powershell", (
-            "Write launch scripts as .ps1 and run them with powershell -File."
-        )
+        """Backwards-compatible alias for the shared host shell detection."""
+        return host.default_shell()
 
     @classmethod
     def _system_facts(cls) -> dict[str, str]:
-        """Return stable technical facts; never inspect personal files or secrets."""
-        windows_version = platform.win32_ver()[0] if platform.system() == "Windows" else ""
-        build_number = platform.win32_ver()[2] if platform.system() == "Windows" else ""
-        windows_generation = (
-            "Windows 11"
-            if build_number.isdigit() and int(build_number) >= 22000
-            else "Windows"
-            if platform.system() == "Windows"
-            else ""
-        )
-        shell_family, shell_name, shell_hint = cls._default_shell()
-        return {
-            "os": platform.system(),
-            "os_release": platform.release(),
-            "os_version": windows_version or platform.version(),
-            "os_generation": windows_generation,
-            "device_platform": "windows" if platform.system() == "Windows" else platform.system().lower(),
-            "architecture": platform.machine(),
-            "python_version": platform.python_version(),
-            "assistant_runtime": sys.implementation.name,
-            "hostname": platform.node(),
-            "cpu_count": str(__import__("os").cpu_count() or 0),
-            "working_directory": str(Path.cwd()),
-            "shell_family": shell_family,
-            "default_shell": shell_name,
-            "script_extension": ".ps1" if shell_family == "windows" else ".sh",
-            "script_interpreter": shell_hint or "Write launch scripts as .sh and run them with sh.",
-        }
+        """Backwards-compatible alias for the shared host fact collection."""
+        return host.system_facts()
 
-    def _user_profile(self) -> UserProfile | None:
-        name = getattr(self.settings, "user_name", None)
+    @staticmethod
+    def _user_profile_for(settings) -> UserProfile | None:
+        name = getattr(settings, "user_name", None)
         if not name:
             return None
         split_values = lambda value: [item.strip() for item in value.split(",") if item.strip()]
         return UserProfile(
             name=name,
-            birth_date=getattr(self.settings, "user_birth_date", None),
-            profession=getattr(self.settings, "user_profession", None),
-            degrees=split_values(getattr(self.settings, "user_degrees", "")),
-            expertise=split_values(getattr(self.settings, "user_expertise", "")),
+            birth_date=getattr(settings, "user_birth_date", None),
+            profession=getattr(settings, "user_profession", None),
+            degrees=split_values(getattr(settings, "user_degrees", "")),
+            expertise=split_values(getattr(settings, "user_expertise", "")),
         )
+
+    def _user_profile(self) -> UserProfile | None:
+        return self._user_profile_for(self.settings)

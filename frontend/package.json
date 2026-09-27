@@ -1,6 +1,6 @@
 {
   "name": "assistant-dashboard",
-  "version": "0.5.0",
+  "version": "0.5.4",
   "private": true,
   "type": "module",
   "description": "Vue 3 control room for Assistant Core",

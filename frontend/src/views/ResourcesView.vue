@@ -29,6 +29,11 @@ function tone(status) {
           <span v-for="c in d.capabilities" :key="c" class="chip">{{ c }}</span>
           <span v-if="!d.capabilities?.length" class="muted">Sin capacidades expuestas</span>
         </div>
+        <div v-if="d.host" class="muted mono" style="font-size:11px;margin-top:10px;line-height:1.7">
+          <div>{{ d.host.os_generation || d.host.os }} · {{ d.host.architecture }} · {{ d.host.hostname }}</div>
+          <div>shell: {{ d.host.default_shell }} · scripts: {{ d.host.script_extension }}</div>
+          <div>cwd: {{ d.host.working_directory }}</div>
+        </div>
       </div>
     </div>
 

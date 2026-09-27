@@ -4,6 +4,7 @@ from pathlib import Path
 
 from ..devices.registry import DEVICE_BRANCHES
 from ..domain.models import priority_label
+from ..host import prompt_facts as host_facts
 from ..llm import AssistantResponse, NodeDecision, OrchestratorDecision, PlanProposal
 from ..prompts.template import render
 
@@ -417,6 +418,10 @@ def _dashboard_devices(context) -> list[dict[str, object]]:
     computer_capabilities = sorted(
         definition.name for definition in definitions if definition.name not in device_tools
     )
+    # The ACTIVE branch is this machine, so it carries the resolved host facts.
+    # They are derived at request time, not read from memory, so the device
+    # stays identifiable here even after the memory has been reset.
+    host = host_facts()
     devices = []
     for branch in DEVICE_BRANCHES:
         capabilities = (
@@ -424,14 +429,15 @@ def _dashboard_devices(context) -> list[dict[str, object]]:
             if branch.name == "computer"
             else [f"device.{branch.name}"] if f"device.{branch.name}" in device_tools else []
         )
-        devices.append(
-            {
-                "name": branch.name,
-                "status": branch.status,
-                "description": branch.description,
-                "platform": branch.platform,
-                "transport": branch.transport,
-                "capabilities": capabilities,
-            }
-        )
+        entry = {
+            "name": branch.name,
+            "status": branch.status,
+            "description": branch.description,
+            "platform": branch.platform,
+            "transport": branch.transport,
+            "capabilities": capabilities,
+        }
+        if branch.name == "computer" and branch.status == "ACTIVE":
+            entry["host"] = host
+        devices.append(entry)
     return devices

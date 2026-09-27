@@ -32,6 +32,16 @@ class Settings(BaseSettings):
     collect_system_facts: bool = True
     persist_system_facts: bool = True
     persist_user_profile: bool = True
+    # Series: programmatic video generator (series/). Low resolution on purpose,
+    # the renderer is CPU bound in headless Chromium.
+    series_root: str = r"C:\projects\Assistant\series"
+    series_enabled: bool = False
+    series_width: int = 854
+    series_height: int = 480
+    series_fps: int = 24
+    series_format: str = "mp4"
+    series_quality: int = 23
+    series_ffmpeg_path: str = ""
     workspace_root: str = "."
     projects_root: str = r"C:\Assistant"
     user_name: str | None = None
