@@ -1,11 +1,35 @@
 ﻿from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field
 
+from ...domain.models import MemoryRecord
 from ..deps import get_context
 from .runtime import perform_reset
 
 router = APIRouter(prefix="/memory", tags=["memory"])
+
+
+class MemoryWrite(BaseModel):
+    kind: str = Field(default="note", min_length=1, max_length=64)
+    key: str = Field(min_length=1, max_length=200)
+    value: object = None
+    source: str = Field(default="USER", max_length=64)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
+@router.post("")
+async def create_memory(request: Request, payload: MemoryWrite) -> dict:
+    """Record a durable fact so workers can reuse it on later tasks."""
+    memory = MemoryRecord(
+        kind=payload.kind,
+        key=payload.key,
+        value=payload.value,
+        source=payload.source,
+        confidence=payload.confidence,
+    )
+    await get_context(request).service.repository.save_memory(memory)
+    return memory.model_dump(mode="json")
 
 
 @router.get("")

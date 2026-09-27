@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from ..context import ContextBuilder
 from ..devices.computer.codegraph import CodeGraphTool
 from ..domain.contracts import (
+    AcceptanceCriterion,
     ArtifactKind,
     ArtifactRef,
     NodeContract,
@@ -359,6 +360,45 @@ class TaskService:
             if path == protected or protected.is_relative_to(path):
                 return True
         return False
+
+    async def _resolve_operation_root(
+        self, operation: Operation, project: Project | None
+    ) -> Project | None:
+        """Apply the authoritative root policy for one operation.
+
+        The LLM never chooses a root. This is the single place that decides it,
+        so every execution path resolves roots identically.
+
+        ``project.create`` is the exception: it must always target the projects
+        root so a new project becomes a direct child of it, never a child of
+        whichever project the task is attached to.
+        """
+        tool, method = operation.tool, operation.method
+        if tool == "project" and method == "create":
+            operation.args["root"] = str(Path(self.projects_root).expanduser().resolve())
+            return project
+        targets_project = tool in {"project", "codegraph"} or (
+            tool == "audit" and method == "run"
+        )
+        if not targets_project:
+            return project
+        if method == "validate":
+            operation.args["root"] = (
+                project.path
+                if project
+                else operation.args.get("root", self.context_builder.workspace_root)
+            )
+            return project
+        operation.args["root"] = (
+            project.path if project else self.context_builder.workspace_root
+        )
+        if tool == "codegraph" and method == "query" and project:
+            refreshed = await self.refresh_project_codegraph(project.id)
+            project = refreshed or project
+            if project.codegraph:
+                operation.args["_persisted_graph"] = project.codegraph
+                operation.args["_graph_fresh"] = True
+        return project
 
     async def delete_project(self, project_id: str) -> bool:
         project = await self.repository.get_project(project_id)
@@ -2012,6 +2052,51 @@ class TaskService:
                 edge.to_node for edge in graph.edges if edge.from_node == current_id
             )
 
+    @staticmethod
+    def _criteria_contract(criteria: Any) -> list[AcceptanceCriterion]:
+        """Normalize orchestrator or planner criteria into contract objects.
+
+        The orchestrator emits plain strings while the planner may emit objects;
+        verification reads ``node.contract.acceptance_criteria``, so both shapes
+        must land there identically.
+        """
+        normalized: list[AcceptanceCriterion] = []
+        for index, item in enumerate(criteria or [], start=1):
+            if isinstance(item, AcceptanceCriterion):
+                normalized.append(item)
+            elif isinstance(item, dict):
+                normalized.append(
+                    AcceptanceCriterion(
+                        id=item.get("id") or f"criterion-{index}",
+                        description=item.get("description") or str(item),
+                        required=bool(item.get("required", True)),
+                    )
+                )
+            elif isinstance(item, str) and item.strip():
+                normalized.append(
+                    AcceptanceCriterion(
+                        id=f"criterion-{index}", description=item.strip()
+                    )
+                )
+        return normalized
+
+    async def _sync_root_node_criteria(self, task: Task, node: TaskNode) -> None:
+        """Mirror the task-level criteria onto the root node contract.
+
+        Root nodes are created before the orchestrator runs, so without this the
+        criteria exist only in ``task.metadata`` and verification would score an
+        empty contract.
+        """
+        criteria = self._criteria_contract(task.metadata.get("acceptance_criteria"))
+        if not criteria:
+            return
+        if [item.model_dump() for item in node.contract.acceptance_criteria] == [
+            item.model_dump() for item in criteria
+        ]:
+            return
+        node.contract.acceptance_criteria = criteria
+        await self.repository.save_node(node)
+
     async def _execute_agent_turn(
         self, task: Task, time_remaining: float | None = None
     ) -> bool:
@@ -2167,10 +2252,7 @@ class TaskService:
         if not await self._consume_budget(task, "tool_calls", task.budget.max_tool_calls):
             return False
         project = await self.repository.get_project(task.project_id) if task.project_id else None
-        if operation.tool == "project" and operation.method == "create":
-            operation.args["root"] = str(Path(self.projects_root).expanduser().resolve())
-        elif operation.tool in {"project", "codegraph"} and project:
-            operation.args["root"] = project.path
+        await self._resolve_operation_root(operation, project)
         node = TaskNode(
             task_id=task.id,
             type=NodeType.OPERATION,
@@ -2466,6 +2548,16 @@ class TaskService:
         task.metadata["orchestration_stage"] = "WORK"
         task.runtime.workflow = "agent"
         task.status = TaskStatus.READY
+        root_node = next(
+            (
+                node
+                for node in await self.repository.list_nodes(task.id)
+                if node.type is NodeType.TASK
+            ),
+            None,
+        )
+        if root_node is not None:
+            await self._sync_root_node_criteria(task, root_node)
         await self.repository.save_task(task)
         return True
 
@@ -3305,22 +3397,7 @@ class TaskService:
             if acceptance:
                 operation.metadata.setdefault("expected", acceptance)
             project = await self.repository.get_project(task.project_id) if task.project_id else None
-            if operation.tool == "project" and operation.method == "create":
-                operation.args["root"] = str(Path(self.projects_root).expanduser().resolve())
-            elif operation.tool == "audit" and operation.method == "run":
-                operation.args["root"] = project.path if project else self.context_builder.workspace_root
-            elif operation.tool == "project" and operation.method in {"analyze", "read", "edit"}:
-                operation.args["root"] = project.path if project else self.context_builder.workspace_root
-            elif operation.tool == "project" and operation.method == "validate":
-                operation.args["root"] = project.path if project else operation.args.get("root", self.context_builder.workspace_root)
-            elif operation.tool == "codegraph" and operation.method in {"analyze", "audit", "build", "system", "query"}:
-                operation.args["root"] = project.path if project else self.context_builder.workspace_root
-                if operation.method == "query" and project:
-                    refreshed = await self.refresh_project_codegraph(project.id)
-                    project = refreshed or project
-                    if project.codegraph:
-                        operation.args["_persisted_graph"] = project.codegraph
-                        operation.args["_graph_fresh"] = True
+            project = await self._resolve_operation_root(operation, project)
             budget_key = None
             budget_limit = None
             if operation.tool == "codegraph" and operation.method == "query":

@@ -5,7 +5,7 @@ import { api } from '@/api/client'
 import StatusBadge from '@/components/StatusBadge.vue'
 import WorkflowGraph from '@/components/WorkflowGraph.vue'
 import { useSystemStore } from '@/stores/system'
-import { date, isActive } from '@/utils/format'
+import { date, isActive, REFRESH_INTERVAL_MS } from '@/utils/format'
 
 const route = useRoute()
 const router = useRouter()
@@ -28,9 +28,9 @@ async function load(forceChildren = false) {
 }
 
 // Subagentes (tareas hijas) con su propio grafo, como en el dashboard legacy.
-// Se refrescan como mucho cada 15s para no multiplicar requests en el polling.
+// Se refrescan como mucho una vez por minuto para no multiplicar requests en el polling.
 async function loadChildren(force = false) {
-  if (!force && Date.now() - childrenLoadedAt < 15000) return
+  if (!force && Date.now() - childrenLoadedAt < REFRESH_INTERVAL_MS) return
   try {
     const data = await api.listTasks(200)
     const byParent = new Map()
@@ -58,7 +58,7 @@ async function loadChildren(force = false) {
   } catch (error) { /* el resumen de hijos es best-effort */ }
 }
 
-function startPoll() { if (!timer) timer = window.setInterval(load, 2500) }
+function startPoll() { if (!timer) timer = window.setInterval(load, REFRESH_INTERVAL_MS) }
 function stopPoll() { if (timer) { window.clearInterval(timer); timer = null } }
 
 function openTask(id) { router.push({ name: 'task-detail', params: { id } }) }

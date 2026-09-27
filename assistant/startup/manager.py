@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import platform
 import sys
 from datetime import UTC, datetime
@@ -126,7 +127,31 @@ class StartupManager:
                 await repository.update_project(assistant)
 
     @staticmethod
-    def _system_facts() -> dict[str, str]:
+    def _default_shell() -> tuple[str, str, str]:
+        """Detect the command interpreter the host actually uses.
+
+        Generated scripts and one-off commands must match the host interpreter;
+        emitting a POSIX ``.sh`` on Windows produces a file the host cannot run.
+        """
+        if platform.system() != "Windows":
+            return "posix", "sh", ""
+        root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        for name in ("pwsh.exe", "powershell.exe"):
+            if (root / "System32" / "WindowsPowerShell" / "v1.0" / name).is_file() or (
+                root / name
+            ).is_file():
+                shell = "powershell" if name == "powershell.exe" else "pwsh"
+                return "windows", shell, (
+                    "Write launch scripts as .ps1 and run them with pwsh -File."
+                    if shell == "pwsh"
+                    else "Write launch scripts as .ps1 and run them with powershell -File."
+                )
+        return "windows", "powershell", (
+            "Write launch scripts as .ps1 and run them with powershell -File."
+        )
+
+    @classmethod
+    def _system_facts(cls) -> dict[str, str]:
         """Return stable technical facts; never inspect personal files or secrets."""
         windows_version = platform.win32_ver()[0] if platform.system() == "Windows" else ""
         build_number = platform.win32_ver()[2] if platform.system() == "Windows" else ""
@@ -137,6 +162,7 @@ class StartupManager:
             if platform.system() == "Windows"
             else ""
         )
+        shell_family, shell_name, shell_hint = cls._default_shell()
         return {
             "os": platform.system(),
             "os_release": platform.release(),
@@ -149,6 +175,10 @@ class StartupManager:
             "hostname": platform.node(),
             "cpu_count": str(__import__("os").cpu_count() or 0),
             "working_directory": str(Path.cwd()),
+            "shell_family": shell_family,
+            "default_shell": shell_name,
+            "script_extension": ".ps1" if shell_family == "windows" else ".sh",
+            "script_interpreter": shell_hint or "Write launch scripts as .sh and run them with sh.",
         }
 
     def _user_profile(self) -> UserProfile | None:

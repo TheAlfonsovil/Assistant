@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { api } from '@/api/client'
+import { REFRESH_INTERVAL_MS } from '@/utils/format'
 
 export const useSystemStore = defineStore('system', {
   state: () => ({
@@ -34,7 +35,7 @@ export const useSystemStore = defineStore('system', {
         this.error = error.message
       }
     },
-    start(interval = 5000) {
+    start(interval = REFRESH_INTERVAL_MS) {
       this.refresh()
       if (this._timer) return
       this._timer = window.setInterval(() => this.refresh(), interval)

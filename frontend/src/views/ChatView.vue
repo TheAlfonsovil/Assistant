@@ -3,7 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, streamChat } from '@/api/client'
 import { useSystemStore } from '@/stores/system'
-import { date, isActive, shortId } from '@/utils/format'
+import { date, isActive, shortId, REFRESH_INTERVAL_MS } from '@/utils/format'
 
 const system = useSystemStore()
 const router = useRouter()
@@ -189,7 +189,7 @@ onMounted(() => {
   loadHistory()
   poller = window.setInterval(() => {
     if (hasOpenTurn.value) loadHistory()
-  }, 6000)
+  }, REFRESH_INTERVAL_MS)
 })
 onUnmounted(() => {
   if (poller) window.clearInterval(poller)

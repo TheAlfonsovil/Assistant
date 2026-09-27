@@ -20,6 +20,9 @@ IMPLEMENTATION GUIDANCE
 	Tests are not executed unless `run_tests` is explicitly true.
 - Never repeat an identical validation operation when its result already shows
 	that a command failed. Change the command only when new evidence justifies it.
+- Match the host when you write scripts or shell commands. Use the interpreter
+	reported in LONG-TERM MEMORY, and when a script fails because of a missing
+	file, inspect the cause and supply it before retrying.
 - Complete only when the requested outcome is supported by operation results
 	and validation evidence. Report changed files and any unverified criteria.
 
@@ -33,6 +36,8 @@ EXTRA CONTEXT
 {{extra_context}}
 ACCEPTANCE CRITERIA
 {{acceptance_criteria}}
+LONG-TERM MEMORY
+{{long_term_memory}}
 TASK
 {{task}}
 WORKING MEMORY

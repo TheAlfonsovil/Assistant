@@ -9,6 +9,9 @@ export const ACTIVE_STATUSES = [
 
 export const TERMINAL_STATUSES = ['SUCCEEDED', 'FAILED', 'CANCELLED', 'BLOCKED']
 
+// Cada vista refresca como mucho una vez por minuto contra la API local.
+export const REFRESH_INTERVAL_MS = 60000
+
 export function isActive(status) {
   return ACTIVE_STATUSES.includes(status)
 }

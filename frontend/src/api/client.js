@@ -50,6 +50,7 @@ export const api = {
   refreshCodegraph: (id) => request(`/projects/${id}/codegraph/refresh`, { method: 'POST' }),
   // memory
   listMemory: () => request('/memory'),
+  createMemory: (payload) => request('/memory', { method: 'POST', body: payload }),
   memorySummary: () => request('/memory/summary'),
   exportMemory: () => request('/memory/export'),
   redactMemory: (id) => request(`/memory/${id}/redact`, { method: 'POST' }),

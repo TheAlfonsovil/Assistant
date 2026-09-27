@@ -103,7 +103,20 @@ code, pre, .mono { font-family: var(--mono); }
 .table tbody tr { cursor: pointer; transition: background 0.12s; }
 .table tbody tr:hover { background: var(--bg-elev); }
 .table tbody tr.selected { background: rgba(56,189,248,0.1); }
+.table-scroll { padding: 0; overflow: hidden; }
 .truncate { max-width: 380px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.right { text-align: right; }
+/* Event stream: fixed columns keep the payload size column stable and stop the
+   expanded detail from widening the table beyond the viewport. */
+.events-table { table-layout: fixed; width: 100%; }
+.events-table th:first-child, .events-table td:first-child { width: 150px; }
+.events-table th:nth-child(2), .events-table td:nth-child(2) { width: 190px; }
+.events-table th:nth-child(3), .events-table td:nth-child(3) { width: 90px; }
+.events-table th:nth-child(4), .events-table td:nth-child(4) { width: 90px; }
+.events-table th:last-child, .events-table td:last-child { width: 64px; }
+.events-table td { overflow: hidden; text-overflow: ellipsis; }
+/* Long JSON wraps instead of scrolling off to the right. */
+.event-detail { max-height: 420px; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* Buttons & inputs */
 .btn { display: inline-flex; align-items: center; gap: 7px; padding: 8px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg-elev); color: var(--text); font-weight: 600; font-size: 13px; cursor: pointer; transition: transform 0.08s, border-color 0.15s, background 0.15s; }

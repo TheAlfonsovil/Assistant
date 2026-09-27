@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '@/api/client'
 import { useSystemStore } from '@/stores/system'
-import { date, shortId, prettyJson } from '@/utils/format'
+import { date, shortId, prettyJson, REFRESH_INTERVAL_MS } from '@/utils/format'
 
 const system = useSystemStore()
 const data = ref(null)
@@ -12,6 +12,16 @@ let timer = null
 const runtime = computed(() => data.value?.runtime ?? {})
 const events = computed(() => data.value?.events ?? [])
 const idle = computed(() => runtime.value.idle ?? {})
+
+function payloadSize(event) {
+  const payload = event?.payload
+  if (payload == null) return 0
+  return typeof payload === 'string' ? payload.length : JSON.stringify(payload).length
+}
+
+function charLabel(count) {
+  return count > 999 ? `${(count / 1000).toFixed(count > 9999 ? 0 : 1)}k` : String(count)
+}
 
 async function load() {
   try { data.value = await api.observability(200) }
@@ -46,7 +56,7 @@ async function reset() {
   try { const r = await api.resetRuntime(); system.notify(`Runtime reiniciado (${r.total} registros)`, 'ok'); await load() }
   catch (e) { system.notify(e.message, 'error') }
 }
-onMounted(() => { load(); timer = window.setInterval(load, 6000) })
+onMounted(() => { load(); timer = window.setInterval(load, REFRESH_INTERVAL_MS) })
 onUnmounted(() => window.clearInterval(timer))
 </script>
 
@@ -75,9 +85,9 @@ onUnmounted(() => window.clearInterval(timer))
     </div>
   </div>
 
-  <div class="card" style="padding:0;overflow:hidden">
-    <table class="table">
-      <thead><tr><th>Tiempo</th><th>Tipo</th><th>Tarea</th><th>Nodo</th></tr></thead>
+  <div class="card table-scroll">
+    <table class="table events-table">
+      <thead><tr><th>Tiempo</th><th>Tipo</th><th>Tarea</th><th>Nodo</th><th class="right">Chars</th></tr></thead>
       <tbody>
         <template v-for="e in events" :key="e.id">
           <tr :class="{ selected: isExpanded(e) }" @click="toggleEvent(e)">
@@ -88,9 +98,12 @@ onUnmounted(() => window.clearInterval(timer))
               <span v-if="e.node_id" class="mono node-link" @click.stop="toggleNode(e)">{{ shortId(e.node_id) }}</span>
               <span v-else class="muted">—</span>
             </td>
+            <td class="right mono muted" :title="`${payloadSize(e)} caracteres`">
+              {{ charLabel(payloadSize(e)) }}
+            </td>
           </tr>
           <tr v-if="isExpanded(e)">
-            <td colspan="4" style="background:var(--bg-elev)">
+            <td colspan="5" style="background:var(--bg-elev)">
               <div v-if="expanded.loading" class="empty">Cargando detalle…</div>
               <template v-else-if="expanded.kind === 'node'">
                 <div class="row" style="margin-bottom:8px">
@@ -100,7 +113,7 @@ onUnmounted(() => window.clearInterval(timer))
                   <span class="mono muted" style="font-size:12px">tarea {{ shortId(expanded.data.task_id) }}</span>
                 </div>
                 <p class="muted" style="margin:0 0 8px">{{ expanded.data.description }}</p>
-                <pre class="code" style="max-height:320px">{{ prettyJson(expanded.data) }}</pre>
+                <pre class="code event-detail">{{ prettyJson(expanded.data) }}</pre>
               </template>
               <template v-else>
                 <div class="row" style="margin-bottom:8px">
@@ -110,7 +123,7 @@ onUnmounted(() => window.clearInterval(timer))
                   <span v-if="expanded.data.node_id" class="mono muted" style="font-size:12px">nodo {{ shortId(expanded.data.node_id) }}</span>
                   <span class="muted" style="font-size:12px">{{ date(expanded.data.created_at) }}</span>
                 </div>
-                <pre class="code" style="max-height:320px">{{ prettyJson(expanded.data) }}</pre>
+                <pre class="code event-detail">{{ prettyJson(expanded.data) }}</pre>
               </template>
             </td>
           </tr>

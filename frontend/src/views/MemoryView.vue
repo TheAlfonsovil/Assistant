@@ -2,18 +2,32 @@
 import { onMounted, ref } from 'vue'
 import { api } from '@/api/client'
 import { useSystemStore } from '@/stores/system'
-import { date, prettyJson } from '@/utils/format'
+import { prettyJson } from '@/utils/format'
 
 const system = useSystemStore()
 const items = ref([])
 const summary = ref(null)
 const open = ref(null)
+const draft = ref({ kind: 'note', key: '', value: '' })
 
 async function load() {
   try {
     const [memories, tables] = await Promise.all([api.listMemory(), api.memorySummary()])
     items.value = memories
     summary.value = tables
+  } catch (error) { system.notify(error.message, 'error') }
+}
+async function add() {
+  if (!draft.value.key.trim()) { system.notify('La clave es obligatoria', 'error'); return }
+  try {
+    await api.createMemory({
+      kind: draft.value.kind.trim() || 'note',
+      key: draft.value.key.trim(),
+      value: draft.value.value,
+    })
+    system.notify('Memoria guardada', 'ok')
+    draft.value = { kind: 'note', key: '', value: '' }
+    await load()
   } catch (error) { system.notify(error.message, 'error') }
 }
 async function redact(m) { try { await api.redactMemory(m.id); system.notify('Memoria redactada', 'ok'); await load() } catch (e) { system.notify(e.message, 'error') } }
@@ -48,6 +62,15 @@ onMounted(load)
       <div v-for="t in summary.tables" :key="t.name" class="metric">
         <small class="mono">{{ t.name }}</small><b>{{ t.rows }}</b>
       </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:16px">
+    <div class="row" style="margin-bottom:10px">
+      <input v-model="draft.key" class="input" placeholder="Clave (p. ej. script_interpreter)">
+      <input v-model="draft.kind" class="input" style="max-width:140px" placeholder="tipo">
+      <input v-model="draft.value" class="input" placeholder="Valor">
+      <button class="btn" @click="add">Guardar</button>
     </div>
   </div>
 

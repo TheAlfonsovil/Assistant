@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api/client'
 import { useSystemStore } from '@/stores/system'
@@ -13,7 +13,15 @@ const loading = ref(false)
 const filter = ref('')
 const showForm = ref(false)
 const goal = ref('')
-const projectId = ref('')
+const target = ref('device:computer')
+
+const targets = computed(() => [
+  { value: 'device:computer', label: 'Ordenador' },
+  { value: '', label: 'Sin proyecto' },
+  ...system.projects
+    .filter((p) => p.enabled)
+    .map((p) => ({ value: p.id, label: p.is_default ? `${p.name} · default` : p.name })),
+])
 
 async function load() {
   loading.value = true
@@ -29,8 +37,15 @@ async function load() {
 
 async function create() {
   if (!goal.value.trim()) return
+  const payload = { goal: goal.value.trim() }
+  if (target.value === 'device:computer') {
+    payload.target_type = 'device'
+    payload.target_id = 'computer'
+  } else if (target.value) {
+    payload.project_id = target.value
+  }
   try {
-    const res = await api.createTask({ goal: goal.value.trim(), project_id: projectId.value || null })
+    const res = await api.createTask(payload)
     system.notify(`Tarea ${res.id.slice(0, 8)} creada`, 'ok')
     goal.value = ''
     await load()
@@ -58,9 +73,8 @@ onMounted(load)
     <h2>Crear tarea persistente</h2>
     <div class="row">
       <input v-model="goal" class="input grow" placeholder="Objetivo de la tarea…" @keyup.enter="create" />
-      <select v-model="projectId" class="select" style="max-width:220px">
-        <option value="">Sin proyecto</option>
-        <option v-for="p in system.projects" :key="p.id" :value="p.id">{{ p.name }}</option>
+      <select v-model="target" class="select" style="max-width:220px">
+        <option v-for="t in targets" :key="t.value" :value="t.value">{{ t.label }}</option>
       </select>
       <button class="btn primary" @click="create">Lanzar</button>
     </div>

@@ -974,6 +974,268 @@ async def test_delete_project_still_removes_a_sibling_project(tmp_path):
     await database.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool,method",
+    [
+        ("project", "create"),
+        ("project", "analyze"),
+        ("project", "read"),
+        ("project", "edit"),
+        ("project", "validate"),
+        ("codegraph", "build"),
+        ("codegraph", "query"),
+        ("audit", "run"),
+        ("shell", "exec"),
+        ("filesystem", "list"),
+    ],
+)
+async def test_resolve_operation_root_ignores_the_llm_supplied_root(
+    tmp_path, tool, method
+):
+    """The LLM never picks a root; the runtime does, and it is the same everywhere.
+
+    ``project.create`` targets the projects root even when the task belongs to
+    another project, so a new project is never nested inside the workspace.
+    """
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'root-policy.db'}")
+    await database.create_all()
+    projects_root = tmp_path / "projects"
+    workspace = projects_root / "Assistant"
+    attached = projects_root / "attached"
+    workspace.mkdir(parents=True)
+    attached.mkdir()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            ToolRegistry(),
+            workspace_root=str(workspace),
+            projects_root=str(projects_root),
+        )
+        project = await service.create_project(
+            Project(name="attached", path=str(attached))
+        )
+        operation = Operation(
+            tool=tool,
+            method=method,
+            args={"root": "C:/somewhere/else", "path": "C:/somewhere/else"},
+        )
+
+        await service._resolve_operation_root(operation, project)
+
+        if tool == "project" and method == "create":
+            assert Path(operation.args["root"]) == projects_root.resolve()
+        elif tool in {"project", "codegraph"} or (tool == "audit" and method == "run"):
+            assert operation.args["root"] == project.path
+        else:
+            assert operation.args["root"] == "C:/somewhere/else"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_operation_root_falls_back_to_workspace_without_a_project(
+    tmp_path,
+):
+    projects_root = tmp_path / "projects"
+    workspace = projects_root / "Assistant"
+    workspace.mkdir(parents=True)
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'root-fallback.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            ToolRegistry(),
+            workspace_root=str(workspace),
+            projects_root=str(projects_root),
+        )
+        operation = Operation(tool="project", method="analyze", args={"root": "x"})
+
+        await service._resolve_operation_root(operation, None)
+
+        assert operation.args["root"] == str(workspace)
+    await database.close()
+
+
+async def test_agent_turn_create_does_not_nest_inside_the_attached_project(tmp_path):
+    """The agent turn must not overwrite the root of a create operation.
+
+    Regression: the agent path overwrote ``root`` with the attached project's
+    path, which nested new projects inside the workspace instead of creating
+    them as siblings under the projects root.
+    """
+    class CreateProjectAgent(MockLLMProvider):
+        async def orchestrate(self, context):
+            return OrchestratorDecision(
+                target_type="device",
+                target_id="computer",
+                worker="CODE_WORKER",
+                template="implementation",
+            )
+
+        async def agent_decide(self, context):
+            if context["last_observation"] is None:
+                return AgentDecision(
+                    decision_type="EXECUTE",
+                    reason="Create the requested project.",
+                    operation=Operation(
+                        tool="project",
+                        method="create",
+                        args={"root": "new_app", "name": "new_app", "files": []},
+                    ),
+                )
+            return AgentDecision(decision_type="COMPLETE", reason="Project created.")
+
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    attached = projects_root / "attached"
+    attached.mkdir()
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'agent-root.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            CreateProjectAgent(),
+            build_tool_registry(),
+            workspace_root=str(projects_root / "Assistant"),
+            projects_root=str(projects_root),
+        )
+        task = await service.create_task(TaskRequest(goal="create new_app"))
+        project = await service.create_project(
+            Project(name="attached", path=str(attached))
+        )
+        task.project_id = project.id
+        await service.repository.save_task(task)
+
+        result = await service.run_task(task.id)
+
+        assert result.status is TaskStatus.SUCCEEDED
+        created = await service.get_project(result.project_id)
+        assert Path(created.path) == (projects_root / "new_app").resolve()
+        assert not (attached / "new_app").exists()
+    await database.close()
+
+
+def test_criteria_contract_normalizes_every_shape():
+    strings = TaskService._criteria_contract(["a", "b"])
+    dicts = TaskService._criteria_contract(
+        [{"id": "criterion-1", "description": "a"}, {"description": "b"}]
+    )
+
+    assert [item.description for item in strings] == ["a", "b"]
+    assert [item.description for item in dicts] == ["a", "b"]
+    assert all(item.required for item in strings)
+    assert [item.id for item in strings] == ["criterion-1", "criterion-2"]
+    assert TaskService._criteria_contract(None) == []
+    assert TaskService._criteria_contract(["", "  "]) == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_criteria_reach_the_root_node_contract(tmp_path):
+    """Verification reads node.contract.acceptance_criteria.
+
+    The root node is created before the orchestrator runs, so the criteria it
+    produces must be mirrored onto the contract or verification scores an
+    empty contract and accepts anything.
+    """
+    class RouteAgent(MockLLMProvider):
+        async def orchestrate(self, context):
+            return OrchestratorDecision(
+                stage="ROUTE",
+                intent="create the project",
+                target_type="device",
+                target_id="computer",
+                worker="CODE_WORKER",
+                template="implementation",
+                acceptance_criteria=[
+                    "Project created",
+                    "Docker script added",
+                ],
+            )
+
+        async def agent_decide(self, context):
+            return AgentDecision(decision_type="COMPLETE", reason="done")
+
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'criteria-sync.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            RouteAgent(),
+            build_tool_registry(),
+            workspace_root=str(projects_root / "Assistant"),
+            projects_root=str(projects_root),
+        )
+        task = await service.create_task(TaskRequest(goal="create the project"))
+
+        await service.run_task(task.id)
+
+        root = next(
+            node
+            for node in await service.repository.list_nodes(task.id)
+            if node.type is NodeType.TASK
+        )
+        assert [item.description for item in root.contract.acceptance_criteria] == [
+            "Project created",
+            "Docker script added",
+        ]
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_saved_memory_is_listed_for_the_dashboard(tmp_path):
+    """The memory view reads GET /memory, which must return written records."""
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'memory-write.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        repository = TaskRepository(session)
+        await repository.save_memory(
+            MemoryRecord(kind="note", key="script_interpreter", value="pwsh -File")
+        )
+
+        listed = await repository.list_memory()
+
+        assert [item.key for item in listed] == ["script_interpreter"]
+        assert listed[0].value == "pwsh -File"
+    await database.close()
+
+
+@pytest.mark.asyncio
+async def test_task_requested_for_a_device_is_not_forced_to_a_project(tmp_path):
+    """A device-targeted task keeps its target instead of binding a project.
+
+    The task form lets the user pick the computer rather than a project, so
+    creating a project here would attach unrelated work to the default project.
+    """
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'device-target.db'}")
+    projects_root = tmp_path / "projects"
+    projects_root.mkdir()
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session,
+            MockLLMProvider(),
+            build_tool_registry(),
+            workspace_root=str(projects_root / "Assistant"),
+            projects_root=str(projects_root),
+        )
+        (projects_root / "default").mkdir()
+        await service.create_project(
+            Project(name="default", path=str(projects_root / "default"), is_default=True)
+        )
+
+        task = await service.create_task(
+            TaskRequest(goal="crear un proyecto nuevo", target_type="device", target_id="computer")
+        )
+
+        assert task.runtime.target == {"type": "device", "id": "computer"}
+        assert task.project_id is None
+    await database.close()
+
+
 def test_empty_plan_fallback_preserves_codegraph_intent():
     proposal = TaskService._fallback_plan(Task(goal="actualiza el codegraph y audita el proyecto"))
 
@@ -1468,6 +1730,38 @@ async def test_startup_loads_memory_and_syncs_system_facts_once(tmp_path):
     assert second.first_initialization is False
     assert "python_version" in second.system_facts
     assert len(second.loaded_memories) == len(second.system_facts)
+    await database.close()
+
+
+def test_system_facts_report_the_host_script_interpreter():
+    """Workers must know which interpreter the host runs.
+
+    A generated ``.sh`` launch script is unrunnable on Windows, so the host
+    interpreter and script extension are part of the persisted system facts.
+    """
+    facts = StartupManager._system_facts()
+    family = facts["shell_family"]
+    extension = facts["script_extension"]
+    hint = facts["script_interpreter"]
+
+    assert family in {"windows", "posix"}
+    assert extension in {".ps1", ".sh"}
+    assert extension in hint
+    assert facts["default_shell"] in {"pwsh", "powershell", "sh"}
+
+
+@pytest.mark.asyncio
+async def test_startup_persists_shell_facts_into_memory(tmp_path):
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'shell-facts.db'}")
+    settings = Settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'shell-facts.db'}",
+        persist_user_profile=False,
+    )
+
+    report = await StartupManager(database, settings, MockLLMProvider()).initialize()
+
+    keys = {memory.key for memory in report.loaded_memories}
+    assert {"shell_family", "default_shell", "script_extension"} <= keys
     await database.close()
 
 
