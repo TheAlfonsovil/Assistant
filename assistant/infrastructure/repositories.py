@@ -74,6 +74,7 @@ def row_to_task(row: TaskRow) -> Task:
                     "failure_reason",
                 )
             },
+            "title": row.title or "",
             "status": row.status,
             "metadata": row.extensions_json or {},
             "budget": row.budget_json or {},
@@ -149,6 +150,14 @@ class TaskRepository:
 
     async def list_tasks(self) -> list[Task]:
         result = await self.session.execute(select(TaskRow).order_by(TaskRow.created_at.desc()))
+        return [row_to_task(row) for row in result.scalars()]
+
+    async def list_tasks_by_status(self, statuses: set[TaskStatus]) -> list[Task]:
+        result = await self.session.execute(
+            select(TaskRow)
+            .where(TaskRow.status.in_([status.value for status in statuses]))
+            .order_by(TaskRow.created_at.desc())
+        )
         return [row_to_task(row) for row in result.scalars()]
 
     async def list_dashboard_tasks(

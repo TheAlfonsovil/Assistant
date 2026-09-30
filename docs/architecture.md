@@ -52,7 +52,7 @@ assistant/
 |-- runtime.py                persistent scheduler loop
 |-- domain/                   models and graph rules
 |-- infrastructure/           SQLite and repositories
-|-- llm.py                    provider contract and Ollama/mock providers
+|-- llm.py                    provider contract and DeepSeek/mock providers
 `-- api/                      FastAPI entry points using startup.bootstrap
 |   |-- __init__.py            stable app export
 |   `-- application.py         HTTP routes and lifecycle

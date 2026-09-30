@@ -46,8 +46,13 @@ DEVICE_BRANCHES = (
 class DeviceRegistry:
     """Registers one branch at a time so new devices stay isolated."""
 
-    def __init__(self, branches: tuple[DeviceBranch, ...] = DEVICE_BRANCHES):
+    def __init__(
+        self,
+        branches: tuple[DeviceBranch, ...] = DEVICE_BRANCHES,
+        enable_input: bool = False,
+    ):
         self.branches = branches
+        self.enable_input = enable_input
 
     def register(self, registry: ToolRegistry) -> None:
         from assistant.devices.computer.actions import register_actions
@@ -55,14 +60,24 @@ class DeviceRegistry:
         registry.register(NotificationTool())
         for branch in self.branches:
             if branch.name == "computer" and branch.status == "ACTIVE":
-                register_actions(registry)
+                register_actions(registry, enable_input=self.enable_input)
             elif branch.status == "MOCK":
                 registry.register(MockDeviceTool(branch))
 
 
-def build_tool_registry() -> ToolRegistry:
-    registry = ToolRegistry([])
-    DeviceRegistry().register(registry)
+def build_tool_registry(
+    policy=None, enable_input: bool = False, repository=None, rate_limit=None
+) -> ToolRegistry:
+    registry = ToolRegistry([], policy=policy, rate_limit=rate_limit)
+    DeviceRegistry(enable_input=enable_input).register(registry)
+    if repository is not None:
+        # Task-scoped capabilities need the ledger, so they are only registered
+        # when a repository exists (the API and CLI always provide one).
+        from assistant.capabilities.artifacts import ArtifactTool
+        from assistant.capabilities.memory import MemoryTool
+
+        registry.register(MemoryTool(repository))
+        registry.register(ArtifactTool(repository))
     return registry
 
 

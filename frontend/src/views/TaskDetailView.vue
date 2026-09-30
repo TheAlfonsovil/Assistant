@@ -27,7 +27,7 @@ async function load(forceChildren = false) {
   }
 }
 
-// Subagentes (tareas hijas) con su propio grafo, como en el dashboard legacy.
+// Subagentes (tareas hijas) con su propio grafo, como en el resto del panel.
 // Se refrescan como mucho una vez por minuto para no multiplicar requests en el polling.
 async function loadChildren(force = false) {
   if (!force && Date.now() - childrenLoadedAt < REFRESH_INTERVAL_MS) return

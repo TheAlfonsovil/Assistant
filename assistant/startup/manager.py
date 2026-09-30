@@ -64,7 +64,7 @@ class StartupManager:
         report = StartupReport(
             status=ReadinessStatus.FAILED,
             assistant_version=__version__,
-            llm_model=self.settings.ollama_model,
+            llm_model=self.settings.deepseek_model,
         )
         try:
             await self.database.create_all()
@@ -77,7 +77,7 @@ class StartupManager:
 
         try:
             report.llm_ready = await self.llm.check_ready()
-            report.checks.append("Ollama and configured model ready" if report.llm_ready else "Ollama not ready")
+            report.checks.append("DeepSeek and configured model ready" if report.llm_ready else "DeepSeek not ready")
         except (HTTPError, OSError, ValueError) as error:
             report.errors.append(f"llm: {error}")
 

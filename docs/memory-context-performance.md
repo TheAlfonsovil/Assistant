@@ -90,7 +90,7 @@ requires them.
 
 ### Prefill and KV-cache reality
 
-Ollama's current integration uses independent non-streaming
+The earlier Ollama integration used independent non-streaming
 `POST /api/generate` calls. The application does not receive a stable KV-cache
 handle and cannot explicitly attach a previous KV state to the next request.
 Therefore:
@@ -202,7 +202,7 @@ The target policy is:
 ## Non-goals
 
 - No production authentication or distributed worker coordination.
-- No claim of physical KV reuse through the current Ollama API.
+- No claim of physical KV reuse through the earlier Ollama API.
 - No concurrent task execution; the queue remains sequential.
 - No automatic deletion of `halo.db` or user-generated files.
 - No cross-platform command emulation for Windows projects.

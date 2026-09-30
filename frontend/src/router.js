@@ -9,7 +9,6 @@ const routes = [
   { path: '/resources', name: 'resources', component: () => import('@/views/ResourcesView.vue'), meta: { title: 'Recursos conectados' } },
   { path: '/projects', name: 'projects', component: () => import('@/views/ProjectsView.vue'), meta: { title: 'Proyectos' } },
   { path: '/memory', name: 'memory', component: () => import('@/views/MemoryView.vue'), meta: { title: 'Memoria' } },
-  { path: '/series', name: 'series', component: () => import('@/views/SeriesView.vue'), meta: { title: 'Series' } },
   { path: '/chat', name: 'chat', component: () => import('@/views/ChatView.vue'), meta: { title: 'Chat rápido' } },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]

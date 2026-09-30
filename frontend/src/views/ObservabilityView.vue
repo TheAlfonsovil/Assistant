@@ -12,6 +12,7 @@ let timer = null
 const runtime = computed(() => data.value?.runtime ?? {})
 const events = computed(() => data.value?.events ?? [])
 const idle = computed(() => runtime.value.idle ?? {})
+const offpeak = computed(() => runtime.value.offpeak ?? {})
 
 function payloadSize(event) {
   const payload = event?.payload
@@ -51,6 +52,22 @@ async function toggleIdle() {
   try { const r = await api.setIdle(!idle.value.enabled); system.notify(r.enabled ? 'Idle activado' : 'Idle detenido', 'ok'); await load() }
   catch (e) { system.notify(e.message, 'error') }
 }
+async function toggleOffPeak() {
+  try {
+    const r = await api.setOffPeak(!offpeak.value.enabled)
+    system.notify(
+      r.enabled ? 'Ahorro de consumo activado: la cola se pausa en horas punta' : 'Ahorro de consumo desactivado',
+      'ok',
+    )
+    await load()
+  } catch (e) { system.notify(e.message, 'error') }
+}
+function offpeakHint() {
+  if (!offpeak.value.configured) return 'no configurado'
+  if (!offpeak.value.enabled) return 'desactivado'
+  if (offpeak.value.state === 'PAUSED') return `en pausa · ${Math.round((offpeak.value.seconds_remaining || 0) / 60)} min restantes`
+  return `activo · próxima ventana ${date(offpeak.value.next_change_at)}`
+}
 async function reset() {
   if (!confirm('Esto borra todas las tareas, nodos, eventos y memoria. ¿Continuar?')) return
   try { const r = await api.resetRuntime(); system.notify(`Runtime reiniciado (${r.total} registros)`, 'ok'); await load() }
@@ -63,6 +80,9 @@ onUnmounted(() => window.clearInterval(timer))
 <template>
   <div class="row" style="margin-bottom:14px">
     <button class="btn" @click="toggleIdle">{{ idle.enabled ? 'Detener idle' : 'Activar idle' }}</button>
+    <button class="btn" @click="toggleOffPeak">
+      {{ offpeak.enabled ? 'Desactivar ahorro' : 'Activar ahorro de consumo' }}
+    </button>
     <span class="grow" />
     <button class="btn danger" @click="reset">Reiniciar runtime</button>
   </div>
@@ -71,6 +91,8 @@ onUnmounted(() => window.clearInterval(timer))
     <div class="card"><h2>Readiness</h2>
       <div class="metric"><small>LLM</small><b>{{ runtime.readiness ? 'Listo' : '—' }}</b></div>
       <div class="metric"><small>Idle activo</small><b>{{ idle.enabled ? 'Sí' : 'No' }}</b></div>
+      <div class="metric"><small>Ahorro de consumo</small><b>{{ offpeakHint() }}</b></div>
+      <div class="metric"><small>Horas punta (UTC)</small><b>{{ (offpeak.peak_windows_utc || []).join(' · ') || '—' }}</b></div>
       <div class="metric"><small>Intervalo</small><b>{{ idle.interval_seconds ?? '—' }}s</b></div>
     </div>
     <div class="card"><h2>Mantenimiento</h2>

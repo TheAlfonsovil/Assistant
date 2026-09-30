@@ -26,6 +26,7 @@ export const api = {
   getNode: (taskId, nodeId) => request(`/tasks/${taskId}/nodes/${nodeId}`),
   resources: () => request('/resources'),
   metrics: (limit = 500) => request(`/metrics?limit=${limit}`),
+  metricsSeries: (hours = 24) => request(`/metrics/series?hours=${hours}`),
   // tasks
   listTasks: (limit = 100, status) =>
     request(`/tasks?limit=${limit}${status ? `&status=${status}` : ''}`),
@@ -56,23 +57,11 @@ export const api = {
   redactMemory: (id) => request(`/memory/${id}/redact`, { method: 'POST' }),
   deleteMemory: (id) => request(`/memory/${id}`, { method: 'DELETE' }),
   purgeExpired: () => request('/memory/purge-expired', { method: 'POST' }),
-  // series
-  seriesStatus: () => request('/series/status'),
-  listCharacters: () => request('/series/characters'),
-  createCharacter: (payload) => request('/series/characters', { method: 'POST', body: payload }),
-  deleteCharacter: (id) => request(`/series/characters/${id}`, { method: 'DELETE' }),
-  listScenes: () => request('/series/scenes'),
-  createScene: (payload) => request('/series/scenes', { method: 'POST', body: payload }),
-  getScene: (id) => request(`/series/scenes/${id}`),
-  updateScene: (id, payload) => request(`/series/scenes/${id}`, { method: 'PUT', body: payload }),
-  deleteScene: (id) => request(`/series/scenes/${id}`, { method: 'DELETE' }),
-  listRenders: () => request('/series/renders'),
-  recordRender: (payload) => request('/series/renders', { method: 'POST', body: payload }),
-  // Streamed by the browser directly, so return the URL instead of JSON.
-  seriesVideo: (id) => `${BASE}/series/renders/${id}/video`,
   // runtime
   getIdle: () => request('/runtime/idle'),
   setIdle: (enabled) => request('/runtime/idle', { method: 'PUT', body: { enabled } }),
+  getOffPeak: () => request('/runtime/offpeak'),
+  setOffPeak: (enabled) => request('/runtime/offpeak', { method: 'PUT', body: { enabled } }),
   resetRuntime: () => request('/runtime/reset', { method: 'POST' }),
   // chat (non-streaming + agent)
   chat: (payload) => request('/chat', { method: 'POST', body: payload }),

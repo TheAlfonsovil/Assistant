@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from .attachments import attachment_view, infer_content_type
 from .domain.contracts import ContractScope, InputRef, OutputSpec, ResolvedInput
 from .domain.graph import TaskGraph
 from .domain.models import Operation, OperationResult, Task, TaskNode
@@ -12,11 +13,38 @@ from .observability import compact
 class ContextBuilder:
     """Builds role-specific, bounded contexts for each LLM phase."""
 
-    def __init__(self, repository, tools, workspace_root: str = ".", projects_root: str = r"C:\Assistant"):
+    def __init__(
+        self,
+        repository,
+        tools,
+        workspace_root: str = ".",
+        projects_root: str = r"C:\Assistant",
+        vision_enabled: bool = False,
+    ):
         self.repository = repository
         self.tools = tools
         self.workspace_root = workspace_root
         self.projects_root = projects_root
+        # True only when the configured model can actually read image bytes.
+        # Otherwise attachments are references the model must not pretend to see.
+        self.vision_enabled = bool(vision_enabled)
+
+    def _attachments(self, task: Task) -> dict[str, Any]:
+        """Attachment references plus whether the current model can view them."""
+        view = attachment_view(task.attachments)
+        if not view:
+            return {}
+        return {
+            "items": view,
+            "viewable_by_model": self.vision_enabled,
+            "note": (
+                "Images are attached to this request as multimodal parts."
+                if self.vision_enabled
+                else "The configured model cannot read image bytes: reason only from "
+                "the file name, size and extracted text, and ask the user instead of "
+                "describing content you cannot see."
+            ),
+        }
 
     @staticmethod
     def _slim_codegraph(codegraph: Any) -> dict[str, Any] | None:
@@ -255,7 +283,8 @@ class ContextBuilder:
         project = await get_project(task.project_id) if task.project_id and get_project else None
         return {
             "phase": "PLANNER",
-            "user_prompt": task.goal,
+            "user_prompt": task.instruction,
+            "attachments": self._attachments(task),
             "assistant_state": {
                 "task_status": task.status,
                 "memory_loaded": True,
@@ -305,6 +334,38 @@ class ContextBuilder:
             "long_term_memory": memories,
         }
 
+    async def _screenshots(self, task: Task, limit: int = 2) -> list[dict[str, Any]]:
+        """Latest screen captures produced by this task, newest last.
+
+        A GUI worker needs to see the result of its own click, so fresh
+        captures are offered to the model next to the original attachments.
+        """
+        list_artifacts = getattr(self.repository, "list_artifacts", None)
+        if list_artifacts is None:
+            return []
+        try:
+            artifacts = await list_artifacts(task.id)
+        except (TypeError, AttributeError):
+            return []
+        images = [
+            item
+            for item in artifacts
+            if getattr(getattr(item, "kind", None), "value", None) == "image"
+        ]
+        return [
+            {
+                "id": item.id,
+                "path": item.path,
+                "description": item.description,
+                "content_type": (item.metadata or {}).get("content_type")
+                or infer_content_type(item.path),
+                "origin_x": (item.metadata or {}).get("origin_x"),
+                "origin_y": (item.metadata or {}).get("origin_y"),
+                "scale": (item.metadata or {}).get("scale"),
+            }
+            for item in images[-limit:]
+        ]
+
     async def for_agent_decision(
         self, task: Task, last_observation: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -328,7 +389,9 @@ class ContextBuilder:
         intent = self._planner_intent(str(raw_intent))
         return self._bound_agent_context({
             "phase": "AGENT",
-            "user_prompt": task.goal,
+            "user_prompt": task.instruction,
+            "attachments": self._attachments(task),
+            "screenshots": await self._screenshots(task),
             "task": {
                 "id": task.id,
                 "goal": task.goal,
@@ -400,7 +463,8 @@ class ContextBuilder:
         ]
         return self._bound_agent_context({
             "phase": "ORCHESTRATOR",
-            "user_prompt": task.goal,
+            "user_prompt": task.instruction,
+            "attachments": self._attachments(task),
             "task": {
                 "id": task.id,
                 "goal": task.goal,
@@ -486,7 +550,8 @@ class ContextBuilder:
         resolved_inputs = await self.resolve_declared_inputs(task, node, graph)
         return {
             "phase": "NODE_RESOLVER",
-            "user_prompt": task.goal,
+            "user_prompt": task.instruction,
+            "attachments": self._attachments(task),
             "assistant_state": {
                 "task_status": task.status,
                 "node_status": node.status,
@@ -653,13 +718,19 @@ class ContextBuilder:
         definitions = self.tools.definitions()
         normalized_intent = self._planner_intent(str(intent))
         preferred = {
-            "audit": {"audit", "project", "codegraph", "git"},
+            "audit": {"audit", "project", "codegraph", "git", "artifact"},
             "create": {"project", "filesystem"},
-            "edit": {"project", "codegraph"},
-            "browser": {"browser", "web"},
+            "edit": {"project", "codegraph", "artifact"},
+            "browser": {"browser", "web", "screen", "input"},
         }.get(normalized_intent)
         primary = [definition for definition in definitions if not preferred or definition.name in preferred]
-        optional_names = {"web", "browser", "deployment", "filesystem", "shell", "process", "git", "codegraph", "project", "audit"}
+        optional_names = {
+            "web", "browser", "deployment", "filesystem", "shell", "process", "git",
+            "codegraph", "project", "audit",
+            # Capabilities added later must be listed here or the model never
+            # sees them: this is an allowlist, not a filter of convenience.
+            "screen", "input", "memory", "artifact", "http", "schedule",
+        }
         optional = [
             definition for definition in definitions
             if definition not in primary and definition.name in optional_names
@@ -777,7 +848,7 @@ class ContextBuilder:
     ) -> dict[str, Any]:
         return {
             "phase": "VERIFIER",
-            "user_prompt": task.goal,
+            "user_prompt": task.instruction,
             "task": {
                 "id": task.id,
                 "goal": task.goal,
@@ -810,7 +881,7 @@ class ContextBuilder:
         memories = await self._memory_context(task.goal, task)
         return {
             "phase": "REPLANNER",
-            "user_prompt": task.goal,
+            "user_prompt": task.instruction,
             "assistant_state": {
                 "task_status": task.status,
                 "node_status": node.status,
@@ -858,7 +929,8 @@ class ContextBuilder:
                 audit_evidence.append({"audit_report": compact(report, limit=12000)})
         return {
             "phase": "FINAL_RESPONSE",
-            "user_prompt": task.goal,
+            "user_prompt": task.instruction,
+            "attachments": self._attachments(task),
             "task": {
                 "id": task.id,
                 "goal": task.goal,

@@ -6,6 +6,7 @@ from httpx import HTTPError
 
 from .domain.models import TaskRequest
 from .idle import IdleCycle
+from .offpeak import OffPeakPolicy
 from .llm import AssistantResponse
 from .observability import preview
 from .runtime import TaskRuntime
@@ -176,6 +177,11 @@ def run(
                 enabled=context.settings.idle_enabled,
             ),
             is_ready=lambda: startup.llm_ready,
+            max_concurrent=context.settings.max_concurrent_tasks,
+            offpeak=OffPeakPolicy(
+                enabled=context.settings.offpeak_savings_default,
+                holidays=context.settings.cn_holidays,
+            ),
         )
         try:
             if once:

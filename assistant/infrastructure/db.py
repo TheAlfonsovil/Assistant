@@ -6,6 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy.pool import NullPool
 
+from .session import SerializedWriteSession
+
 
 class Base(DeclarativeBase):
     pass
@@ -41,7 +43,9 @@ class Database:
         self.engine = create_async_engine(async_url, **engine_options)
         if async_url.startswith("sqlite+"):
             event.listen(self.engine.sync_engine, "connect", self._configure_sqlite)
-        self.sessions = async_sessionmaker(self.engine, expire_on_commit=False)
+        self.sessions = async_sessionmaker(
+            self.engine, class_=SerializedWriteSession, expire_on_commit=False
+        )
 
     @staticmethod
     def _configure_sqlite(dbapi_connection, _connection_record) -> None:
@@ -62,6 +66,7 @@ class Database:
                 )
             )
             await connection.run_sync(self._migrate_schema)
+            await connection.run_sync(self._add_missing_columns)
             await connection.run_sync(self._validate_schema)
             current = await connection.scalar(text("SELECT MAX(version) FROM schema_version"))
             if current is not None and current != self.CURRENT_SCHEMA_VERSION:
@@ -131,6 +136,21 @@ class Database:
                 "VALUES (5, CURRENT_TIMESTAMP)"
             )
         )
+
+    # Nullable/defaulted columns added after schema 5; safe to add in place.
+    ADDITIVE_COLUMNS = {"tasks": {"title": "TEXT DEFAULT ''"}}
+
+    @staticmethod
+    def _add_missing_columns(connection) -> None:
+        inspector = inspect(connection)
+        tables = set(inspector.get_table_names())
+        for table, additions in Database.ADDITIVE_COLUMNS.items():
+            if table not in tables:
+                continue
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for name, ddl in additions.items():
+                if name not in existing:
+                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
 
     @staticmethod
     def _validate_schema(connection) -> None:

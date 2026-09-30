@@ -6,7 +6,7 @@ SQLite keeps V1 local and durable. SQLAlchemy repositories keep the domain indep
 
 ## Provider boundary
 
-`LLMProvider` exposes planning, resolution, replanning and verification without exposing Ollama payloads to the task engine.
+`LLMProvider` exposes planning, resolution, replanning and verification without exposing DeepSeek payloads to the task engine.
 
 ## Proposal before execution
 

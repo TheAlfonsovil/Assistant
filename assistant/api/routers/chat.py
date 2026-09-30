@@ -17,11 +17,14 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 async def create_chat_message(request: Request, chat_request: ChatRequest) -> dict:
     task = await get_context(request).service.create_task(
         TaskRequest(
+            title=chat_request.title,
             goal=chat_request.message,
+            description=chat_request.description,
             source="DASHBOARD_CHAT",
             project_id=chat_request.project_id,
             target_type=chat_request.target_type,
             target_id=chat_request.target_id,
+            attachments=chat_request.attachments,
             metadata={"interaction": "chat", "requested_format": "answer"},
         )
     )
@@ -137,11 +140,14 @@ async def _chat_fast_stream(request: Request, chat_request: ChatFastRequest):
     try:
         task = await get_context(request).service.create_task(
             TaskRequest(
+                title=chat_request.title,
                 goal=chat_request.message,
+                description=chat_request.description,
                 source="DASHBOARD_CHAT_FAST",
                 project_id=chat_request.project_id,
                 target_type=chat_request.target_type,
                 target_id=chat_request.target_id,
+                attachments=chat_request.attachments,
                 metadata={"interaction": "chat", "requested_format": "answer"},
             )
         )

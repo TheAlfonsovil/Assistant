@@ -2,6 +2,9 @@
 
 from ..browser import BrowserTool
 from ..codegraph import CodeGraphTool
+from ..http_client import HttpTool
+from ..input import InputTool
+from ..screen import ScreenTool
 from .audit import AuditTool
 from .deployment import DeploymentTool
 from .filesystem import FilesystemTool
@@ -13,9 +16,14 @@ from ..system import SystemInfoTool
 from ..web import WebTool
 
 
-def register_actions(registry) -> None:
-    """Register every real computer action in one discoverable place."""
-    for action in (
+def register_actions(registry, *, enable_input: bool = False) -> None:
+    """Register every real computer action in one discoverable place.
+
+    ``screen`` is read-only and always available. ``input`` (mouse/keyboard)
+    can type into any window, so it is registered only when the deployment
+    explicitly opts in: when disabled the model never even sees it.
+    """
+    actions = [
         FilesystemTool(),
         AuditTool(),
         ShellTool(),
@@ -27,5 +35,10 @@ def register_actions(registry) -> None:
         SystemInfoTool(),
         WebTool(),
         BrowserTool(),
-    ):
+        ScreenTool(),
+        HttpTool(),
+    ]
+    if enable_input:
+        actions.append(InputTool())
+    for action in actions:
         registry.register(action)

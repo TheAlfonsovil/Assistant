@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from assistant.domain.models import ErrorType, OperationResult
+from assistant.tools import file_artifact
 
 
 async def edit_project(args: dict[str, Any], timeout: float) -> OperationResult:
@@ -91,7 +92,7 @@ async def edit_project(args: dict[str, Any], timeout: float) -> OperationResult:
         if process.returncode != 0:
             _restore_files(originals)
             return OperationResult(success=False, output={"feature": feature, "files": written, "validation": validation}, error=f"validation command failed: {command}", error_type=ErrorType.TOOL_FAILURE)
-    return OperationResult(success=True, output={"feature": feature, "files": written, "deleted": deleted, "validation": validation}, side_effects=["project.modified"])
+    return OperationResult(success=True, output={"feature": feature, "files": written, "deleted": deleted, "validation": validation}, artifacts=[file_artifact(project_root / relative, description=f"project.edit {relative}", metadata={"feature": feature, "relative_path": relative}) for relative in written], side_effects=["project.modified"])
 
 
 def _restore_files(originals: dict[Path, bytes | None]) -> None:

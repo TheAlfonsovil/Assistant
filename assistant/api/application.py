@@ -7,6 +7,7 @@ from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from httpx import HTTPError
 
 from ..idle import IdleCycle
+from ..offpeak import OffPeakPolicy
 from ..runtime import TaskRuntime
 from ..startup.bootstrap import create_context
 from .routers import (
@@ -15,7 +16,6 @@ from .routers import (
     memory_router,
     projects_router,
     runtime_router,
-    series_router,
     system_router,
     tasks_router,
 )
@@ -50,6 +50,12 @@ async def lifespan(app: FastAPI):
             enabled=context.settings.idle_enabled,
         ),
         is_ready=check_llm_ready,
+        readiness_ttl=context.settings.deepseek_ready_cache_seconds,
+        max_concurrent=context.settings.max_concurrent_tasks,
+        offpeak=OffPeakPolicy(
+            enabled=context.settings.offpeak_savings_default,
+            holidays=context.settings.cn_holidays,
+        ),
     )
     worker = asyncio.create_task(runtime.run_forever(), name="assistant-task-runtime")
     app.state.runtime = runtime
@@ -66,7 +72,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.5.5", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.6.0", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -85,7 +91,6 @@ app.include_router(tasks_router, prefix=API_PREFIX)
 app.include_router(projects_router, prefix=API_PREFIX)
 app.include_router(memory_router, prefix=API_PREFIX)
 app.include_router(runtime_router, prefix=API_PREFIX)
-app.include_router(series_router, prefix=API_PREFIX)
 app.include_router(chat_router, prefix=API_PREFIX)
 
 

@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter, HTTPException, Request
 
+from ...attachments import AttachmentError
 from ...domain.models import (
     TaskInputRequest,
     TaskRedefinitionRequest,
@@ -23,10 +24,15 @@ async def list_tasks(request: Request, limit: int = 100, status: str | None = No
 async def create_task(request: Request, task_request: TaskRequest) -> dict:
     try:
         task = await get_context(request).service.create_task(task_request)
+    except AttachmentError as error:
+        # An unusable upload is a request problem, not a conflict.
+        raise HTTPException(422, str(error)) from error
     except ValueError as error:
         raise HTTPException(409, str(error)) from error
     get_runtime(request).wake()
-    return {"id": task.id, "status": task.status}
+    # Return the whole task so a client can confirm the title, description and
+    # attachments it actually stored instead of guessing from the response.
+    return _task_json(task)
 
 
 @router.get("/{task_id}")

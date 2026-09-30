@@ -139,7 +139,7 @@ pre.code { background: #0a1120; border: 1px solid var(--border); border-radius: 
 .node-link { color: var(--brand); cursor: pointer; text-decoration: underline dotted; }
 .node-link:hover { color: var(--text); }
 
-/* Workflow graph (ported from the legacy /dashboard inspector) */
+/* Workflow graph (ported from the original Node inspector) */
 .wf-canvas { display: grid; gap: 14px; padding: 16px; border: 1px solid var(--border); border-radius: 12px; background: linear-gradient(180deg, var(--bg-elev), var(--bg-card)); }
 .wf-node { display: grid; grid-template-columns: 30px 1fr; gap: 12px; position: relative; padding: 13px 15px; border: 1px solid var(--border); border-left: 3px solid var(--muted); background: var(--bg-card); border-radius: 10px; }
 .wf-node.tone-ok { border-left-color: var(--ok); }

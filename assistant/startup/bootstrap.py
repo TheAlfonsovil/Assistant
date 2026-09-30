@@ -12,7 +12,8 @@ from assistant.application import TaskService
 from assistant.config import Settings, get_settings
 from assistant.devices.registry import build_tool_registry
 from assistant.infrastructure.db import Database
-from assistant.llm import MockLLMProvider, OllamaLLMProvider
+from assistant.infrastructure.repositories import TaskRepository
+from assistant.llm import DeepSeekLLMProvider, MockLLMProvider
 from assistant.startup.manager import StartupManager
 from assistant.startup.models import StartupReport
 
@@ -43,30 +44,41 @@ async def create_context(
     provider = (
         MockLLMProvider()
         if use_mock
-        else OllamaLLMProvider(
-            resolved_settings.ollama_url,
-            resolved_settings.ollama_model,
-            resolved_settings.ollama_timeout,
-            temperature=resolved_settings.ollama_temperature,
-            num_ctx=resolved_settings.ollama_num_ctx,
-            thinking=resolved_settings.ollama_thinking,
-            reasoning_effort=resolved_settings.ollama_reasoning_effort,
-            reasoning_policy=resolved_settings.ollama_reasoning_policy,
-            keep_alive=resolved_settings.ollama_keep_alive,
-            context_reserve_tokens=resolved_settings.ollama_context_reserve_tokens,
+        else DeepSeekLLMProvider(
+            resolved_settings.deepseek_url,
+            resolved_settings.deepseek_model,
+            resolved_settings.deepseek_api_key,
+            timeout=resolved_settings.deepseek_timeout,
+            temperature=resolved_settings.deepseek_temperature,
+            thinking=resolved_settings.deepseek_thinking,
+            reasoning_policy=resolved_settings.deepseek_reasoning_policy,
+            max_tokens=resolved_settings.deepseek_max_tokens,
             trace_sink=trace_sink,
-            failure_threshold=resolved_settings.ollama_failure_threshold,
-            recovery_timeout=resolved_settings.ollama_recovery_timeout,
-            max_prompt_chars=resolved_settings.ollama_max_prompt_chars,
-            max_response_chars=resolved_settings.ollama_max_response_chars,
+            failure_threshold=resolved_settings.deepseek_failure_threshold,
+            recovery_timeout=resolved_settings.deepseek_recovery_timeout,
+            max_prompt_chars=resolved_settings.deepseek_max_prompt_chars,
+            max_response_chars=resolved_settings.deepseek_max_response_chars,
+            supports_vision=resolved_settings.deepseek_supports_vision,
+            max_image_bytes=resolved_settings.attachment_max_bytes,
+            stream_responses=resolved_settings.deepseek_stream_responses,
+            max_vision_images=resolved_settings.vision_max_images,
         )
     )
     startup = await StartupManager(database, resolved_settings, provider).initialize()
     session = async_scoped_session(database.sessions, scopefunc=asyncio.current_task)
+    # Built before the tools so task-scoped capabilities (memory, artifacts) can
+    # read the same ledger the service writes.
+    repository = TaskRepository(session, event_sink=event_sink)
+    tools = build_tool_registry(
+        policy=resolved_settings.tool_policy(),
+        enable_input=resolved_settings.enable_input_control,
+        repository=repository,
+        rate_limit=resolved_settings.rate_limiter(),
+    )
     service = TaskService(
         session,
         provider,
-        build_tool_registry(),
+        tools,
         event_sink=event_sink,
         workspace_root=resolved_settings.workspace_root,
         projects_root=resolved_settings.projects_root,
@@ -75,5 +87,13 @@ async def create_context(
         max_steps=resolved_settings.task_max_steps,
         event_retention_days=resolved_settings.event_retention_days,
         event_retention_keep_recent=resolved_settings.event_retention_keep_recent,
+        attachment_max_bytes=resolved_settings.attachment_max_bytes,
+        attachment_max_count=resolved_settings.attachment_max_count,
+        vision_enabled=resolved_settings.deepseek_supports_vision,
     )
+    # Registered after the service exists: recurrence is expressed by creating
+    # and cloning tasks, so this capability needs the service, not just tools.
+    from assistant.capabilities.scheduling import ScheduleTool
+
+    tools.register(ScheduleTool(service))
     return AssistantContext(database, session, service, startup, resolved_settings)

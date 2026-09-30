@@ -242,6 +242,7 @@ class TaskRuntimeState(BaseModel):
     project_reads: int = 0
     source_bytes: int = 0
     recovery_attempts: int = 0
+    llm_errors: int = 0
     created_project: dict[str, Any] = Field(default_factory=dict)
     llm_usage: dict[str, Any] = Field(default_factory=dict)
 

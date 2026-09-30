@@ -116,7 +116,7 @@ class TaskBudget(BaseModel):
     max_llm_calls: int = 20
     max_retries: int = 3
     max_recovery_attempts: int = 2
-    max_execution_time: float = 86400.0
+    max_execution_time: float = 7200.0
     max_tool_calls: int = 50
     max_codegraph_queries: int = 100
     max_project_reads: int = 100
@@ -335,12 +335,18 @@ class OperationResult(BaseModel):
     side_effects: list[str] = Field(default_factory=list)
 
 
+def derive_task_title(goal: str, limit: int = 120) -> str:
+    first_line = next((line.strip() for line in goal.splitlines() if line.strip()), "")
+    return first_line if len(first_line) <= limit else first_line[: limit - 1].rstrip() + "…"
+
+
 class Task(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid4()))
     parent_task_id: str | None = None
     root_task_id: str | None = None
     source: str = "USER"
     project_id: str | None = None
+    title: str = ""
     goal: str
     description: str = ""
     status: TaskStatus = TaskStatus.CREATED
@@ -363,6 +369,21 @@ class Task(BaseModel):
         super().__init__(**data)
         if self.root_task_id is None:
             self.root_task_id = self.id
+        if not self.title.strip():
+            self.title = derive_task_title(self.goal) or "Tarea"
+
+    @property
+    def instruction(self) -> str:
+        """Full user request as seen by LLM roles: goal plus optional details."""
+        details = self.description.strip()
+        if not details or details == self.goal.strip():
+            return self.goal
+        return f"{self.goal}\n\n{details}"
+
+    @property
+    def attachments(self) -> list[dict[str, Any]]:
+        items = self.metadata.get("attachments")
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
 
     def apply_worker_decision(self, decision: AgentDecision) -> None:
         """Apply only the explicitly typed, task-local worker memory patch."""
@@ -463,9 +484,18 @@ class UserProfile(BaseModel):
     expertise: list[str] = Field(default_factory=list)
 
 
+class TaskAttachmentUpload(BaseModel):
+    """Inline image upload; bytes are validated by content, never by name or MIME."""
+
+    filename: str = Field(default="image", max_length=255)
+    content_type: str | None = Field(default=None, max_length=100)
+    data_base64: str = Field(min_length=1)
+
+
 class TaskRequest(BaseModel):
-    goal: str = Field(min_length=1, max_length=10000)
-    description: str = ""
+    title: str = Field(default="", max_length=200)
+    goal: str = Field(default="", max_length=10000)
+    description: str = Field(default="", max_length=20000)
     source: str = "USER"
     project_id: str | None = None
     project_name: str | None = None
@@ -474,6 +504,21 @@ class TaskRequest(BaseModel):
     priority: int = 1
     deadline: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    attachments: list[TaskAttachmentUpload] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def require_title_or_goal(self) -> "TaskRequest":
+        self.title = self.title.strip()
+        self.goal = self.goal.strip()
+        if not self.title and not self.goal:
+            raise ValueError("a task requires a non-empty title")
+        if not self.goal:
+            self.goal = self.title
+        if not self.title:
+            self.title = derive_task_title(self.goal)
+        # Attachments are only accepted through the validated upload path.
+        self.metadata.pop("attachments", None)
+        return self
 
     @field_validator("priority", mode="before")
     @classmethod
@@ -491,10 +536,13 @@ class TaskRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=10000)
+    title: str = Field(default="", max_length=200)
+    description: str = Field(default="", max_length=20000)
     project_id: str | None = None
     target_type: str | None = None
     target_id: str | None = None
     confirm: bool = False
+    attachments: list[TaskAttachmentUpload] = Field(default_factory=list)
 
 
 class ChatFastRequest(ChatRequest):
@@ -514,6 +562,7 @@ class TaskInputRequest(BaseModel):
 
 class TaskRedefinitionRequest(BaseModel):
     goal: str = Field(min_length=1, max_length=10000)
+    title: str | None = Field(default=None, max_length=200)
     description: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
 

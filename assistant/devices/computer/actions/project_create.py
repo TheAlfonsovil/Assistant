@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from assistant.domain.models import ErrorType, OperationResult
+from assistant.tools import content_checksum, file_artifact
 
 
 async def create_project(args: dict[str, Any]) -> OperationResult:
@@ -95,5 +96,15 @@ async def create_project(args: dict[str, Any]) -> OperationResult:
             "existing": existing,
             "verified": all((project_root / relative).is_file() for relative in generated),
         },
+        # Every file this tool wrote is a deliverable of the task.
+        artifacts=[
+            file_artifact(
+                project_root / relative,
+                description=f"project.create {relative}",
+                metadata={"relative_path": relative, "project_name": name.strip()},
+                checksum=content_checksum(generated[relative]),
+            )
+            for relative in sorted(generated)
+        ],
         side_effects=["project.created"],
     )

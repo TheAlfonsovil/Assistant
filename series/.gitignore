@@ -1,7 +1,0 @@
-node_modules/
-output/frames/
-output/*.mp4
-output/*.webm
-output/*.gif
-output/*.png
-*.txt

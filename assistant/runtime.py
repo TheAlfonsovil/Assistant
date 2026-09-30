@@ -5,6 +5,7 @@ import logging
 import socket
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from time import monotonic
 from typing import cast
 from uuid import uuid4
 
@@ -25,6 +26,9 @@ class TaskRuntime:
         idle_cycle: IdleCycle | None = None,
         max_backoff: float = 60.0,
         is_ready: Callable[[], bool | Awaitable[bool]] | None = None,
+        readiness_ttl: float = 0.0,
+        max_concurrent: int = 1,
+        offpeak=None,
     ):
         self.repository = repository
         self.execute_task = execute_task
@@ -32,6 +36,17 @@ class TaskRuntime:
         self.max_backoff = max_backoff
         self.idle_cycle = idle_cycle or IdleCycle()
         self.is_ready = is_ready or (lambda: True)
+        # 1 keeps the original strictly sequential behaviour. Raising it lets
+        # independent tasks advance in parallel; node leases and the serialized
+        # write path keep that safe.
+        self.max_concurrent = max(1, int(max_concurrent))
+        # A 24/7 loop must not issue a readiness request on every pass. The
+        # previous value (including ``None`` before the first check) is reused
+        # until the TTL expires; 0 keeps the original per-pass behaviour.
+        self.readiness_ttl = max(0.0, readiness_ttl)
+        self._readiness_checked_at: float | None = None
+        # "Ahorro de consumo": stop starting paid work inside peak windows.
+        self.offpeak = offpeak
         self.stop_requested = False
         self.last_started_at: datetime | None = None
         self.last_completed_at: datetime | None = None
@@ -49,6 +64,7 @@ class TaskRuntime:
             "idle_skipped": 0,
             "not_ready_passes": 0,
             "runtime_errors": 0,
+            "offpeak_passes": 0,
         }
         self.worker_id = f"{socket.gethostname()}:{uuid4()}"
         self.started_at = datetime.now(UTC)
@@ -59,6 +75,22 @@ class TaskRuntime:
 
     def readiness_snapshot(self) -> bool | None:
         return self.last_ready
+
+    def set_offpeak_enabled(self, enabled: bool) -> None:
+        if self.offpeak is None:
+            from .offpeak import OffPeakPolicy
+
+            self.offpeak = OffPeakPolicy(enabled=enabled)
+            return
+        self.offpeak.set_enabled(enabled)
+
+    def offpeak_snapshot(self) -> dict[str, object]:
+        """Savings-mode state, or a disabled default when not configured."""
+        if self.offpeak is None:
+            return {"enabled": False, "state": "RUNNING", "configured": False}
+        snapshot = dict(self.offpeak.snapshot())
+        snapshot["configured"] = True
+        return snapshot
 
     def idle_snapshot(self) -> dict[str, object]:
         return {
@@ -74,6 +106,30 @@ class TaskRuntime:
 
     def set_idle_enabled(self, enabled: bool) -> None:
         self.idle_cycle.set_enabled(enabled)
+
+    async def _release_scoped_session(self) -> None:
+        """Drop the session this asyncio task created, if the repository has one.
+
+        Sessions are scoped per asyncio task, so a task spawned by the
+        concurrent dispatcher must release its own or the connection survives
+        until garbage collection.
+        """
+        remove = getattr(getattr(self.repository, "session", None), "remove", None)
+        if remove is None:
+            return
+        try:
+            await remove()
+        except Exception:  # pragma: no cover - cleanup must never break a pass
+            logger.debug("Releasing the scoped session failed", exc_info=True)
+
+    async def _dispatch(self, task_id: str) -> None:
+        """Advance one task by one step, counting failures instead of aborting."""
+        try:
+            self.metrics["tasks_dispatched"] += 1
+            await self.execute_task(task_id)
+        except Exception:
+            self.metrics["task_errors"] += 1
+            logger.exception("Task worker iteration failed for %s", task_id)
 
     async def _run_idle(self, has_work: bool) -> None:
         if not self.idle_cycle.enabled:
@@ -102,13 +158,26 @@ class TaskRuntime:
             self.last_active_count,
         )
 
+    def _readiness_is_stale(self) -> bool:
+        if self.readiness_ttl <= 0 or self._readiness_checked_at is None:
+            return True
+        return (monotonic() - self._readiness_checked_at) >= self.readiness_ttl
+
+    async def _resolve_readiness(self) -> bool | None:
+        """Return the cached readiness value until its TTL expires."""
+        if not self._readiness_is_stale():
+            return self.last_ready
+        readiness = self.is_ready()
+        if asyncio.iscoroutine(readiness) or isinstance(readiness, Awaitable):
+            readiness = await cast(Awaitable[bool], readiness)
+        self._readiness_checked_at = monotonic()
+        return bool(readiness)
+
     async def run_once(self) -> int:
         self.metrics["passes"] += 1
         self.last_started_at = datetime.now(UTC)
         await self._persist_heartbeat()
-        readiness = self.is_ready()
-        if asyncio.iscoroutine(readiness) or isinstance(readiness, Awaitable):
-            readiness = await cast(Awaitable[bool], readiness)
+        readiness = await self._resolve_readiness()
         self.last_ready = bool(readiness)
         if not self.last_ready:
             self.metrics["not_ready_passes"] += 1
@@ -129,14 +198,33 @@ class TaskRuntime:
                 TaskStatus.FINALIZING,
             }
         ]
-        for task in sorted(active, key=lambda item: (-item.priority, item.created_at)):
-            try:
-                self.metrics["tasks_dispatched"] += 1
-                await self.execute_task(task.id)
-            except Exception:
-                self.metrics["task_errors"] += 1
-                logger.exception("Task worker iteration failed for %s", task.id)
-                continue
+        ordered = sorted(active, key=lambda item: (-item.priority, item.created_at))
+        if self.offpeak is not None and self.offpeak.is_paused():
+            # Peak pricing: hold the queue instead of spending on every step.
+            # Nothing is cancelled or failed; work resumes at the next window.
+            self.metrics["offpeak_passes"] += 1
+            await self._run_idle(has_work=bool(ordered))
+            self.last_active_count = len(ordered)
+            self.last_completed_at = datetime.now(UTC)
+            await self._persist_heartbeat()
+            return len(ordered)
+        if self.max_concurrent <= 1:
+            for task in ordered:
+                await self._dispatch(task.id)
+        else:
+            # Independent tasks advance in parallel; the semaphore bounds how
+            # many run at once. ``_dispatch`` swallows per-task failures, so one
+            # bad task cannot cancel the whole pass.
+            semaphore = asyncio.Semaphore(self.max_concurrent)
+
+            async def guarded(task_id: str) -> None:
+                try:
+                    async with semaphore:
+                        await self._dispatch(task_id)
+                finally:
+                    await self._release_scoped_session()
+
+            await asyncio.gather(*(guarded(task.id) for task in ordered))
         await self._run_idle(has_work=bool(active))
         self.last_active_count = len(active)
         self.last_completed_at = datetime.now(UTC)

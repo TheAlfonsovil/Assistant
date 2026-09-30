@@ -16,9 +16,60 @@ const mode = ref('chat')
 const target = ref('device:computer')
 const live = ref('')
 const sending = ref(false)
+const files = ref([])
+const attachmentError = ref('')
 const log = ref(null)
 let controller = null
 let poller = null
+
+// Keep in sync with ASSISTANT_ATTACHMENT_MAX_BYTES / _MAX_COUNT.
+const MAX_ATTACHMENT_BYTES = 5_000_000
+const MAX_ATTACHMENTS = 4
+
+function formatSize(bytes) {
+  return bytes >= 1_000_000 ? `${(bytes / 1_000_000).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`
+}
+
+function readAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const result = String(reader.result || '')
+      resolve(result.slice(result.indexOf(',') + 1))
+    }
+    reader.onerror = () => reject(new Error(`No se pudo leer ${file.name}`))
+    reader.readAsDataURL(file)
+  })
+}
+
+function onFiles(event) {
+  attachmentError.value = ''
+  const selected = Array.from(event.target.files || [])
+  if (selected.length > MAX_ATTACHMENTS) {
+    attachmentError.value = `Máximo ${MAX_ATTACHMENTS} imágenes por mensaje.`
+    files.value = []
+    event.target.value = ''
+    return
+  }
+  const tooBig = selected.find((file) => file.size > MAX_ATTACHMENT_BYTES)
+  if (tooBig) {
+    attachmentError.value = `${tooBig.name} supera los 5 MB.`
+    files.value = []
+    event.target.value = ''
+    return
+  }
+  files.value = selected
+}
+
+async function attachmentPayload() {
+  return Promise.all(
+    files.value.map(async (file) => ({
+      filename: file.name,
+      content_type: file.type || null,
+      data_base64: await readAsBase64(file),
+    })),
+  )
+}
 
 const modeHelp = computed(() =>
   mode.value === 'agent' ? 'Puede operar tareas y la cola' : 'Consulta y crea trabajo',
@@ -163,9 +214,20 @@ async function send() {
   scrollToBottom()
   const [target_type, target_id] = target.value.split(':')
   const body = { message: text, target_type, target_id }
+  if (files.value.length) {
+    try {
+      body.attachments = await attachmentPayload()
+    } catch (error) {
+      attachmentError.value = error.message
+      sending.value = false
+      return
+    }
+  }
   try {
     if (mode.value === 'agent') await runAgent(body)
     else await runChat(body)
+    files.value = []
+    attachmentError.value = ''
     system.refresh()
   } catch (error) {
     system.notify(error.message, 'error')
@@ -235,11 +297,24 @@ onUnmounted(() => {
         <select v-model="target" class="select" aria-label="Destino">
           <option v-for="t in targets" :key="t.value" :value="t.value">{{ t.label }}</option>
         </select>
+        <input
+          class="input"
+          style="max-width:230px"
+          type="file"
+          accept="image/png,image/jpeg,image/gif,image/webp"
+          multiple
+          aria-label="Adjuntar imágenes"
+          @change="onFiles"
+        />
         <span class="grow" />
         <button class="btn primary" type="submit" :disabled="sending || !message.trim()">
           Enviar
         </button>
       </div>
+      <p v-if="attachmentError" class="chat-hint">{{ attachmentError }}</p>
+      <p v-else-if="files.length" class="chat-hint">
+        Adjuntos: {{ files.map((f) => `${f.name} (${formatSize(f.size)})`).join(' · ') }}
+      </p>
       <p class="chat-hint">
         Agente: <code>crear objetivo</code>, <code>cancelar id</code>, <code>borrar id</code>,
         <code>reanudar id</code>, <code>replanificar id</code> o <code>listar</code>.

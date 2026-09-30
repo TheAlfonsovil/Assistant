@@ -98,6 +98,11 @@ class WebTool(Tool):
                 raise ValueError("Private and local network destinations are blocked")
 
     @staticmethod
+    async def validate_public_url(url: str) -> None:
+        """Public alias of the SSRF guard so every egress tool shares one rule."""
+        await WebTool._validate_public_url(url)
+
+    @staticmethod
     def _invalid(message: str) -> OperationResult:
         return OperationResult(success=False, error=message, error_type=ErrorType.INVALID_ARGUMENT)
 

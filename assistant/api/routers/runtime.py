@@ -55,3 +55,18 @@ async def configure_idle(request: Request, configuration: IdleConfigurationReque
     runtime = get_runtime(request)
     runtime.set_idle_enabled(configuration.enabled)
     return runtime.idle_snapshot()
+
+
+@router.get("/offpeak")
+async def get_offpeak(request: Request) -> dict:
+    return get_runtime(request).offpeak_snapshot()
+
+
+@router.put("/offpeak")
+async def configure_offpeak(
+    request: Request, configuration: IdleConfigurationRequest
+) -> dict:
+    """Toggle "ahorro de consumo": hold the queue during DeepSeek peak hours."""
+    runtime = get_runtime(request)
+    runtime.set_offpeak_enabled(configuration.enabled)
+    return runtime.offpeak_snapshot()

@@ -1,6 +1,6 @@
 # Assistant Core
 
-Persistent local task engine built with Python 3.12+, SQLite, SQLAlchemy 2, Pydantic, FastAPI, asyncio and Ollama.
+Persistent task engine built with Python 3.12+, SQLite, SQLAlchemy 2, Pydantic, FastAPI, asyncio and DeepSeek.
 
 ## Structure
 
@@ -99,7 +99,7 @@ La ejecución normal muestra el resultado resumido. Para inspeccionar el ciclo c
 [TASK_FINISHED] id=... status=SUCCEEDED
 ```
 
-El comando normal usa Ollama y aplica el presupuesto de tiempo de la tarea a Planner, Resolver, Replanner y respuesta final. Usa `--fullflow` para ver la interacción humana completa entre Planner, Resolver, tools y Verifier. Para validar el circuito sin cargar el modelo usa `assistant task --mock --fullflow "tarea de prueba"`.
+El comando normal usa DeepSeek y aplica el presupuesto de tiempo de la tarea a Planner, Resolver, Replanner y respuesta final. Usa `--fullflow` para ver la interacción humana completa entre Planner, Resolver, tools y Verifier. Para validar el circuito sin llamar a la API usa `assistant task --mock --fullflow "tarea de prueba"`.
 
 `assistant run` mantiene vivo el Task Manager. La API también arranca un worker
 en segundo plano durante su lifespan. Cuando no hay tareas, el worker ejecuta
@@ -188,7 +188,7 @@ Para analizar estructura y relaciones del código, una operación puede usar la 
 El diseño de la siguiente fase de memoria, contextos, recovery y prefill está en
 [docs/memory-context-performance.md](docs/memory-context-performance.md). Define
 condicionantes débiles, expansión trazable del grafo y los límites reales de la
-reutilización de KV cache con la API actual de Ollama.
+reutilización de KV cache en la integración local anterior; es un documento histórico.
 
 Para que Chrome o Edge expongan sus pestañas y URLs, hay que iniciarlo con un puerto DevTools, por ejemplo `--remote-debugging-port=9222`. Sin ese canal, Windows solo permite identificar la ventana/proceso del navegador; el sistema informa esa limitación y no afirma conocer sus pestañas.
 
@@ -200,20 +200,17 @@ marca como datos, nunca como instrucciones. La identidad y la ruta del proyecto
 proceden del registro estructurado, no de memoria libre ni de una ruta inventada
 por el LLM.
 
-The default provider is Ollama at `http://localhost:11434` using
-`smtek/Qwen3.8-27B:Q3_K_M`. The local integration uses low temperature (`0.1`) and a
-`32768` token context by default because agent responses are
-schema-constrained decisions, not creative text. The included configuration uses
-phase-specific thinking: Agent `high`, Planner `medium`, Resolver `low`,
-Replanner `high`, Verifier `off` and final response `low`. Ollama keeps the
-model loaded for 30 minutes by default so repeated agent turns avoid reload
-cost; stable prompt instructions are emitted before turn-specific evidence to
-maximize prefix/KV-cache reuse. Change the comma-separated
-`ASSISTANT_OLLAMA_REASONING_POLICY` value, or disable the feature globally with
-`ASSISTANT_OLLAMA_THINKING=false`. The prompt budget reserves output tokens, so it
-cannot exceed the configured context window even when
-`ASSISTANT_OLLAMA_MAX_PROMPT_CHARS` is larger.
-Set values in `.env` using `.env.example` as a template. Tests use mock providers
-and tools, so Ollama is not required for the test suite.
+The default provider is DeepSeek-V4.1-Flash (`deepseek-flash`) through
+`https://api.deepseek.com`. Set `ASSISTANT_DEEPSEEK_API_KEY` in the process
+environment; never put credentials in the tracked `.env` file. The task engine
+requests JSON output, validates it against Pydantic models and uses phase-specific
+reasoning. Change `ASSISTANT_DEEPSEEK_REASONING_POLICY` or disable thinking with
+`ASSISTANT_DEEPSEEK_THINKING=false`. Per-request limits default to 240,000 prompt
+characters, 16,384 output tokens and 600 seconds; task time defaults to two hours.
+The provider's optional `chat()` interface accepts system/user/assistant/tool
+messages, user image URLs or base64/file references, tool definitions, response
+format and sampling options, and streaming. Current task execution remains
+text-only and executes tools locally. Tests use mock transports and do not call
+the paid API.
 
 See [docs/architecture.md](docs/architecture.md) and [docs/task-lifecycle.md](docs/task-lifecycle.md) for the design.

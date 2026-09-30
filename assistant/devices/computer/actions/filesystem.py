@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from assistant.domain.models import ErrorType, OperationResult
-from assistant.tools import Tool, ToolDefinition
+from assistant.tools import Tool, ToolDefinition, content_checksum, file_artifact
 
 class FilesystemTool(Tool):
     definition = ToolDefinition(
@@ -168,9 +168,24 @@ class FilesystemTool(Tool):
                 output = [entry.name for entry in path.iterdir()]
             else:
                 raise ValueError(f"Unsupported filesystem method: {method}")
+            # Writing a file is a deliverable: publish it to the artifact
+            # ledger so dependants and the final report can reference it.
+            artifacts = (
+                [
+                    file_artifact(
+                        path,
+                        description=f"filesystem.{method} {path.name}",
+                        metadata={"method": method},
+                        checksum=content_checksum(content),
+                    )
+                ]
+                if method in {"write", "create"}
+                else []
+            )
             return OperationResult(
                 success=True,
                 output=output,
+                artifacts=artifacts,
                 started_at=started,
                 side_effects=[method] if method in {"write", "create", "delete"} else [],
             )

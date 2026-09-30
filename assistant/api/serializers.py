@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from ..devices.registry import DEVICE_BRANCHES
@@ -57,8 +59,151 @@ def _task_json(task) -> dict:
         "final_response": task.runtime.final_response,
     }
 
+
+def _usage_tokens(usage: dict) -> tuple[int, int]:
+    return (
+        int(usage.get("prompt_tokens", usage.get("prompt_eval_count", 0)) or 0),
+        int(usage.get("completion_tokens", usage.get("eval_count", 0)) or 0),
+    )
+
+
+def _percentile(values: list[float], ratio: float) -> float:
+    """Nearest-rank percentile; empty input yields 0.0."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(ratio * (len(ordered) - 1)))))
+    return round(float(ordered[index]), 3)
+
+
+def _metrics_series(events, hours: int = 24, now: datetime | None = None) -> list[dict]:
+    """Hourly rollup derived from the retained event window.
+
+    There is no history table: the series is bounded by event retention, which
+    is reported as its basis so it is never mistaken for a permanent ledger.
+    """
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    hours = max(1, min(int(hours), 168))
+    buckets: dict[str, dict] = {}
+    for offset in range(hours - 1, -1, -1):
+        moment = (current - timedelta(hours=offset)).replace(
+            minute=0, second=0, microsecond=0
+        )
+        key = moment.isoformat()
+        buckets[key] = {
+            "hour": key,
+            "llm_calls": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cached_tokens": 0,
+            "reasoning_tokens": 0,
+            "latency_ms_total": 0,
+            "tool_calls": 0,
+            "tool_failures": 0,
+            "tasks_created": 0,
+            "tasks_finished": 0,
+        }
+    for event in events:
+        created = event.created_at
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=UTC)
+        key = created.astimezone(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
+        bucket = buckets.get(key)
+        if bucket is None:
+            continue
+        payload = event.payload or {}
+        if event.event_type == "LLM_RESPONSE":
+            bucket["llm_calls"] += 1
+            usage = payload.get("usage") or {}
+            usage = usage if isinstance(usage, dict) else {}
+            prompt_tokens, completion_tokens = _usage_tokens(usage)
+            bucket["prompt_tokens"] += prompt_tokens
+            bucket["completion_tokens"] += completion_tokens
+            details = usage.get("prompt_tokens_details")
+            details = details if isinstance(details, dict) else {}
+            completion_details = usage.get("completion_tokens_details")
+            completion_details = (
+                completion_details if isinstance(completion_details, dict) else {}
+            )
+            bucket["cached_tokens"] += max(
+                int(usage.get("prompt_cache_hit_tokens", 0) or 0),
+                int(details.get("cached_tokens", 0) or 0),
+            )
+            bucket["reasoning_tokens"] += int(
+                completion_details.get("reasoning_tokens", 0) or 0
+            )
+            latency_ms = usage.get("provider_latency_ms")
+            if isinstance(latency_ms, (int, float)):
+                bucket["latency_ms_total"] += int(latency_ms)
+        elif event.event_type == "TOOL_RESULT":
+            bucket["tool_calls"] += 1
+            if payload.get("success") is False:
+                bucket["tool_failures"] += 1
+        elif event.event_type == "TASK_CREATED":
+            bucket["tasks_created"] += 1
+        elif event.event_type in {"TASK_COMPLETED", "TASK_FAILED"}:
+            bucket["tasks_finished"] += 1
+    series = []
+    for bucket in buckets.values():
+        calls = bucket.pop("llm_calls")
+        latency_total = bucket.pop("latency_ms_total")
+        bucket["llm_calls"] = calls
+        bucket["average_latency_ms"] = round(latency_total / calls, 1) if calls else 0
+        series.append(bucket)
+    return series
+
+
+def _cost_estimate(
+    settings, model: str, prompt: int, cached: int, completion: int
+) -> dict:
+    """Estimate cost from configured pricing, or report that it is unset.
+
+    Prices are never hardcoded: a model whose tariff is unknown must not be
+    presented with an invented figure.
+    """
+    raw = getattr(settings, "model_pricing", "") or ""
+    if not raw.strip():
+        return {"configured": False, "reason": "ASSISTANT_MODEL_PRICING is not set"}
+    try:
+        table = json.loads(raw)
+    except (TypeError, ValueError):
+        return {"configured": False, "reason": "ASSISTANT_MODEL_PRICING is not valid JSON"}
+    price = table.get(model) if isinstance(table, dict) else None
+    if not isinstance(price, dict):
+        return {"configured": False, "reason": f"no pricing entry for model '{model}'"}
+
+    def rate(key: str, fallback: float = 0.0) -> float:
+        try:
+            return float(price.get(key, fallback) or 0.0)
+        except (TypeError, ValueError):
+            return fallback
+
+    input_rate = rate("input")
+    cached_rate = rate("cached_input", input_rate)
+    output_rate = rate("output")
+    billable_prompt = max(0, prompt - cached)
+    input_cost = billable_prompt * input_rate / 1_000_000
+    cached_cost = max(0, cached) * cached_rate / 1_000_000
+    output_cost = completion * output_rate / 1_000_000
+    return {
+        "configured": True,
+        "currency": getattr(settings, "cost_currency", "USD"),
+        "prompt_usd": round(input_cost + cached_cost, 6),
+        "completion_usd": round(output_cost, 6),
+        "total_usd": round(input_cost + cached_cost + output_cost, 6),
+        "rates_per_million": {
+            "input": input_rate,
+            "cached_input": cached_rate,
+            "output": output_rate,
+        },
+        "basis": "configured pricing applied to measured tokens",
+    }
+
+
 def _dashboard_analytics(context, tasks, task_nodes, events):
+    settings = getattr(context, "settings", None)
     model = getattr(context.service.llm, "model", "configured-provider")
+    model_label = getattr(settings, "deepseek_model_label", None) or model
     status_counts = {}
     tool_counts = {}
     phase_counts = {}
@@ -71,6 +216,14 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
     prefill_seconds = 0.0
     generation_seconds = 0.0
     measured_generation_tokens = 0
+    actual_total_tokens = 0
+    cached_tokens = 0
+    cache_miss_tokens = 0
+    reasoning_tokens = 0
+    provider_latency_samples = 0
+    provider_latency_ms_total = 0.0
+    ttft_samples = 0
+    ttft_ms_total = 0.0
     llm_latency = []
     tool_latency = []
     retries = 0
@@ -102,14 +255,40 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             llm_response_events += 1
             chars = payload.get("response_chars", 0)
             estimated_response_tokens += int(chars / 4) if isinstance(chars, (int, float)) else 0
-            usage = payload.get("usage", {})
-            actual_prompt_tokens += int(usage.get("prompt_eval_count", 0) or 0)
-            actual_response_tokens += int(usage.get("eval_count", 0) or 0)
-            if usage.get("prompt_eval_count") or usage.get("eval_count"):
+            usage = payload.get("usage") or {}
+            if not isinstance(usage, dict):
+                usage = {}
+            prompt_tokens, completion_tokens = _usage_tokens(usage)
+            actual_prompt_tokens += prompt_tokens
+            actual_response_tokens += completion_tokens
+            if prompt_tokens or completion_tokens:
                 actual_usage_events += 1
+            prompt_details = usage.get("prompt_tokens_details")
+            prompt_details = prompt_details if isinstance(prompt_details, dict) else {}
+            completion_details = usage.get("completion_tokens_details")
+            completion_details = completion_details if isinstance(completion_details, dict) else {}
+            actual_total_tokens += int(usage.get("total_tokens", 0) or 0) or (
+                prompt_tokens + completion_tokens
+            )
+            # DeepSeek reports cache hits both at the top level and inside
+            # ``prompt_tokens_details``; other gateways use only the latter.
+            cached_tokens += max(
+                int(usage.get("prompt_cache_hit_tokens", 0) or 0),
+                int(prompt_details.get("cached_tokens", 0) or 0),
+            )
+            cache_miss_tokens += int(usage.get("prompt_cache_miss_tokens", 0) or 0)
+            reasoning_tokens += int(completion_details.get("reasoning_tokens", 0) or 0)
+            latency_ms = usage.get("provider_latency_ms")
+            if isinstance(latency_ms, (int, float)):
+                provider_latency_samples += 1
+                provider_latency_ms_total += float(latency_ms)
+            ttft_ms = usage.get("ttft_ms")
+            if isinstance(ttft_ms, (int, float)):
+                ttft_samples += 1
+                ttft_ms_total += float(ttft_ms)
             prefill_seconds += float(usage.get("prompt_eval_duration", 0) or 0) / 1_000_000_000
             generation_seconds += float(usage.get("eval_duration", 0) or 0) / 1_000_000_000
-            measured_generation_tokens += int(usage.get("eval_count", 0) or 0)
+            measured_generation_tokens += completion_tokens
             request_key = (event.task_id, event.node_id, payload.get("role", "unknown"))
             requested_at = llm_requests.get(request_key)
             if requested_at is not None:
@@ -136,12 +315,12 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             if event.event_type == "LLM_RESPONSE"
         )
         task_actual_prompt = sum(
-            int(((event.payload or {}).get("usage") or {}).get("prompt_eval_count", 0) or 0)
+            _usage_tokens((event.payload or {}).get("usage") or {})[0]
             for event in task_task_events
             if event.event_type == "LLM_RESPONSE"
         )
         task_actual_response = sum(
-            int(((event.payload or {}).get("usage") or {}).get("eval_count", 0) or 0)
+            _usage_tokens((event.payload or {}).get("usage") or {})[1]
             for event in task_task_events
             if event.event_type == "LLM_RESPONSE"
         )
@@ -165,8 +344,9 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
                     "calls": 0,
                 },
             )
-            bucket["prompt_tokens"] += int(usage.get("prompt_eval_count", 0) or 0)
-            bucket["response_tokens"] += int(usage.get("eval_count", 0) or 0)
+            prompt_tokens, completion_tokens = _usage_tokens(usage)
+            bucket["prompt_tokens"] += prompt_tokens
+            bucket["response_tokens"] += completion_tokens
             bucket["estimated_tokens"] += int((payload.get("response_chars", 0) or 0) / 4)
             bucket["prefill_seconds"] += float(usage.get("prompt_eval_duration", 0) or 0) / 1_000_000_000
             bucket["generation_seconds"] += float(usage.get("eval_duration", 0) or 0) / 1_000_000_000
@@ -201,9 +381,7 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             elif event.event_type == "LLM_RESPONSE":
                 usage["estimated_tokens"] += int(payload.get("response_chars", 0) / 4)
                 provider_usage = payload.get("usage") or {}
-                measured = int(provider_usage.get("prompt_eval_count", 0) or 0) + int(
-                    provider_usage.get("eval_count", 0) or 0
-                )
+                measured = sum(_usage_tokens(provider_usage))
                 usage["actual_tokens"] += measured
                 usage["actual_tokens_available"] = bool(measured)
             elif event.event_type == "TOOL_CALLED":
@@ -247,7 +425,7 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             "estimated_tokens": task_prompt + task_response,
             "actual_tokens": task_measured_total,
             "actual_tokens_available": task_actual_available,
-            "token_source": "ollama" if task_actual_available else "estimated_chars_divided_by_4",
+            "token_source": "measured" if task_actual_available else "estimated_chars_divided_by_4",
             "duration_seconds": round(
                 max(0, (task.finished_at - task.started_at).total_seconds())
                 if task.started_at and task.finished_at else 0,
@@ -289,8 +467,9 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
                 bucket["responses"] += 1
                 bucket["estimated_response_tokens"] += int((payload.get("response_chars", 0) or 0) / 4)
                 usage = payload.get("usage") or {}
-                bucket["actual_prompt_tokens"] += int(usage.get("prompt_eval_count", 0) or 0)
-                bucket["actual_response_tokens"] += int(usage.get("eval_count", 0) or 0)
+                prompt_tokens, completion_tokens = _usage_tokens(usage)
+                bucket["actual_prompt_tokens"] += prompt_tokens
+                bucket["actual_response_tokens"] += completion_tokens
                 bucket["prefill_seconds"] += float(usage.get("prompt_eval_duration", 0) or 0) / 1_000_000_000
                 bucket["generation_seconds"] += float(usage.get("eval_duration", 0) or 0) / 1_000_000_000
         if event.event_type == "TOOL_RESULT":
@@ -331,8 +510,84 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         bucket["average_prefill_seconds"] = round(float(bucket["prefill_seconds"]) / responses, 3)
         bucket["average_generation_seconds"] = round(float(bucket["generation_seconds"]) / responses, 3)
         bucket["actual_available"] = bool(measured)
+    # Reliability, queue health and per-worker outcomes: the signals that tell
+    # an unattended run apart from a healthy one.
+    tool_calls_total = 0
+    tool_calls_failed = 0
+    blockers: dict[str, int] = {}
+    worker_outcomes: dict[str, dict[str, int]] = {}
+    for task in tasks:
+        worker = str(
+            task.metadata.get("worker") or task.metadata.get("template") or "UNROUTED"
+        )
+        bucket = worker_outcomes.setdefault(
+            worker, {"total": 0, "succeeded": 0, "failed": 0, "blocked": 0, "cancelled": 0}
+        )
+        bucket["total"] += 1
+        status = task.status.value
+        if status == "SUCCEEDED":
+            bucket["succeeded"] += 1
+        elif status == "FAILED":
+            bucket["failed"] += 1
+        elif status == "BLOCKED":
+            bucket["blocked"] += 1
+        elif status == "CANCELLED":
+            bucket["cancelled"] += 1
+    for event in events:
+        payload = event.payload or {}
+        if event.event_type == "TOOL_RESULT":
+            tool_calls_total += 1
+            if payload.get("success") is False:
+                tool_calls_failed += 1
+        elif event.event_type in {
+            "NODE_BLOCKED",
+            "TASK_NO_PROGRESS",
+            "BUDGET_EXHAUSTED",
+            "OPERATION_REJECTED",
+            "INPUTS_MISSING",
+            "REPLAN_FAILED",
+        }:
+            reason = str(
+                payload.get("reason") or payload.get("budget") or event.event_type
+            )[:140]
+            blockers[reason] = blockers.get(reason, 0) + 1
+    queue_waits = [
+        (task.started_at - task.created_at).total_seconds()
+        for task in tasks
+        if task.started_at and task.created_at
+    ]
+    queued_states = {"CREATED", "QUEUED", "PLANNING", "READY"}
+    running_states = {"RUNNING", "VERIFYING", "FINALIZING"}
+    queue = {
+        "queued": sum(1 for task in tasks if task.status.value in queued_states),
+        "running": sum(1 for task in tasks if task.status.value in running_states),
+        "waiting": sum(1 for task in tasks if task.status.value == "WAITING"),
+        "blocked": sum(1 for task in tasks if task.status.value == "BLOCKED"),
+        "average_queue_seconds": round(sum(queue_waits) / len(queue_waits), 2)
+        if queue_waits
+        else 0,
+        "max_queue_seconds": round(max(queue_waits), 2) if queue_waits else 0,
+    }
+    cost = _cost_estimate(
+        settings, model, actual_prompt_tokens, cached_tokens, actual_response_tokens
+    )
     return {
         "model": model,
+        "model_label": model_label,
+        "cost": cost,
+        "reliability": {
+            "tool_calls": tool_calls_total,
+            "tool_failures": tool_calls_failed,
+            "tool_success_rate": round(
+                (tool_calls_total - tool_calls_failed) / tool_calls_total * 100, 1
+            )
+            if tool_calls_total
+            else 0,
+            "retries": retries,
+            "blockers": dict(sorted(blockers.items(), key=lambda item: -item[1])[:10]),
+        },
+        "queue": queue,
+        "worker_outcomes": worker_outcomes,
         "event_counts": status_counts,
         "tool_counts": tool_counts,
         "phase_counts": phase_counts,
@@ -345,9 +600,15 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         "actual_tokens": {
             "prompt": actual_prompt_tokens,
             "response": actual_response_tokens,
-            "total": actual_prompt_tokens + actual_response_tokens,
+            "total": actual_total_tokens or actual_prompt_tokens + actual_response_tokens,
+            "cached": cached_tokens,
+            "cache_miss": cache_miss_tokens,
+            "reasoning": reasoning_tokens,
+            "cache_hit_rate": round(
+                cached_tokens / (cached_tokens + cache_miss_tokens) * 100, 1
+            ) if (cached_tokens + cache_miss_tokens) else 0,
             "available": bool(actual_prompt_tokens or actual_response_tokens),
-            "basis": "Ollama prompt_eval_count/eval_count when provided",
+            "basis": "Provider prompt_tokens/completion_tokens/total_tokens plus cache and reasoning details when provided",
         },
         "display_tokens": {
             "prompt": actual_prompt_tokens if actual_prompt_tokens else estimated_prompt_tokens,
@@ -358,9 +619,9 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
                 else estimated_prompt_tokens + estimated_response_tokens
             ),
             "source": (
-                "ollama"
+                "measured"
                 if actual_usage_events == llm_response_events and actual_usage_events
-                else "ollama_partial"
+                else "measured_partial"
                 if actual_usage_events
                 else "estimated_chars_divided_by_4"
             ),
@@ -376,6 +637,24 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
             "generation_tokens_per_second": round(
                 measured_generation_tokens / generation_seconds, 2
             ) if generation_seconds else 0,
+            # Averages hide the tail; the tail is what breaks a 24/7 worker.
+            "llm_p50_seconds": _percentile(llm_latency, 0.5),
+            "llm_p95_seconds": _percentile(llm_latency, 0.95),
+            "tool_p50_seconds": _percentile(tool_latency, 0.5),
+            "tool_p95_seconds": _percentile(tool_latency, 0.95),
+            "task_p50_seconds": _percentile(durations, 0.5),
+            "task_p95_seconds": _percentile(durations, 0.95),
+        },
+        "provider_latency": {
+            "samples": provider_latency_samples,
+            "average_ms": round(provider_latency_ms_total / provider_latency_samples, 1)
+            if provider_latency_samples
+            else 0,
+            "ttft_samples": ttft_samples,
+            "average_ttft_ms": round(ttft_ms_total / ttft_samples, 1)
+            if ttft_samples
+            else 0,
+            "basis": "measured around the provider call; TTFT requires streaming",
         },
         "llm_per_request": llm_per_request,
         "phase_metrics": phase_metrics,

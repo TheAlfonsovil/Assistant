@@ -39,6 +39,10 @@ RULES
 - Use OPERATION for registered work, VERIFY for evidence checks, WAIT for missing
   user input, and NOTIFY only when requested. Never put shell commands or tool
   arguments in a plan; the resolver supplies typed arguments.
+- Screen work uses `screen.list` then `screen.capture` (the PNG is published to
+  the artifact ledger with its monitor origin and scale); clicking or typing
+  uses `input.*` with absolute coordinates derived from that capture. Capture
+  again after acting: an unverified click is not evidence.
 - Include acceptance evidence when observable. Inputs and outputs are declarations,
   not operation arguments.
 - Audit, review, inspect, and analyze are read-only unless the user explicitly

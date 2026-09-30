@@ -8,6 +8,7 @@ from ..serializers import (
     _dashboard_analytics,
     _dashboard_devices,
     _event_json,
+    _metrics_series,
 )
 
 router = APIRouter(tags=["dashboard"])
@@ -38,7 +39,27 @@ async def overview(request: Request) -> dict:
             "active_tasks": runtime.last_active_count,
             "metrics": runtime.metrics_snapshot(),
             "idle": runtime.idle_snapshot(),
+            "offpeak": runtime.offpeak_snapshot(),
         },
+    }
+
+
+@router.get("/metrics/series")
+async def metrics_series(request: Request, hours: int = 24) -> dict:
+    """Hourly rollup for the dashboard trend view.
+
+    Derived from the retained events, so the available span is bounded by
+    ``ASSISTANT_EVENT_RETENTION_DAYS`` rather than by an unbounded history.
+    """
+    context = get_context(request)
+    span = max(1, min(hours, 168))
+    events = await context.service.repository.list_recent_events(
+        limit=min(5000, span * 120)
+    )
+    return {
+        "hours": span,
+        "buckets": _metrics_series(events, span),
+        "basis": "hourly rollup of retained events",
     }
 
 
@@ -54,6 +75,7 @@ async def observability(request: Request, limit: int = 200) -> dict:
             "readiness": runtime.readiness_snapshot(),
             "last_error": runtime.last_error,
             "idle": runtime.idle_snapshot(),
+            "offpeak": runtime.offpeak_snapshot(),
         },
     }
 

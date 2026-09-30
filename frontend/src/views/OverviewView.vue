@@ -11,6 +11,7 @@ const ordered = computed(() => orderStatuses(counts.value))
 const maxCount = computed(() => Math.max(1, ...ordered.value.map(([, c]) => c)))
 const active = computed(() => system.runtime.active_tasks ?? 0)
 const idle = computed(() => system.idle ?? {})
+const offpeak = computed(() => system.offpeak ?? {})
 const metrics = computed(() => system.metrics ?? {})
 </script>
 
@@ -26,6 +27,11 @@ const metrics = computed(() => system.metrics ?? {})
       <MetricCard label="Total tareas" :value="Object.values(counts).reduce((a, b) => a + b, 0)" />
       <MetricCard label="Proyectos" :value="system.projects.length" />
       <MetricCard label="Idle cycle" :value="idle.enabled ? 'ON' : 'OFF'" :hint="idle.maintenance_runs ? idle.maintenance_runs + ' mantenimientos' : 'inactivo'" />
+      <MetricCard
+        label="Ahorro de consumo"
+        :value="offpeak.state === 'PAUSED' ? 'PAUSA' : offpeak.enabled ? 'ON' : 'OFF'"
+        :hint="offpeak.enabled ? 'pausa en horas punta DeepSeek' : 'sin ahorro activo'"
+      />
     </div>
 
     <div class="grid cols-2">

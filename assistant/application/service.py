@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
+from ..attachments import persist_uploads
 from ..context import ContextBuilder
 from ..devices.computer.codegraph import CodeGraphTool
 from ..domain.contracts import (
@@ -48,7 +49,6 @@ from ..domain.models import (
 )
 from ..infrastructure.orm import IdempotencyRow, LeaseRow
 from ..infrastructure.repositories import TaskRepository
-from ..infrastructure.series_repository import SeriesRepository
 from ..llm import (
     AssistantResponse,
     LLMProvider,
@@ -62,9 +62,26 @@ from ..planning import plan_coverage_warnings, validate_plan_quality
 from ..scheduler import NodeScheduler
 from ..tools import ToolRegistry
 from ..verifier import DeterministicVerifier
-from .series_service import SeriesService
 
 logger = logging.getLogger(__name__)
+
+# Recurring work: one minute is the floor, so a schedule cannot become a
+# self-inflicted request loop; a month is the practical ceiling.
+SCHEDULE_MIN_SECONDS = 60
+SCHEDULE_MAX_SECONDS = 30 * 24 * 3600
+
+
+def _parse_schedule_time(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            moment = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment
 
 
 class TaskService:
@@ -82,22 +99,26 @@ class TaskService:
         max_steps: int = 1000,
         event_retention_days: int = 30,
         event_retention_keep_recent: int = 1000,
+        attachment_max_bytes: int = 5_000_000,
+        attachment_max_count: int = 4,
+        vision_enabled: bool = False,
     ):
         self.repository = TaskRepository(session, event_sink=event_sink)
         self.session = session
         self.llm = llm
         self.tools = tools
-        # Series content is authored data, not task state, so it gets its own
-        # repository over the same session. A runtime reset clears tasks and
-        # memory but must not delete characters or scenes.
-        self.series = SeriesService(SeriesRepository(session))
         self.verifier = verifier or DeterministicVerifier()
         self.scheduler = NodeScheduler()
+        self.attachment_max_bytes = max(1, int(attachment_max_bytes))
+        self.attachment_max_count = max(0, int(attachment_max_count))
+        self.vision_enabled = bool(vision_enabled)
+        self.workspace_root = workspace_root
         self.context_builder = ContextBuilder(
             self.repository,
             tools,
             workspace_root=workspace_root,
             projects_root=projects_root,
+            vision_enabled=self.vision_enabled,
         )
         self.projects_root = projects_root
         self.default_execution_time = default_execution_time
@@ -211,6 +232,19 @@ class TaskService:
         if project:
             project.last_used_at = datetime.now(UTC)
             await self.repository.update_project(project)
+        # Attachments are validated and written before the task is persisted, so
+        # an invalid upload fails the request instead of creating a task that
+        # silently lost its images.
+        attachment_refs: list[dict[str, Any]] = []
+        if request.attachments:
+            attachment_refs = persist_uploads(
+                Path(self.workspace_root) / "data" / "attachments",
+                task.id,
+                list(request.attachments),
+                max_bytes=self.attachment_max_bytes,
+                max_count=self.attachment_max_count,
+            )
+            task.metadata["attachments"] = attachment_refs
         task.status = TaskStatus.WAITING if requires_project_selection else TaskStatus.QUEUED
         root = TaskNode(
             task_id=task.id,
@@ -226,9 +260,41 @@ class TaskService:
                 task_id=task.id,
                 node_id=root.id,
                 event_type="TASK_CREATED",
-                payload={"task_id": task.id, "goal": task.goal, "status": task.status},
+                payload={
+                    "task_id": task.id,
+                    "title": task.title,
+                    "goal": task.goal,
+                    "status": task.status,
+                },
             )
         )
+        for reference in attachment_refs:
+            await self.repository.save_artifact(
+                task.id,
+                ArtifactRef(
+                    id=str(reference["id"]),
+                    kind=ArtifactKind.IMAGE,
+                    description=str(reference["filename"]),
+                    producer_node_id=root.id,
+                    path=str(reference["path"]),
+                    checksum=str(reference["checksum"]),
+                    metadata={
+                        "filename": reference["filename"],
+                        "content_type": reference["content_type"],
+                        "size": reference["size"],
+                    },
+                ),
+            )
+        if attachment_refs:
+            await self.repository.save_task(task)
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    node_id=root.id,
+                    event_type="ATTACHMENT_ADDED",
+                    payload={"attachments": attachment_refs},
+                )
+            )
         await self.repository.save_event(TaskEvent(
             task_id=task.id,
             node_id=root.id,
@@ -368,7 +434,7 @@ class TaskService:
         return False
 
     async def _resolve_operation_root(
-        self, operation: Operation, project: Project | None
+        self, operation: Operation, project: Project | None, task: Task | None = None
     ) -> Project | None:
         """Apply the authoritative root policy for one operation.
 
@@ -378,8 +444,14 @@ class TaskService:
         ``project.create`` is the exception: it must always target the projects
         root so a new project becomes a direct child of it, never a child of
         whichever project the task is attached to.
+
+        Task-scoped capabilities (durable memory, artifact ledger, recurring
+        work) receive the task id the same way: injected here, never supplied by
+        the model.
         """
         tool, method = operation.tool, operation.method
+        if task is not None and tool in {"memory", "artifact", "schedule"}:
+            operation.args["_task_id"] = task.id
         if tool == "project" and method == "create":
             operation.args["root"] = str(Path(self.projects_root).expanduser().resolve())
             return project
@@ -472,11 +544,14 @@ class TaskService:
         )
 
     async def reconcile_idle(self, has_work: bool = False) -> int:
+        # Recurring work is time-driven, not queue-driven: a busy queue must not
+        # starve a due schedule, and firing one only clones a task.
+        scheduled = await self.reconcile_schedules()
         if has_work:
             # The main dispatcher is actively cycling tasks. Running idle
             # supervision here would race the scheduler over the same tasks
             # and burn LLM/tool budget for work already in motion.
-            return 0
+            return scheduled
         repaired = 0
         purge = getattr(self.repository, "purge_expired_memory", None)
         if purge is not None:
@@ -503,7 +578,184 @@ class TaskService:
             if not graph.ready_nodes() and not await self._has_active_running_node(graph):
                 await self.execute_once(task.id)
                 repaired += 1
-        return repaired
+        return repaired + scheduled
+
+    async def reconcile_schedules(self, now: datetime | None = None) -> int:
+        """Clone every due recurring task and advance its schedule.
+
+        The holder only advances: the work itself runs as an ordinary child
+        task, so budgets, leases, idempotency and the ledger apply unchanged.
+        Missed windows collapse into one run instead of firing a backlog.
+        """
+        moment = now or datetime.now(UTC)
+        fired = 0
+        for task in await self.repository.list_tasks():
+            schedule = task.metadata.get("schedule")
+            if not isinstance(schedule, dict) or not schedule.get("enabled", True):
+                continue
+            if task.status in {TaskStatus.CANCELLED, TaskStatus.FAILED}:
+                continue
+            try:
+                every = int(schedule.get("every_seconds") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not SCHEDULE_MIN_SECONDS <= every <= SCHEDULE_MAX_SECONDS:
+                continue
+            due = _parse_schedule_time(schedule.get("next_run_at"))
+            if due is None or due > moment:
+                continue
+            # The clone goes through `create_task` on purpose: project
+            # resolution, agent-mode wiring and budget defaults must be the
+            # same as for any other task.
+            clone = await self.create_task(
+                TaskRequest(
+                    title=task.title,
+                    goal=task.goal,
+                    description=task.description,
+                    source="SCHEDULE",
+                    project_id=task.project_id,
+                    priority=task.priority,
+                )
+            )
+            clone.parent_task_id = task.id
+            clone.root_task_id = task.root_task_id or task.id
+            clone.budget = task.budget.model_copy(deep=True)
+            if task.attachments:
+                clone.metadata["attachments"] = [dict(ref) for ref in task.attachments]
+            await self.repository.save_task(clone)
+            while due <= moment:
+                due += timedelta(seconds=every)
+            schedule["next_run_at"] = due.isoformat()
+            schedule["last_fired_at"] = moment.isoformat()
+            schedule["runs"] = int(schedule.get("runs") or 0) + 1
+            schedule["last_task_id"] = clone.id
+            task.metadata["schedule"] = schedule
+            task.status = TaskStatus.WAITING
+            task.finished_at = None
+            await self.repository.save_task(task)
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    event_type="SCHEDULE_FIRED",
+                    payload={
+                        "every_seconds": every,
+                        "next_run_at": schedule["next_run_at"],
+                        "fired_task_id": clone.id,
+                        "runs": schedule["runs"],
+                    },
+                )
+            )
+            fired += 1
+        return fired
+
+    async def create_schedule(
+        self,
+        goal: str,
+        every_seconds: int,
+        *,
+        title: str = "",
+        description: str = "",
+        project_id: str | None = None,
+        parent_task_id: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> Task:
+        """Create the holder task of a recurring schedule.
+
+        The holder is written directly as WAITING instead of going through
+        `create_task`: it must never be dispatched, and one single write removes
+        the window where a concurrent pass could run it before the schedule
+        metadata existed.
+        """
+        every = int(every_seconds)
+        if not SCHEDULE_MIN_SECONDS <= every <= SCHEDULE_MAX_SECONDS:
+            raise ValueError(
+                f"every_seconds must be between {SCHEDULE_MIN_SECONDS} and "
+                f"{SCHEDULE_MAX_SECONDS}"
+            )
+        now = datetime.now(UTC)
+        task = Task(
+            parent_task_id=parent_task_id,
+            source="SCHEDULE",
+            project_id=project_id,
+            title=title,
+            goal=goal,
+            description=description,
+            status=TaskStatus.WAITING,
+            metadata={
+                "schedule": {
+                    "every_seconds": every,
+                    "next_run_at": (now + timedelta(seconds=every)).isoformat(),
+                    "enabled": True,
+                    "runs": 0,
+                    "created_at": now.isoformat(),
+                    "created_by_task": parent_task_id,
+                }
+            },
+        )
+        if parent_task_id:
+            parent = await self.get_task(parent_task_id)
+            if parent is not None:
+                task.project_id = task.project_id or parent.project_id
+                project_path = parent.metadata.get("project_path")
+                if project_path:
+                    task.metadata["project_path"] = project_path
+        if attachments:
+            task.metadata["attachments"] = [dict(ref) for ref in attachments]
+        root = TaskNode(
+            task_id=task.id,
+            type=NodeType.TASK,
+            description=task.goal,
+            status=NodeStatus.WAITING,
+            priority=task.priority,
+        )
+        await self.repository.save_task(task)
+        await self.repository.save_node(root)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                node_id=root.id,
+                event_type="TASK_CREATED",
+                payload={
+                    "task_id": task.id,
+                    "title": task.title,
+                    "goal": task.goal,
+                    "status": task.status,
+                    "source": "SCHEDULE",
+                },
+            )
+        )
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                node_id=root.id,
+                event_type="SCHEDULE_CREATED",
+                payload={
+                    "every_seconds": every,
+                    "next_run_at": task.metadata["schedule"]["next_run_at"],
+                },
+            )
+        )
+        return task
+
+    async def cancel_schedule(self, task_id: str) -> Task | None:
+        """Disable a schedule, stopping future runs but keeping its history."""
+        task = await self.get_task(task_id)
+        if task is None or not isinstance(task.metadata.get("schedule"), dict):
+            return None
+        schedule = dict(task.metadata["schedule"])
+        schedule["enabled"] = False
+        schedule["cancelled_at"] = datetime.now(UTC).isoformat()
+        task.metadata["schedule"] = schedule
+        if task.status in {TaskStatus.WAITING, TaskStatus.QUEUED, TaskStatus.READY}:
+            task.status = TaskStatus.CANCELLED
+            task.finished_at = datetime.now(UTC)
+        await self.repository.save_task(task)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id, event_type="SCHEDULE_CANCELLED", payload={"task_id": task.id}
+            )
+        )
+        return task
 
     async def cancel_task(self, task_id: str, reason: str = "cancelled by user") -> Task | None:
         cancellation = self._cancellation_events.get(task_id)
@@ -825,14 +1077,26 @@ class TaskService:
 
         async def renew_until_done() -> None:
             nonlocal lease_lost
-            while True:
-                try:
-                    await asyncio.wait_for(stop_renewal.wait(), timeout=interval)
-                    return
-                except TimeoutError:
-                    if not await self.renew_lease(node_id, lease_seconds):
-                        lease_lost = True
+            try:
+                while True:
+                    try:
+                        await asyncio.wait_for(stop_renewal.wait(), timeout=interval)
                         return
+                    except TimeoutError:
+                        if not await self.renew_lease(node_id, lease_seconds):
+                            lease_lost = True
+                            return
+            finally:
+                # Sessions are scoped to the current asyncio task, so this child
+                # task must drop its own session or it is only reclaimed by the
+                # garbage collector (SQLAlchemy warns about exactly that). A
+                # plain session has no ``remove``, so it is probed.
+                remove = getattr(self.session, "remove", None)
+                if remove is not None:
+                    try:
+                        await remove()
+                    except Exception:  # noqa: BLE001 - cleanup must not fail a tool
+                        logger.debug("Releasing the renewal session failed", exc_info=True)
 
         renewal_task = asyncio.create_task(renew_until_done())
         try:
@@ -1508,6 +1772,42 @@ class TaskService:
         )
 
     @staticmethod
+    def _operation_is_repeatable(tool_definition, method: str) -> bool:
+        """True when repeating this exact call is harmless.
+
+        Reads must stay live (a cached GET would report stale state), while a
+        side effect must never run twice because a turn was replayed.
+        """
+        if tool_definition.idempotent:
+            return True
+        repeatable = {item.casefold() for item in tool_definition.idempotent_methods}
+        return (method or "").casefold() in repeatable
+
+    async def _agent_replay_key(
+        self, task: Task, operation: Operation, tool_definition
+    ) -> tuple[str | None, dict | None]:
+        """Return the replay key and any stored result for one agent operation.
+
+        Reads are never cached: repeating them is how a worker observes new
+        state. Only side-effecting (non-idempotent) operations get a
+        task-scoped key, so a turn replayed after a process restart can no
+        longer repeat an effect that already happened. An explicit
+        ``operation.idempotency_key`` from the model always wins.
+        """
+        key = operation.idempotency_key
+        if key is None:
+            if tool_definition is None or self._operation_is_repeatable(
+                tool_definition, operation.method
+            ):
+                return None, None
+            key = self._operation_key(task.id, "task-scope", operation)
+        existing = await self.session.get(IdempotencyRow, key)
+        if existing is None:
+            return key, None
+        stored = existing.result_json
+        return key, dict(stored) if isinstance(stored, dict) else None
+
+    @staticmethod
     def _operation_key(task_id: str, node_id: str, operation) -> str:
         operation_args = {
             key: value for key, value in operation.args.items()
@@ -1842,18 +2142,49 @@ class TaskService:
         usage = usage or {}
         totals = task.runtime.llm_usage
         totals["calls"] = int(totals.get("calls", 0)) + 1
-        totals["prompt_tokens"] = int(totals.get("prompt_tokens", 0)) + int(
-            usage.get("prompt_eval_count", 0) or 0
+        prompt_tokens = int(usage.get("prompt_tokens", usage.get("prompt_eval_count", 0)) or 0)
+        completion_tokens = int(usage.get("completion_tokens", usage.get("eval_count", 0)) or 0)
+        totals["prompt_tokens"] = int(totals.get("prompt_tokens", 0)) + prompt_tokens
+        totals["completion_tokens"] = int(totals.get("completion_tokens", 0)) + completion_tokens
+        totals["total_tokens"] = int(totals.get("total_tokens", 0)) + (
+            int(usage.get("total_tokens", 0) or 0) or prompt_tokens + completion_tokens
         )
-        totals["completion_tokens"] = int(totals.get("completion_tokens", 0)) + int(
-            usage.get("eval_count", 0) or 0
+        # DeepSeek reports cache accounting both at the top level and inside
+        # ``prompt_tokens_details``; OpenAI-compatible gateways use only the
+        # latter. Keep whichever values are present so cache savings are real.
+        prompt_details = usage.get("prompt_tokens_details")
+        prompt_details = prompt_details if isinstance(prompt_details, dict) else {}
+        cached_tokens = max(
+            int(usage.get("prompt_cache_hit_tokens", 0) or 0),
+            int(prompt_details.get("cached_tokens", 0) or 0),
         )
+        totals["cached_tokens"] = int(totals.get("cached_tokens", 0)) + cached_tokens
+        totals["cache_miss_tokens"] = int(totals.get("cache_miss_tokens", 0)) + int(
+            usage.get("prompt_cache_miss_tokens", 0) or 0
+        )
+        completion_details = usage.get("completion_tokens_details")
+        completion_details = completion_details if isinstance(completion_details, dict) else {}
+        totals["reasoning_tokens"] = int(totals.get("reasoning_tokens", 0)) + int(
+            completion_details.get("reasoning_tokens", 0) or 0
+        )
+        # Ollama-style durations are absent on DeepSeek; the keys are kept so an
+        # Ollama-compatible gateway still reports prefill/generation time.
         totals["prefill_ms"] = int(totals.get("prefill_ms", 0)) + int(
             int(usage.get("prompt_eval_duration", 0) or 0) / 1_000_000
         )
         totals["generation_ms"] = int(totals.get("generation_ms", 0)) + int(
             int(usage.get("eval_duration", 0) or 0) / 1_000_000
         )
+        # Timing measured by the provider around the HTTP call: real latency for
+        # every model, plus TTFT when streaming is enabled.
+        latency_ms = usage.get("provider_latency_ms")
+        if isinstance(latency_ms, (int, float)):
+            totals["latency_ms"] = int(totals.get("latency_ms", 0)) + int(latency_ms)
+            totals["latency_samples"] = int(totals.get("latency_samples", 0)) + 1
+        ttft_ms = usage.get("ttft_ms")
+        if isinstance(ttft_ms, (int, float)):
+            totals["ttft_ms"] = int(totals.get("ttft_ms", 0)) + int(ttft_ms)
+            totals["ttft_samples"] = int(totals.get("ttft_samples", 0)) + 1
         return dict(totals)
 
     @staticmethod
@@ -1876,12 +2207,23 @@ class TaskService:
         request = {}
         if prepare_request is not None:
             request = prepare_request(role, context, schema)
+        payload: dict[str, Any] = {"role": role, "request": request}
+        # ``context_chars`` is what the metrics endpoint turns into estimated
+        # prompt tokens. It is measured here, where the exact context object is
+        # still available, because the trace sink is not wired in the API
+        # runtime and therefore never reaches the event ledger.
+        try:
+            payload["context_chars"] = len(json.dumps(context, default=str))
+        except (TypeError, ValueError):
+            payload["context_chars"] = 0
+        if isinstance(request, dict) and request.get("prompt_chars"):
+            payload["prompt_chars"] = request["prompt_chars"]
         await self.repository.save_event(
             TaskEvent(
                 task_id=task_id,
                 node_id=node_id,
                 event_type="LLM_REQUEST",
-                payload={"role": role, "request": request},
+                payload=payload,
             )
         )
 
@@ -2218,7 +2560,8 @@ class TaskService:
             return True
 
         operation = self._normalize_agent_operation(decision.operation)
-        if self.tools.definition(operation.tool) is None:
+        tool_definition = self.tools.definition(operation.tool)
+        if tool_definition is None:
             task.status = TaskStatus.BLOCKED
             task.failure_reason = f"unknown tool: {operation.tool}"
             task.finished_at = datetime.now(UTC)
@@ -2250,15 +2593,10 @@ class TaskService:
             task.status = TaskStatus.READY
             await self.repository.save_task(task)
             return True
-            task.status = TaskStatus.BLOCKED
-            task.failure_reason = f"unknown tool: {operation.tool}"
-            task.finished_at = datetime.now(UTC)
-            await self.repository.save_task(task)
-            return False
         if not await self._consume_budget(task, "tool_calls", task.budget.max_tool_calls):
             return False
         project = await self.repository.get_project(task.project_id) if task.project_id else None
-        await self._resolve_operation_root(operation, project)
+        await self._resolve_operation_root(operation, project, task)
         node = TaskNode(
             task_id=task.id,
             type=NodeType.OPERATION,
@@ -2280,15 +2618,58 @@ class TaskService:
             operation_error = self.tools.validate_operation(operation)
             if operation_error:
                 raise ValueError(operation_error)
-            output = await self.tools.execute(operation)
-            observation = output.model_dump(mode="json") if hasattr(output, "model_dump") else output
+            idempotency_key, replay = await self._agent_replay_key(
+                task, operation, tool_definition
+            )
+            if replay is not None:
+                operation_result = OperationResult.model_validate(replay)
+                await self.repository.save_event(
+                    TaskEvent(
+                        task_id=task.id,
+                        node_id=node.id,
+                        event_type="OPERATION_IDEMPOTENT_REPLAY",
+                        payload={
+                            "tool": operation.tool,
+                            "method": operation.method,
+                            "reason": (
+                                "identical side-effecting operation already ran in this task"
+                            ),
+                        },
+                    )
+                )
+            else:
+                operation_result = await self.tools.execute(operation)
+                if idempotency_key is not None:
+                    await self.repository.save_idempotency_result(
+                        idempotency_key, operation_result.model_dump(mode="json")
+                    )
+            if tool_definition is not None:
+                evidence = tool_definition.evidence.get(operation.method, {})
+                if evidence:
+                    operation_result = DeterministicVerifier.with_tool_evidence(
+                        operation_result, evidence
+                    )
+            # The agent path runs the same deterministic verifier as the graph
+            # path. The verdict is attached to the observation rather than
+            # falsifying the tool result, so the worker must act on it.
+            verification = self.verifier.verify(operation_result)
+            observation = operation_result.model_dump(mode="json")
             agent_observation = self._agent_observation(operation, observation)
+            if verification.decision.value != "SUCCESS":
+                agent_observation["verification"] = {
+                    "decision": verification.decision.value,
+                    "reason": verification.reason,
+                    "missing_evidence": verification.missing_evidence,
+                }
             node.output_data = observation if isinstance(observation, dict) else {"value": observation}
             node.status = NodeStatus.SUCCEEDED
             node.finished_at = datetime.now(UTC)
             await self.repository.save_node(node)
             if isinstance(observation, dict):
                 await self._persist_project_operation_result(task, operation, observation)
+                await self._publish_operation_artifacts(
+                    task.id, node.id, observation.get("artifacts", []), []
+                )
             await self.repository.save_event(
                 TaskEvent(
                     task_id=task.id,
@@ -2298,6 +2679,23 @@ class TaskService:
                         **node.output_data,
                         "tool": operation.tool,
                         "method": operation.method,
+                    },
+                )
+            )
+            await self.repository.save_event(
+                TaskEvent(
+                    task_id=task.id,
+                    node_id=node.id,
+                    event_type="NODE_VERIFIED",
+                    payload={
+                        "decision": verification.decision.value,
+                        "reason": verification.reason,
+                        "source": "agent",
+                        "criteria_results": [
+                            item.model_dump(mode="json")
+                            for item in verification.criteria_results
+                        ],
+                        "missing_evidence": verification.missing_evidence,
                     },
                 )
             )
@@ -2376,7 +2774,16 @@ class TaskService:
                     "orchestration_stage": "WORK",
                     "worker": task.metadata.get("worker", "GENERAL_WORKER"),
                     "template": task.metadata.get("template", "general"),
-                    "extra_context": {"delegated_from": task.id},
+                    "extra_context": {
+                        **self.context_builder._slim_extra_context(
+                            task.metadata.get("extra_context", {})
+                        ),
+                        "delegated_from": task.id,
+                    },
+                    "acceptance_criteria": task.metadata.get("acceptance_criteria", []),
+                    # A child must see the same evidence the parent was given,
+                    # otherwise a delegated image task silently loses its input.
+                    "attachments": task.metadata.get("attachments", []),
                     "agent_depth": depth + 1,
                 },
             )
@@ -3403,7 +3810,7 @@ class TaskService:
             if acceptance:
                 operation.metadata.setdefault("expected", acceptance)
             project = await self.repository.get_project(task.project_id) if task.project_id else None
-            project = await self._resolve_operation_root(operation, project)
+            project = await self._resolve_operation_root(operation, project, task)
             budget_key = None
             budget_limit = None
             if operation.tool == "codegraph" and operation.method == "query":

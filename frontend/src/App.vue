@@ -16,7 +16,6 @@ const nav = [
   { to: '/resources', icon: '⌁', label: 'Recursos' },
   { to: '/projects', icon: '▣', label: 'Proyectos' },
   { to: '/memory', icon: '◈', label: 'Memoria' },
-  { to: '/series', icon: '▷', label: 'Series' },
   { to: '/chat', icon: '✦', label: 'Chat' },
 ]
 

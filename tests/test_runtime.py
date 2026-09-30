@@ -40,10 +40,10 @@ from assistant.llm import (
     ActionProposal,
     AgentDecision,
     AssistantResponse,
+    DeepSeekLLMProvider,
     FinalReport,
     MockLLMProvider,
     NodeDecision,
-    OllamaLLMProvider,
     OrchestratorDecision,
     PlanNodeProposal,
     PlanProposal,
@@ -1898,7 +1898,7 @@ async def test_reset_state_deletes_runtime_state_but_keeps_projects(tmp_path):
     await database.close()
 
 
-def test_ollama_planner_contract_accepts_graph_response():
+def test_planner_contract_accepts_graph_response():
     proposal = PlanProposal.model_validate(
         {
             "task_id": "task-1",
@@ -1915,163 +1915,164 @@ def test_ollama_planner_contract_accepts_graph_response():
     assert proposal.nodes[0].dependencies == []
 
 
+def test_deepseek_token_usage_is_persisted_in_task_totals():
+    task = Task(goal="audit")
+    totals = TaskService._record_llm_usage(
+        task, {"prompt_tokens": 1200, "completion_tokens": 240,
+               "prompt_cache_hit_tokens": 400, "completion_tokens_details": {"reasoning_tokens": 90}}
+    )
+
+    assert totals["prompt_tokens"] == 1200
+    assert totals["completion_tokens"] == 240
+    assert totals["calls"] == 1
+
+
 @pytest.mark.asyncio
-async def test_ollama_provider_sends_versioned_prompt_and_json_schema():
+async def test_deepseek_provider_uses_chat_completions_and_usage():
     requests = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return httpx.Response(
-            200,
-            json={"response": '{"task_id": null, "nodes": []}'},
-        )
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": '{"task_id": null, "nodes": []}'}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1200, "completion_tokens": 240},
+        })
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OllamaLLMProvider("http://ollama.test", "test-model", client=client)
-    await provider.plan({"task": {"goal": "run tests"}})
+    provider = DeepSeekLLMProvider("https://api.deepseek.com", "deepseek-flash", "test-key", client=client)
+    proposal = await provider.plan({"task": {"goal": "run tests"}})
+
+    assert proposal.nodes == []
+    assert requests[0].url.path == "/chat/completions"
+    assert requests[0].headers["authorization"] == "Bearer test-key"
     payload = json.loads(requests[0].content)
-    prompt = json.loads(payload["prompt"])["instructions"]
-    assert payload["format"]["type"] == "object"
-    assert payload["options"] == {"temperature": 0.1, "num_ctx": 32768}
-    assert payload["think"] is False
-    assert "OUTPUT SCHEMA" in prompt
+    assert payload["model"] == "deepseek-flash"
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["messages"][0]["role"] == "system"
+    assert provider.last_usage["prompt_tokens"] == 1200
     await provider.close()
 
 
 @pytest.mark.asyncio
-async def test_ollama_provider_uses_explicit_reasoning_and_context_budget():
+async def test_deepseek_provider_applies_reasoning_policy_and_traces():
     requests = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(200, json={"response": '{"task_id": null, "nodes": []}'})
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OllamaLLMProvider(
-        "http://ollama.test",
-        "test-model",
-        client=client,
-        num_ctx=8192,
-        thinking=True,
-        reasoning_effort="medium",
-        context_reserve_tokens=1024,
-        max_prompt_chars=200_000,
-    )
-    await provider.plan({"task": {"goal": "run tests"}})
-    payload = json.loads(requests[0].content)
-
-    assert payload["think"] == "medium"
-    assert provider.effective_prompt_chars == (8192 - 1024) * 4
-    await provider.close()
-
-
-@pytest.mark.asyncio
-async def test_ollama_provider_applies_reasoning_policy_per_phase():
-    requests = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(json.loads(request.content))
-        return httpx.Response(200, json={"response": '{"decision": "SUCCESS", "reason": "ok"}'})
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OllamaLLMProvider(
-        "http://ollama.test",
-        "test-model",
-        client=client,
-        thinking=True,
-        reasoning_policy="PLANNER:medium,NODE_RESOLVER:low,VERIFIER:off",
-    )
-    await provider.verify({"result": {"success": True}})
-
-    assert requests[0]["think"] is False
-    assert provider.reasoning_policy["PLANNER"] == "medium"
-    await provider.close()
-
-
-@pytest.mark.asyncio
-async def test_ollama_agent_uses_high_reasoning_and_keep_alive():
-    requests = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(json.loads(request.content))
-        return httpx.Response(
-            200,
-            json={"response": '{"decision_type": "COMPLETE", "reason": "done"}'},
-        )
-
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OllamaLLMProvider(
-        "http://ollama.test",
-        "test-model",
-        client=client,
-        thinking=True,
-        keep_alive="30m",
-    )
-    await provider.agent_decide({"task": {"goal": "inspect"}})
-
-    assert requests[0]["think"] == "high"
-    assert requests[0]["keep_alive"] == "30m"
-    await provider.close()
-
-
-@pytest.mark.asyncio
-async def test_ollama_provider_traces_prompt_and_validated_response():
     traces = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"response": '{"task_id": null, "nodes": []}'})
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": '{"decision": "SUCCESS", "reason": "ok"}'}, "finish_reason": "stop"}],
+        })
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OllamaLLMProvider(
-        "http://ollama.test", "test-model", client=client, trace_sink=traces.append
+    provider = DeepSeekLLMProvider(
+        "https://api.deepseek.com", "deepseek-flash", "test-key", client=client,
+        reasoning_policy="VERIFIER:off,PLANNER:max", trace_sink=traces.append,
     )
-    await provider.plan({"user_prompt": "audit", "task": {"id": "task-1"}})
-    await provider.close()
+    await provider.verify({"result": {"success": True}})
 
-    assert [trace["phase"] for trace in traces] == [
-        "LLM_REQUEST_BUILT",
-        "LLM_RESPONSE_PARSED",
-    ]
-    assert traces[0]["prompt_chars"] > 0
-    assert traces[1]["validated"]["nodes"] == []
+    assert requests[0]["thinking"] == {"type": "disabled"}
+    assert requests[0]["temperature"] == 0.1
+    assert provider.reasoning_policy["PLANNER"] == "max"
+    assert [trace["phase"] for trace in traces] == ["LLM_REQUEST_BUILT", "LLM_RESPONSE_PARSED"]
+    await provider.close()
 
 
 @pytest.mark.asyncio
-async def test_ollama_provider_exposes_prefill_and_generation_timing():
+async def test_deepseek_provider_checks_model_availability_without_leaking_key():
+    requests = []
+
     async def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "response": '{"task_id": null, "nodes": []}',
-                "prompt_eval_count": 1200,
-                "eval_count": 240,
-                "prompt_eval_duration": 2_000_000_000,
-                "eval_duration": 3_000_000_000,
-            },
-        )
+        requests.append(request)
+        return httpx.Response(200, json={"data": [{"id": "deepseek-flash"}]})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OllamaLLMProvider("http://ollama.test", "test-model", client=client)
-    await provider.plan({"task": {"goal": "timing"}})
-
-    assert provider.last_usage["prompt_eval_duration"] == 2_000_000_000
-    assert provider.last_usage["eval_duration"] == 3_000_000_000
-    assert provider.last_usage["prompt_eval_count"] == 1200
+    provider = DeepSeekLLMProvider("https://api.deepseek.com", "deepseek-flash", "test-key", client=client)
+    assert await provider.check_ready() is True
+    assert requests[0].url.path == "/models"
+    assert requests[0].headers["authorization"] == "Bearer test-key"
     await provider.close()
 
 
 @pytest.mark.asyncio
-async def test_ollama_circuit_breaker_opens_after_repeated_failures():
+async def test_deepseek_chat_accepts_image_and_role_messages():
+    requests = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "A chart"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 5},
+        })
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = DeepSeekLLMProvider("https://api.deepseek.com", "deepseek-flash", "test-key", client=client)
+    messages = [
+        {"role": "system", "content": "Describe the image."},
+        {"role": "user", "content": [
+            {"type": "text", "text": "What is this?"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/chart.png", "detail": "low"}},
+        ]},
+    ]
+    result = await provider.chat(messages, reasoning_effort="none", response_format={"type": "text"})
+
+    assert result["choices"][0]["message"]["content"] == "A chart"
+    assert requests[0]["messages"] == messages
+    assert requests[0]["thinking"] == {"type": "disabled"}
+    assert requests[0]["response_format"] == {"type": "text"}
+    assert provider.last_usage["completion_tokens"] == 5
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_chat_stream_accumulates_content_and_usage():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["stream_options"] == {"include_usage": True}
+        return httpx.Response(200, text=(
+            ": keep-alive\n\n"
+            'data: {"choices":[{"delta":{"reasoning_content":"think"},"finish_reason":null}]}\n\n'
+            'data: {"choices":[{"delta":{"content":"Hello "},"finish_reason":null}]}\n\n'
+            'data: {"choices":[{"delta":{"content":"world"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}\n\n'
+            "data: [DONE]"
+        ))
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = DeepSeekLLMProvider("https://api.deepseek.com", "deepseek-flash", "test-key", client=client)
+    result = await provider.chat([{"role": "user", "content": "Hi"}], stream=True)
+
+    assert result["choices"][0]["message"]["content"] == "Hello world"
+    assert result["choices"][0]["message"]["reasoning_content"] == "think"
+    assert provider.last_usage["prompt_tokens"] == 10
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_rejects_images_outside_user_and_truncated_json():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": '{"task_id":'}, "finish_reason": "length"}],
+        })
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = DeepSeekLLMProvider("https://api.deepseek.com", "deepseek-flash", "test-key", client=client)
+    with pytest.raises(ValueError, match="Images are supported only in user"):
+        await provider.chat([{"role": "system", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.com/image.jpg"}}
+        ]}])
+    with pytest.raises(ValueError, match="LLM stopped with length"):
+        await provider.plan({"task": {"goal": "inspect"}})
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_circuit_breaker_opens_after_repeated_failures():
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, text="unavailable")
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    provider = OllamaLLMProvider(
-        "http://ollama.test",
-        "test-model",
-        client=client,
-        failure_threshold=2,
-        recovery_timeout=60,
+    provider = DeepSeekLLMProvider(
+        "https://api.deepseek.com", "deepseek-flash", "test-key", client=client,
+        failure_threshold=2, recovery_timeout=60,
     )
 
     with pytest.raises(httpx.HTTPStatusError):
@@ -2081,6 +2082,25 @@ async def test_ollama_circuit_breaker_opens_after_repeated_failures():
     assert provider.circuit_state == "OPEN"
     with pytest.raises(RuntimeError, match="circuit breaker is open"):
         await provider.plan({"task": {"goal": "blocked"}})
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_deepseek_invalid_json_opens_circuit_after_repeated_responses():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "not json"}, "finish_reason": "stop"}],
+        })
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = DeepSeekLLMProvider(
+        "https://api.deepseek.com", "deepseek-flash", "test-key", client=client,
+        failure_threshold=2,
+    )
+    for _ in range(2):
+        with pytest.raises(ValueError):
+            await provider.plan({"task": {"goal": "invalid"}})
+    assert provider.circuit_state == "OPEN"
     await provider.close()
 
 
@@ -2290,6 +2310,7 @@ async def test_runtime_processes_only_active_tasks_once():
         "idle_skipped": 0,
         "not_ready_passes": 0,
         "runtime_errors": 0,
+        "offpeak_passes": 0,
     }
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 from abc import ABC, abstractmethod
@@ -14,6 +15,39 @@ from pydantic import BaseModel, Field
 from .domain.models import ErrorType, Operation, OperationResult
 
 
+def file_artifact(
+    path: str | Path,
+    *,
+    description: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    checksum: str | None = None,
+) -> dict[str, Any]:
+    """Build a deterministic FILE artifact payload for a path a tool produced.
+
+    Tools are the only components that know which files they really wrote, so
+    they publish the artifact themselves. The id is derived from the resolved
+    path, which makes a replayed operation idempotent instead of creating a
+    duplicate artifact ledger row.
+    """
+    resolved = str(Path(path).resolve())
+    payload: dict[str, Any] = {
+        "id": hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:32],
+        "kind": "file",
+        "description": description or resolved,
+        "path": resolved,
+    }
+    if checksum:
+        payload["checksum"] = checksum
+    if metadata:
+        payload["metadata"] = metadata
+    return payload
+
+
+def content_checksum(content: str) -> str:
+    """SHA-256 of written text, used as the artifact checksum."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
 class ToolDefinition(BaseModel):
     name: str
     description: str
@@ -23,6 +57,10 @@ class ToolDefinition(BaseModel):
     permissions: list[str] = Field(default_factory=list)
     timeout: float = 60.0
     idempotent: bool = True
+    #: Methods that are safe to repeat even when the tool as a whole is not.
+    #: A single flag cannot describe a tool like ``http``, where GET must always
+    #: observe fresh state while POST must never silently run twice.
+    idempotent_methods: list[str] = Field(default_factory=list)
     evidence: dict[str, Any] = Field(default_factory=dict)
 
     def arguments_for(self, method: str) -> dict[str, Any]:
@@ -105,13 +143,19 @@ class NotificationTool(Tool):
 
 
 class ToolRegistry:
-    def __init__(self, tools: list[Tool] | None = None):
+    def __init__(self, tools: list[Tool] | None = None, policy=None, rate_limit=None):
         from .devices.computer.actions import register_actions
 
         self._tools = {
             tool.definition.name: tool
             for tool in (tools if tools is not None else [])
         }
+        # Optional deterministic allow/deny policy. ``None`` keeps the
+        # historical permissive behaviour.
+        self.policy = policy
+        # Optional per-tool pacing; a refused call is retryable so it rides the
+        # existing node-retry backoff.
+        self.rate_limit = rate_limit
         if tools is None:
             register_actions(self)
             self.register(NotificationTool())
@@ -134,6 +178,9 @@ class ToolRegistry:
             return f"Unknown tool: {operation.tool}"
         if operation.method not in definition.methods:
             return f"Unknown method: {operation.tool}.{operation.method}"
+        violation = self.policy.evaluate(operation) if self.policy is not None else None
+        if violation:
+            return violation
         return self._arguments_match_schema(definition, operation.args, operation.method)
 
     @staticmethod
@@ -187,6 +234,16 @@ class ToolRegistry:
                 error=f"Unknown method: {operation.method}",
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
+        # Defence in depth: callers normally validate first, but a direct call
+        # must not bypass the policy either.
+        if self.policy is not None:
+            violation = self.policy.evaluate(operation)
+            if violation:
+                return OperationResult(
+                    success=False,
+                    error=violation,
+                    error_type=ErrorType.AUTH,
+                )
         schema_error = self._arguments_match_schema(tool.definition, operation.args, operation.method)
         if schema_error:
             return OperationResult(
@@ -194,6 +251,15 @@ class ToolRegistry:
                 error=schema_error,
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
+        if self.rate_limit is not None:
+            violation = self.rate_limit.check(operation)
+            if violation:
+                return OperationResult(
+                    success=False,
+                    error=violation,
+                    error_type=ErrorType.TRANSIENT,
+                    retryable=True,
+                )
         started = perf_counter()
         try:
             result = await asyncio.wait_for(
