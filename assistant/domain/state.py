@@ -8,14 +8,19 @@ class InvalidStateTransition(ValueError):
 
 
 _TASK_TRANSITIONS = {
-    TaskStatus.CREATED: {TaskStatus.QUEUED, TaskStatus.WAITING},
-    TaskStatus.QUEUED: {TaskStatus.PLANNING, TaskStatus.READY, TaskStatus.RUNNING, TaskStatus.WAITING, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
+    # Every live state can reach FAILED: any step can raise, and a failure the
+    # machine refuses to record is worse than the failure itself. A missing edge
+    # here is what once turned one rejected response into a task that could never
+    # be closed, was re-dispatched by the runtime and looped until the circuit
+    # breaker opened.
+    TaskStatus.CREATED: {TaskStatus.QUEUED, TaskStatus.WAITING, TaskStatus.FAILED},
+    TaskStatus.QUEUED: {TaskStatus.PLANNING, TaskStatus.READY, TaskStatus.RUNNING, TaskStatus.WAITING, TaskStatus.BLOCKED, TaskStatus.CANCELLED, TaskStatus.FAILED},
     TaskStatus.PLANNING: {TaskStatus.QUEUED, TaskStatus.READY, TaskStatus.FINALIZING, TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
     TaskStatus.READY: {TaskStatus.PLANNING, TaskStatus.RUNNING, TaskStatus.WAITING, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.FINALIZING, TaskStatus.SUCCEEDED, TaskStatus.CANCELLED, TaskStatus.QUEUED},
     TaskStatus.RUNNING: {TaskStatus.READY, TaskStatus.WAITING, TaskStatus.VERIFYING, TaskStatus.FINALIZING, TaskStatus.SUCCEEDED, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.CANCELLED},
     TaskStatus.VERIFYING: {TaskStatus.READY, TaskStatus.WAITING, TaskStatus.BLOCKED, TaskStatus.FAILED, TaskStatus.FINALIZING, TaskStatus.SUCCEEDED, TaskStatus.CANCELLED},
-    TaskStatus.WAITING: {TaskStatus.READY, TaskStatus.QUEUED, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
-    TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.QUEUED, TaskStatus.FINALIZING, TaskStatus.CANCELLED},
+    TaskStatus.WAITING: {TaskStatus.READY, TaskStatus.QUEUED, TaskStatus.BLOCKED, TaskStatus.CANCELLED, TaskStatus.FAILED},
+    TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.QUEUED, TaskStatus.FINALIZING, TaskStatus.CANCELLED, TaskStatus.FAILED},
     TaskStatus.FAILED: {TaskStatus.READY, TaskStatus.QUEUED, TaskStatus.FINALIZING, TaskStatus.CANCELLED},
     TaskStatus.FINALIZING: {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.CANCELLED},
     TaskStatus.SUCCEEDED: {TaskStatus.FINALIZING},

@@ -22,6 +22,9 @@ const DEVICE_LABELS = { computer: 'Ordenador' }
 
 const turns = ref([])
 const message = ref('')
+const specification = ref('')
+const title = ref('')
+const showDetail = ref(false)
 const live = ref('')
 const sending = ref(false)
 const streaming = ref(false)
@@ -376,6 +379,11 @@ async function send() {
   scrollToBottom()
   const resolution = command ? { type: undefined, id: undefined, cleaned: text } : resolveTarget(text)
   const body = { message: resolution.cleaned }
+  // Optional extras, not a mode: a short label for lists and the long version of
+  // the request. Both already reach the model (title <= 200, description <= 20000
+  // characters) and neither is required.
+  if (!command && title.value.trim()) body.title = title.value.trim()
+  if (!command && specification.value.trim()) body.description = specification.value.trim()
   if (resolution.type) {
     body.target_type = resolution.type
     body.target_id = resolution.id
@@ -394,6 +402,9 @@ async function send() {
     else await runChat(body)
     files.value = []
     attachmentError.value = ''
+    title.value = ''
+    specification.value = ''
+    showDetail.value = false
     system.refresh()
   } catch (error) {
     system.notify(error.message, 'error')
@@ -585,6 +596,9 @@ onUnmounted(() => {
 
       <div class="chat-controls">
         <span class="chip">destino: {{ currentTarget?.label }}</span>
+        <button type="button" class="btn ghost compact" @click="showDetail = !showDetail">
+          {{ showDetail ? 'Ocultar detalle' : 'Título y especificación' }}
+        </button>
         <input
           class="input"
           style="max-width: 210px"
@@ -596,6 +610,27 @@ onUnmounted(() => {
         />
         <span class="grow" />
         <button class="btn primary" type="submit" :disabled="sending || !message.trim()">Enviar</button>
+      </div>
+
+      <div v-if="showDetail" class="detail">
+        <label class="detail-field">
+          <small>Título (opcional, para listas)</small>
+          <input v-model="title" class="input" maxlength="200" placeholder="Proyecto test_zone" />
+        </label>
+        <label class="detail-field">
+          <small>Especificación (opcional, lo que no cabe arriba)</small>
+          <textarea
+            v-model="specification"
+            class="textarea"
+            maxlength="20000"
+            rows="4"
+            placeholder="Front en Vue, back en Java 25 con Spring Boot 4, carpetas separadas, script para levantar todo en Docker…"
+          />
+        </label>
+        <p class="chat-hint">
+          El mensaje de arriba es el encargo; esto se añade al contexto del planificador, del agente y del
+          orquestador. Ninguno de los dos campos es obligatorio.
+        </p>
       </div>
 
       <p v-if="attachmentError" class="chat-hint">{{ attachmentError }}</p>

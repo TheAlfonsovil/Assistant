@@ -724,6 +724,11 @@ class ContextBuilder:
                 "id": task.id,
                 "goal": task.goal,
                 "status": task.status,
+                # Deliberately without ``description``: the specification is read
+                # by the planner, which turns it into node descriptions and
+                # acceptance criteria, and this role runs once per node. Passing
+                # the whole specification here would be paid once per node for
+                # information the plan is already supposed to carry.
                 **self._typed_task_context(task),
             },
             "project": {

@@ -139,5 +139,6 @@ tests/test_semantics.py
 tests/test_semantics_and_debug.py
 tests/test_support.py
 tests/test_surface_observation.py
+tests/test_task_failure_path.py
 tests/test_tool_policy.py
 tests/test_windows_uia.py

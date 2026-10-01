@@ -73,7 +73,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.6.3", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.6.4", lifespan=lifespan)
 
 
 @app.middleware("http")

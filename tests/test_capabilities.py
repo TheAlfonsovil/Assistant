@@ -154,6 +154,61 @@ async def test_artifact_tool_lists_and_reads_text_and_refuses_binaries(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_the_ledger_accepts_the_name_it_publishes(tmp_path):
+    """`list` returns {"id": ...}, so `read` cannot insist on `artifact_id`.
+
+    The worker copied the field it had just been given and was told its argument
+    was unsupported, with no hint of what was supported instead. Both halves of
+    that are fixed here: the alias works, and a genuinely unknown argument names
+    the ones the tool does take.
+    """
+    from assistant.domain.contracts import ArtifactKind, ArtifactRef
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'aliases.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session, MockLLMProvider(), ToolRegistry(), workspace_root=str(tmp_path)
+        )
+        task = await service.create_task(TaskRequest(goal="lee el informe"))
+        report = tmp_path / "report.md"
+        report.write_text("# Informe\ncontenido\n", encoding="utf-8")
+        await service.repository.save_artifact(
+            task.id,
+            ArtifactRef(
+                id="text-1",
+                kind=ArtifactKind.FILE,
+                description="informe",
+                producer_node_id="node-1",
+                path=str(report),
+            ),
+        )
+        listed = await ArtifactTool(service.repository).execute(
+            "list", {"_task_id": task.id}, timeout=5
+        )
+        published_name = next(iter(listed.output["artifacts"][0]))
+
+        assert published_name == "id"
+        read = await ArtifactTool(service.repository).execute(
+            "read", {"_task_id": task.id, published_name: "text-1"}, timeout=5
+        )
+        assert read.success is True
+        assert "contenido" in read.output["content"]
+
+        registry = ToolRegistry()
+        registry.register(ArtifactTool(service.repository))
+        violation = registry.validate_operation(
+            Operation(tool="artifact", method="read", args={"id": "text-1", "nonsense": 1})
+        )
+        assert violation is not None
+        assert "nonsense" in violation
+        assert "artifact_id" in violation
+        assert registry.validate_operation(
+            Operation(tool="artifact", method="read", args={"id": "text-1"})
+        ) is None
+
+
+@pytest.mark.asyncio
 async def test_artifact_tool_requires_a_task_context(tmp_path):
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'artifacts-nocontext.db'}")
     await database.create_all()

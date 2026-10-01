@@ -65,6 +65,13 @@ class ToolDefinition(BaseModel):
     #: screen). The runtime observes again right after them, so the next turn
     #: decides from the result of its own action instead of assuming it worked.
     observable_methods: list[str] = Field(default_factory=list)
+    #: Alternative spellings accepted for an argument, mapped to the canonical
+    #: name. They are accepted, never advertised: the schema keeps one name for the
+    #: model to read, but a call that uses the obvious synonym is not rejected.
+    #: ``artifact`` publishes rows as ``{"id": ...}`` and then demanded
+    #: ``artifact_id`` to read them back, which bought the worker a turn of
+    #: guessing in exchange for nothing.
+    aliases: dict[str, str] = Field(default_factory=dict)
     evidence: dict[str, Any] = Field(default_factory=dict)
 
     def arguments_for(self, method: str) -> dict[str, Any]:
@@ -196,20 +203,40 @@ class ToolRegistry:
         definition: ToolDefinition, args: dict[str, Any], method: str | None = None
     ) -> str | None:
         schema = definition.arguments_for(method) if method else definition.argument_schema
+
+        def provided(name: str) -> bool:
+            """True when the argument is there, under its name or an alias."""
+            if name in args:
+                return True
+            return any(
+                target == name and alias in args
+                for alias, target in definition.aliases.items()
+            )
+
         unknown = sorted(
             key for key in args
             if schema
             and key not in schema
+            and key not in definition.aliases
             and not key.startswith("_")
         )
         if unknown:
-            return f"unsupported argument(s) for {definition.name}: {', '.join(unknown)}"
+            # Naming what *is* accepted turns a guess into a correction; a bare
+            # "unsupported argument" leaves the caller with nothing to try next.
+            return (
+                f"unsupported argument(s) for {definition.name}: {', '.join(unknown)} "
+                f"(accepted: {', '.join(sorted(schema))})"
+            )
         for name, item_schema in schema.items():
             expected = item_schema.get("type") if isinstance(item_schema, dict) else item_schema
             required = isinstance(item_schema, dict) and item_schema.get("required", False)
-            if name not in args:
+            if not provided(name):
                 if required:
                     return f"argument '{name}' is required"
+                continue
+            if name not in args:
+                # Supplied under an alias: the shape check below applies to the
+                # canonical name only, and the tool resolves the alias itself.
                 continue
             value = args[name]
             valid = (

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,10 @@ DIFFERENT_ON_PURPOSE = {
     ),
     "workspace_root": "the example documents a deployment path, not a portable default",
     "projects_root": "the example documents a deployment path, not a portable default",
+    "model_pricing": (
+        "a price belongs to a provider and a date, not to the code: the default is "
+        "empty so an unknown model is never reported with an invented cost"
+    ),
     **{
         field: "personal data is never a code default"
         for field in (
@@ -158,3 +163,19 @@ def test_a_provider_without_an_explicit_timeout_gets_the_configured_one():
 
 def test_the_vision_detail_default_is_one_the_api_accepts():
     assert code_default("vision_detail") in IMAGE_DETAILS
+
+
+def test_the_example_tariff_is_usable():
+    """Cost is reported only when the numbers are real, so they have to parse.
+
+    The failure this prevents is silent: a typo in the JSON, a missing rate or a
+    swapped pair (``input`` is the cache-miss price, ``cached_input`` the hit
+    price) turns the cost panel into a plausible-looking lie.
+    """
+    values = example_values()
+    pricing = json.loads(values["model_pricing"])
+    rates = pricing[values["deepseek_model"]]
+
+    assert {"input", "cached_input", "output"} <= set(rates)
+    assert 0 < rates["cached_input"] < rates["input"]
+    assert rates["output"] > 0

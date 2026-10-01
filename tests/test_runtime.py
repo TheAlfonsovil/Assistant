@@ -2197,6 +2197,93 @@ async def test_context_builder_separates_planner_and_resolver_context():
     assert "available_tools" not in resolver_context
 
 
+@pytest.mark.asyncio
+async def test_the_long_specification_reaches_every_role():
+    """A task has three fields, and the long one is not decoration.
+
+    ``title`` labels the task in lists, ``goal`` is the request and
+    ``description`` carries whatever does not fit. The chat exposes all three, so
+    the specification has to reach the roles that decide: dropping it would leave
+    a worker reasoning from a summary of its own summary.
+
+    The node resolver is the exception, and on purpose: it runs once per node,
+    and the plan it works from was built by the role that did read the
+    specification.
+    """
+    task = Task(
+        title="Proyecto test_zone",
+        goal="Crea el proyecto test_zone con front y back",
+        description="Front en Vue, back en Java 25 con Spring Boot 4, carpetas separadas.",
+    )
+    node = TaskNode(task_id=task.id, type=NodeType.OPERATION, description="scaffold", status=NodeStatus.READY)
+
+    class Repository:
+        async def search_memory(self, query):
+            return []
+
+        async def list_events(self, task_id):
+            return []
+
+    builder = ContextBuilder(Repository(), ToolRegistry())
+    planner = await builder.for_planner(task)
+    agent = await builder.for_agent_decision(task)
+    resolver = await builder.for_resolver(task, node, TaskGraph([node]))
+
+    assert planner["task"]["description"].startswith("Front en Vue")
+    assert agent["task"]["description"].startswith("Front en Vue")
+    assert "description" not in resolver["task"]
+    for context in (planner, agent, resolver):
+        assert context["task"]["goal"] == task.goal
+
+
+@pytest.mark.asyncio
+async def test_agent_turns_report_their_exchange_like_every_other_role(tmp_path):
+    """Cost and tokens are aggregated from LLM_RESPONSE, so agent turns must emit it.
+
+    Agent mode is most of this deployment's traffic (the chat always sends a
+    destination), and it used to record usage only inside AGENT_DECISION. Every
+    aggregation filters by ``LLM_RESPONSE``, so twenty real calls summed to zero
+    in the metrics and the cost panel.
+    """
+
+    class AnsweringAgent(MockLLMProvider):
+        async def orchestrate(self, context):
+            return OrchestratorDecision(
+                worker="AUDIT_WORKER",
+                template="audit",
+                intent="audit",
+                reason="The requested work is an audit.",
+            )
+
+        async def agent_decide(self, context):
+            return AgentDecision(decision_type="COMPLETE", reason="nothing to do")
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'agent-usage.db'}")
+    await database.create_all()
+    async with database.sessions() as session:
+        service = TaskService(
+            session, AnsweringAgent(), ToolRegistry(), workspace_root=str(tmp_path)
+        )
+        project = await service.create_project(
+            Project(name="usage", path=str(tmp_path))
+        )
+        task = await service.create_task(
+            TaskRequest(goal="audita el proyecto", project_id=project.id)
+        )
+
+        await service.run_task(task.id)
+        events = await service.repository.list_events(task.id)
+        responses = [
+            event
+            for event in events
+            if event.event_type == "LLM_RESPONSE" and event.payload.get("role") == "AGENT"
+        ]
+
+        assert responses, [event.event_type for event in events]
+        assert "usage" in responses[0].payload
+        assert "usage_total" in responses[0].payload
+
+
 def test_project_audit_plan_drops_unverifiable_prose_acceptance():
     task = Task(goal="audita el proyecto")
     task.runtime.workflow = "project_audit"

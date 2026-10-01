@@ -55,6 +55,10 @@ class ArtifactTool(Tool):
             },
         },
         permissions=["artifact.read"],
+        # ``list`` and ``read`` return rows keyed by ``id``, so that is the name the
+        # worker reaches for when it reads one back. Accepting it is symmetry, not
+        # generosity.
+        aliases={"id": "artifact_id"},
         idempotent=True,
     )
 
@@ -96,7 +100,13 @@ class ArtifactTool(Tool):
                     },
                 )
             if method == "read":
-                artifact_id = str(args["artifact_id"])
+                artifact_id = str(args.get("artifact_id") or args.get("id") or "")
+                if not artifact_id:
+                    return OperationResult(
+                        success=False,
+                        error="artifact.read requires artifact_id",
+                        error_type=ErrorType.INVALID_ARGUMENT,
+                    )
                 artifact = await self.repository.get_artifact(task_id, artifact_id)
                 if artifact is None:
                     return OperationResult(

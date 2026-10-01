@@ -207,6 +207,9 @@ pre.code { background: #0a1120; border: 1px solid var(--border); border-radius: 
 .ask strong { display: block; margin-bottom: 8px; font-size: 13px; }
 .ask-options { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ask-options .input { width: auto; min-width: 220px; }
+.detail { display: grid; gap: 10px; padding: 12px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 12px; }
+.detail-field { display: grid; gap: 4px; }
+.detail-field small { color: var(--muted); font-size: 11px; }
 
 /* Route/toast transition */
 .fade-enter-active, .fade-leave-active { transition: opacity 0.22s ease; }

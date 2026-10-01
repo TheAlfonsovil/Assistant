@@ -35,7 +35,7 @@ from ..domain.contracts import (
     OperationHint,
 )
 from ..domain.graph import TaskGraph
-from ..domain.state import can_restart
+from ..domain.state import TERMINAL_TASK_STATUSES, can_restart
 from ..domain.models import (
     AgentDecision,
     AgentDecisionType,
@@ -2922,6 +2922,24 @@ class TaskService:
             task, getattr(self.llm, "last_usage", {})
         )
         task.apply_worker_decision(decision)
+        # Every other role reports its exchange as LLM_RESPONSE, and every
+        # aggregation of tokens, cache and cost reads that event type. This turn
+        # used to report usage only inside AGENT_DECISION, so agent-mode work —
+        # which in this deployment is most of it, because the chat always sends a
+        # destination — was invisible to the metrics: twenty calls summed to zero.
+        # One convention instead of two: a call emits LLM_RESPONSE.
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="LLM_RESPONSE",
+                payload={
+                    "role": "AGENT",
+                    "response": decision.model_dump(mode="json"),
+                    "usage": getattr(self.llm, "last_usage", {}),
+                    "usage_total": usage_totals,
+                },
+            )
+        )
         await self.repository.save_event(
             TaskEvent(
                 task_id=task.id,
@@ -4699,6 +4717,22 @@ class TaskService:
             except Exception as error:
                 logger.exception("Task execution failed for %s", task_id)
                 task = await self.repository.get_task(task_id)
+                if task is not None and task.status in TERMINAL_TASK_STATUSES:
+                    # Cancelled while the worker was busy. The error is real but
+                    # the task is already over, and forcing a failure onto it is
+                    # a transition that does not exist: raising here is what left
+                    # the worker looping on a task it could never close.
+                    await self.repository.save_event(
+                        TaskEvent(
+                            task_id=task_id,
+                            event_type="TASK_ERROR_IGNORED",
+                            payload={
+                                "status": task.status.value,
+                                "error": str(error)[:500],
+                            },
+                        )
+                    )
+                    return task
                 if task:
                     return await self._finish_task(
                         task,

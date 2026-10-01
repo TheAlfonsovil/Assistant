@@ -59,7 +59,10 @@ class Settings(BaseSettings):
     # requires an SSE-capable endpoint.
     deepseek_stream_responses: bool = False
     # Optional cost reporting. JSON map of model id -> USD per 1,000,000 tokens,
-    # e.g. {"deepseek-flash": {"input": 0.27, "cached_input": 0.07, "output": 1.10}}.
+    # e.g. {"deepseek-flash": {"input": 0.15, "cached_input": 0.003, "output": 0.6}}.
+    # ``input`` is the cache-miss rate and ``cached_input`` the cache-hit rate,
+    # which is ten times cheaper, so a wrong pair here misreports the cache as
+    # either worthless or free. Check the provider's page before editing.
     # Empty means "cost is not configured" and no cost is reported, instead of
     # inventing a price for a model whose tariff is unknown.
     model_pricing: str = ""

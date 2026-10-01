@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .attachments import image_parts
 from .config import (
@@ -35,6 +35,9 @@ from .domain.contracts import (
 )
 from .domain.models import AgentDecision, DependencyType, Operation, VerificationDecision
 from .prompts.template import render
+
+# Characters kept from an LLM-supplied label (see OrchestratorDecision.intent).
+INTENT_LABEL_CHARS = 200
 
 # Usage and the rendered request are per-call results, not provider state.
 # Context variables isolate them per asyncio task, so concurrent tasks can no
@@ -66,7 +69,13 @@ class OrchestratorDecision(BaseModel):
     """Routing decision made before any worker is allowed to execute."""
 
     stage: str = Field(default="ROUTE", pattern="^(ROUTE|FINALIZE|CONTINUE|BLOCK)$")
-    intent: str = Field(default="general", min_length=1, max_length=120)
+    # A label, not a contract. It is shown in the workflow graph and stored in the
+    # task metadata, so a 121st character is no reason to throw the whole routing
+    # decision away: the model is asked to summarise a goal that can itself be
+    # long, and rejecting it burned three provider calls, tripped the circuit
+    # breaker and left a task that could not be closed. It is clipped instead.
+    # ``worker`` and ``template`` stay strict on purpose: they select code.
+    intent: str = Field(default="general", min_length=1)
     target_type: str | None = Field(default=None, pattern="^(project|device|resource)$")
     target_id: str | None = None
     worker: str = Field(default="GENERAL_WORKER", min_length=1, max_length=120)
@@ -76,6 +85,13 @@ class OrchestratorDecision(BaseModel):
     reason: str = Field(default="", max_length=4000)
     needs_input: bool = False
     clarification: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def _clip_intent(cls, value: Any) -> Any:
+        if isinstance(value, str) and len(value) > INTENT_LABEL_CHARS:
+            return value[:INTENT_LABEL_CHARS]
+        return value
 
 
 class PlanNodeProposal(BaseModel):
