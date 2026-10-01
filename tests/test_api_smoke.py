@@ -141,9 +141,31 @@ async def test_the_project_payload_lists_the_index_shape_not_the_index(client):
 
 
 @pytest.mark.asyncio
+async def test_two_projects_cannot_claim_the_same_directory(client):
+    """A second row for one folder splits its tasks and its index in two."""
+    http, context = client
+    root = pathlib.Path(context.settings.projects_root) / "shared"
+    root.mkdir(parents=True, exist_ok=True)
+
+    first = await http.post(
+        f"{API_PREFIX}/projects", json={"name": "Shared", "path": str(root)}
+    )
+    assert first.status_code == 200, first.text
+
+    # Same directory spelled in another case: still the same project.
+    second = await http.post(
+        f"{API_PREFIX}/projects", json={"name": "shared", "path": str(root).lower()}
+    )
+    assert second.status_code == 409, second.text
+    assert "Shared" in second.json()["detail"]
+
+    listing = (await http.get(f"{API_PREFIX}/projects")).json()
+    assert [item["name"] for item in listing if item["name"].casefold() == "shared"] == ["Shared"]
+
+
+@pytest.mark.asyncio
 async def test_invalid_attachment_is_a_422_and_creates_nothing(client):
     http, context = client
-
     response = await http.post(
         f"{API_PREFIX}/tasks",
         json={"title": "Adjunto roto", "attachments": [_upload(b"not an image")]},

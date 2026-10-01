@@ -40,6 +40,11 @@ DIFFERENT_ON_PURPOSE = {
         "the safe default is False: claiming vision you do not have sends images "
         "that fail, denying it only degrades to asking the user"
     ),
+    "deepseek_stream_responses": (
+        "the example streams because the deployment needs time-to-first-token and "
+        "progressive text; the code default stays buffered because an endpoint "
+        "without SSE would fail every call instead of losing a metric"
+    ),
     "workspace_root": "the example documents a deployment path, not a portable default",
     "projects_root": "the example documents a deployment path, not a portable default",
     **{

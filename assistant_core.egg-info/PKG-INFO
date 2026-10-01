@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: assistant-core
-Version: 0.6.2
+Version: 0.6.3
 Summary: Persistent local task engine for Assistant
 Requires-Python: >=3.12
 License-File: LICENSE
@@ -18,4 +18,8 @@ Provides-Extra: dev
 Requires-Dist: pytest<9.0,>=8.3; extra == "dev"
 Requires-Dist: pytest-asyncio<2.0,>=1.2; extra == "dev"
 Requires-Dist: ruff<1.0,>=0.8; extra == "dev"
+Provides-Extra: debug
+Requires-Dist: debugpy>=1.8; extra == "debug"
+Provides-Extra: uia
+Requires-Dist: uiautomation>=2.0; extra == "uia"
 Dynamic: license-file

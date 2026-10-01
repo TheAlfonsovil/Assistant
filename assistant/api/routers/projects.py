@@ -17,9 +17,15 @@ async def list_projects(request: Request) -> list:
 
 @router.post("")
 async def create_project(request: Request, project_request: ProjectRequest) -> dict:
-    project = await get_context(request).service.create_project(
-        Project.model_validate(project_request.model_dump())
-    )
+    try:
+        project = await get_context(request).service.create_project(
+            Project.model_validate(project_request.model_dump())
+        )
+    except ValueError as error:
+        # A directory that already has a project is a conflict, not a server
+        # error: the dashboard shows the message so the user sees which project
+        # owns the path instead of a 500.
+        raise HTTPException(409, str(error)) from error
     return project_view(project)
 
 

@@ -9,7 +9,13 @@ python-dotenv<2.0,>=1.0
 uvicorn[standard]<1.0,>=0.30
 tzdata>=2024.1
 
+[debug]
+debugpy>=1.8
+
 [dev]
 pytest<9.0,>=8.3
 pytest-asyncio<2.0,>=1.2
 ruff<1.0,>=0.8
+
+[uia]
+uiautomation>=2.0

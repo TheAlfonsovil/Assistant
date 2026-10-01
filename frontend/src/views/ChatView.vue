@@ -3,28 +3,36 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, streamChat } from '@/api/client'
 import { useSystemStore } from '@/stores/system'
-import { date, isActive, shortId, REFRESH_INTERVAL_MS } from '@/utils/format'
+import { date, isActive, prettyJson, shortId, statusTone, REFRESH_INTERVAL_MS } from '@/utils/format'
 
 const system = useSystemStore()
 const router = useRouter()
 
 const CHAT_SOURCES = ['DASHBOARD_CHAT', 'DASHBOARD_CHAT_FAST', 'DASHBOARD_AGENT']
-
-const turns = ref([])
-const message = ref('')
-const mode = ref('chat')
-const target = ref('device:computer')
-const live = ref('')
-const sending = ref(false)
-const files = ref([])
-const attachmentError = ref('')
-const log = ref(null)
-let controller = null
-let poller = null
-
+const TARGET_KEY = 'assistant.chat.target'
 // Keep in sync with ASSISTANT_ATTACHMENT_MAX_BYTES / _MAX_COUNT.
 const MAX_ATTACHMENT_BYTES = 5_000_000
 const MAX_ATTACHMENTS = 4
+// Payload keys worth showing without opening the raw event. They answer "what
+// happened" for any tool, role or node, so the timeline needs no per-tool table.
+const FACT_KEYS = ['tool', 'method', 'role', 'decision', 'status', 'success', 'duration', 'error']
+// A device label is a courtesy name; anything without one shows its branch name,
+// so a new branch appears here by itself the day it stops being a placeholder.
+const DEVICE_LABELS = { computer: 'Ordenador' }
+
+const turns = ref([])
+const message = ref('')
+const live = ref('')
+const sending = ref(false)
+const streaming = ref(false)
+const files = ref([])
+const attachmentError = ref('')
+const devices = ref([])
+const draftTarget = ref(localStorage.getItem(TARGET_KEY) || '')
+const mention = ref({ open: false, query: '', index: 0 })
+const log = ref(null)
+let controller = null
+let poller = null
 
 function formatSize(bytes) {
   return bytes >= 1_000_000 ? `${(bytes / 1_000_000).toFixed(1)} MB` : `${Math.round(bytes / 1024)} KB`
@@ -71,23 +79,104 @@ async function attachmentPayload() {
   )
 }
 
-const modeHelp = computed(() =>
-  mode.value === 'agent' ? 'Puede operar tareas y la cola' : 'Consulta y crea trabajo',
-)
+// The destination is a property of the message, not a mode of the screen: the
+// default sits in a chip and a mention overrides it for that one message.
+const targets = computed(() => {
+  const items = []
+  for (const device of devices.value) {
+    if (device.status !== 'ACTIVE') continue
+    items.push({
+      value: `device:${device.name}`,
+      label: DEVICE_LABELS[device.name] || device.name,
+      kind: 'Dispositivo',
+    })
+  }
+  if (!items.length) items.push({ value: 'device:computer', label: 'Ordenador', kind: 'Dispositivo' })
+  for (const project of system.projects) {
+    if (!project.enabled) continue
+    items.push({
+      value: `project:${project.id}`,
+      label: project.name,
+      kind: 'Proyecto',
+      is_default: project.is_default,
+    })
+  }
+  return items
+})
 
-const targets = computed(() => [
-  { value: 'device:computer', label: 'Ordenador' },
-  ...system.projects
-    .filter((p) => p.enabled)
-    .map((p) => ({
-      value: `project:${p.id}`,
-      label: p.is_default ? `${p.name} · default` : p.name,
-    })),
-])
+const currentTarget = computed(() => {
+  const chosen = targets.value.find((item) => item.value === draftTarget.value)
+  // With nothing chosen yet, the project the deployment marked as default is the
+  // useful answer; the machine itself is the fallback, not the first guess.
+  return chosen || targets.value.find((item) => item.is_default) || targets.value[0]
+})
+
+const mentionMatches = computed(() => {
+  const query = mention.value.query.toLowerCase()
+  const matches = targets.value.filter((item) => !query || item.label.toLowerCase().includes(query))
+  return matches.slice(0, 6)
+})
+
+function persistTarget(value) {
+  draftTarget.value = value
+  localStorage.setItem(TARGET_KEY, value)
+}
+
+function onType(event) {
+  // A trailing "@word" opens the picker; anything else closes it.
+  const match = /@([^\s@]*)$/.exec(message.value)
+  mention.value.open = Boolean(match)
+  mention.value.query = match ? match[1] : ''
+  mention.value.index = 0
+}
+
+function applyMention(target) {
+  message.value = message.value.replace(/@([^\s@]*)$/, `@${target.label} `)
+  persistTarget(target.value)
+  mention.value.open = false
+}
+
+function pickMention() {
+  const choice = mentionMatches.value[mention.value.index]
+  if (choice) applyMention(choice)
+}
+
+function moveMention(step) {
+  const total = mentionMatches.value.length
+  if (!total) return
+  mention.value.index = (mention.value.index + step + total) % total
+}
+
+function resolveTarget(text) {
+  // Longest label first, so "Assistant" wins over a project named "Assis".
+  const ordered = [...targets.value].sort((a, b) => b.label.length - a.label.length)
+  for (const target of ordered) {
+    const marker = `@${target.label}`
+    const at = text.toLowerCase().lastIndexOf(marker.toLowerCase())
+    if (at === -1) continue
+    const cleaned = (text.slice(0, at) + text.slice(at + marker.length)).replace(/\s{2,}/g, ' ').trim()
+    const [type, id] = target.value.split(':')
+    return { type, id, cleaned: cleaned || text }
+  }
+  const [type, id] = (currentTarget.value?.value || 'device:computer').split(':')
+  return { type, id, cleaned: text }
+}
+
+const isCommand = computed(() => message.value.trim().startsWith('/'))
 
 const hasOpenTurn = computed(() =>
-  turns.value.some((t) => t.role === 'assistant' && isActive(t.status || '')),
+  turns.value.some((turn) => turn.role === 'assistant' && isActive(turn.status || '')),
 )
+
+const attention = computed(() => {
+  const map = {}
+  for (const item of system.needsAttention) map[item.task_id] = item
+  return map
+})
+
+function askFor(turn) {
+  return turn.task_id ? attention.value[turn.task_id] : undefined
+}
 
 function scrollToBottom() {
   nextTick(() => {
@@ -117,6 +206,8 @@ function fromTask(task) {
       task_id: task.id,
       created_at: task.finished_at || task.created_at,
       status: task.status,
+      events: null,
+      open: false,
     },
   ]
 }
@@ -126,22 +217,85 @@ async function loadHistory() {
     const data = await api.listTasks(60)
     const chats = (data.tasks || []).filter(isChatTask).slice(0, 20).reverse()
     const restored = chats.flatMap(fromTask)
-    const liveIds = new Set(turns.value.map((t) => t.task_id).filter(Boolean))
-    turns.value = [...restored.filter((t) => !liveIds.has(t.task_id)), ...turns.value]
+    const liveIds = new Set(turns.value.map((turn) => turn.task_id).filter(Boolean))
+    turns.value = [...restored.filter((turn) => !liveIds.has(turn.task_id)), ...turns.value]
     if (turns.value.length) scrollToBottom()
   } catch (error) {
     system.notify(error.message, 'error')
   }
 }
 
+async function loadDevices() {
+  try {
+    const data = await api.resources()
+    devices.value = data.devices || []
+  } catch {
+    devices.value = []
+  }
+}
+
 function pushAssistant(status) {
-  turns.value.push({ role: 'assistant', text: '', status, task_id: null, live: true })
+  turns.value.push({ role: 'assistant', text: '', status, task_id: null, live: true, events: null, open: false })
   return turns.value[turns.value.length - 1]
 }
+
+// The process is the interesting half of an answer, and all of it is already
+// recorded: the events say which tools ran, in which order, and what came back.
+async function loadProcess(turn) {
+  if (!turn.task_id || turn.events) return
+  try {
+    turn.events = (await api.getEvents(turn.task_id)) || []
+  } catch (error) {
+    turn.events = []
+    live.value = error.message
+  }
+}
+
+function toggleProcess(turn) {
+  turn.open = !turn.open
+  if (turn.open) loadProcess(turn)
+}
+
+function eventTone(event) {
+  const payload = event.payload || {}
+  const type = event.event_type || ''
+  if (payload.success === false || /FAILED|EXHAUSTED|BLOCKED|CANCELLED/.test(type)) return 'error'
+  if (/COMPLETED|SUCCEEDED|RESPONSE|PARSED|READY/.test(type)) return 'ok'
+  return ''
+}
+
+function eventIcon(event) {
+  const type = event.event_type || ''
+  if (type.startsWith('TOOL')) return '⚙'
+  if (type.startsWith('LLM')) return '∑'
+  if (type.startsWith('NODE')) return '◆'
+  if (type.startsWith('TASK')) return '▣'
+  if (type.startsWith('RECOVERY')) return '♡'
+  if (type.startsWith('SCHEDULE')) return '⏱'
+  return '·'
+}
+
+function eventFacts(event) {
+  const payload = event.payload || {}
+  return FACT_KEYS.filter((key) => payload[key] !== undefined && payload[key] !== null && payload[key] !== '')
+    .map((key) => `${key}=${typeof payload[key] === 'number' ? Number(payload[key]).toFixed(2) : payload[key]}`)
+    .join('  ')
+}
+
+function counts(turn) {
+  const events = turn.events || []
+  return {
+    tools: events.filter((event) => event.event_type === 'TOOL_RESULT').length,
+    calls: events.filter((event) => event.event_type.startsWith('LLM_')).length,
+    problems: events.filter((event) => eventTone(event) === 'error').length,
+  }
+}
+
 async function runChat(body) {
   const turn = pushAssistant('QUEUED')
   live.value = 'Conectando con la cola…'
   controller = new AbortController()
+  streaming.value = true
   let streamed = false
   try {
     for await (const frame of streamChat(body, controller.signal)) {
@@ -183,15 +337,18 @@ async function runChat(body) {
   } finally {
     turn.live = false
     controller = null
+    streaming.value = false
+    if (turn.task_id) await loadProcess(turn)
+    scrollToBottom()
   }
 }
 
-async function runAgent(body) {
+async function runCommand(body) {
   const turn = pushAssistant('RUNNING')
-  live.value = 'Ejecutando comando de agente…'
+  live.value = 'Ejecutando comando…'
   let result = await api.chatAgent(body)
   if (result.action === 'confirmation_required') {
-    if (!confirm(result.message || '¿Confirmar la operación?')) {
+    if (!window.confirm(result.message || '¿Confirmar la operación?')) {
       turns.value.pop()
       live.value = 'Operación cancelada'
       return
@@ -205,15 +362,24 @@ async function runAgent(body) {
   live.value = turn.text
   scrollToBottom()
 }
+
 async function send() {
   const text = message.value.trim()
   if (!text || sending.value) return
+  // Decided before the box is cleared: the composer must look empty again while
+  // the turn runs, and the message is what says whether this is a command.
+  const command = text.startsWith('/')
   sending.value = true
   turns.value.push({ role: 'user', text, created_at: new Date().toISOString(), status: 'QUEUED' })
   message.value = ''
+  mention.value.open = false
   scrollToBottom()
-  const [target_type, target_id] = target.value.split(':')
-  const body = { message: text, target_type, target_id }
+  const resolution = command ? { type: undefined, id: undefined, cleaned: text } : resolveTarget(text)
+  const body = { message: resolution.cleaned }
+  if (resolution.type) {
+    body.target_type = resolution.type
+    body.target_id = resolution.id
+  }
   if (files.value.length) {
     try {
       body.attachments = await attachmentPayload()
@@ -224,7 +390,7 @@ async function send() {
     }
   }
   try {
-    if (mode.value === 'agent') await runAgent(body)
+    if (command) await runCommand(body)
     else await runChat(body)
     files.value = []
     attachmentError.value = ''
@@ -238,9 +404,51 @@ async function send() {
   }
 }
 
-function stop() {
+function stopStream() {
   if (controller) controller.abort()
-  live.value = 'Flujo detenido; la tarea sigue viva en la cola'
+  live.value = 'Flujo detenido; la tarea sigue viva en la cola (usa Cancelar tarea).'
+}
+
+async function cancelTurn(turn) {
+  if (!turn.task_id) return
+  if (!window.confirm(`¿Cancelar la tarea ${shortId(turn.task_id)}?`)) return
+  try {
+    const task = await api.cancelTask(turn.task_id)
+    turn.status = task?.status || 'CANCELLED'
+    turn.text = turn.text || 'Tarea cancelada.'
+    live.value = 'Tarea cancelada'
+    system.refresh()
+  } catch (error) {
+    system.notify(error.message, 'error')
+  }
+}
+
+async function answerQuestion(turn, item) {
+  if (!item) return
+  const value = (turn.answer || '').trim()
+  if (!value) return
+  await sendInput(turn, item, { answer: value })
+  turn.answer = ''
+}
+
+async function answerWithProject(turn, item, option) {
+  const project = system.projects.find((candidate) => candidate.name === option)
+  if (project) {
+    await sendInput(turn, item, { project_id: project.id })
+    return
+  }
+  await sendInput(turn, item, { target_type: 'device', target_id: 'computer' })
+}
+
+async function sendInput(turn, item, input) {
+  try {
+    await api.submitTaskInput(turn.task_id, { node_id: item.node_id, input })
+    live.value = 'Respuesta enviada; la tarea sigue en la cola'
+    system.refresh()
+    setTimeout(loadHistory, 1200)
+  } catch (error) {
+    system.notify(error.message, 'error')
+  }
 }
 
 function openTask(turn) {
@@ -249,6 +457,7 @@ function openTask(turn) {
 
 onMounted(() => {
   loadHistory()
+  loadDevices()
   poller = window.setInterval(() => {
     if (hasOpenTurn.value) loadHistory()
   }, REFRESH_INTERVAL_MS)
@@ -262,44 +471,123 @@ onUnmounted(() => {
 <template>
   <div class="chat">
     <div ref="log" class="chat-log">
-      <div v-if="!turns.length" class="empty">La conversación aparecerá aquí.</div>
+      <div v-if="!turns.length" class="empty">
+        Escribe qué necesitas. Menciona con <code>@</code> el proyecto o el dispositivo si no es el de por defecto.
+      </div>
+
       <div v-for="(turn, index) in turns" :key="index" class="bubble" :class="turn.role">
         <small>
           {{ turn.role === 'user' ? 'TÚ' : 'ASSISTANT' }}
           <template v-if="turn.created_at"> · {{ date(turn.created_at) }}</template>
-          <template v-if="turn.status"> · {{ turn.status }}</template>
+          <template v-if="turn.role === 'assistant' && turn.status">
+            · <span class="tone" :class="statusTone(turn.status)">{{ turn.status }}</span>
+          </template>
         </small>
-        <p :class="{ muted: !turn.text }">{{ turn.text || (turn.live ? 'Pensando…' : '—') }}</p>
-        <button v-if="turn.task_id" class="btn ghost compact" @click="openTask(turn)">
-          Abrir tarea {{ shortId(turn.task_id) }}
-        </button>
+
+        <p :class="{ muted: !turn.text }">
+          {{ turn.text || (turn.live ? 'Pensando…' : '—') }}
+        </p>
+
+        <div v-if="askFor(turn)" class="ask">
+          <strong>{{ askFor(turn).question }}</strong>
+          <div class="ask-options">
+            <template v-if="askFor(turn).kind === 'project_selection'">
+              <button
+                v-for="option in askFor(turn).options"
+                :key="option"
+                class="btn ghost compact"
+                @click="answerWithProject(turn, askFor(turn), option)"
+              >
+                {{ option }}
+              </button>
+              <button class="btn ghost compact" @click="answerWithProject(turn, askFor(turn), null)">
+                Ordenador (sin proyecto)
+              </button>
+            </template>
+            <template v-else>
+              <input
+                v-model="turn.answer"
+                class="input"
+                placeholder="Tu respuesta"
+                @keydown.enter.prevent="answerQuestion(turn, askFor(turn))"
+              />
+              <button class="btn primary compact" @click="answerQuestion(turn, askFor(turn))">
+                Responder
+              </button>
+            </template>
+          </div>
+        </div>
+
+        <template v-if="turn.role === 'assistant' && turn.task_id">
+          <div class="proc">
+            <button class="btn ghost compact" @click="toggleProcess(turn)">
+              {{ turn.open ? 'Ocultar proceso' : 'Ver proceso' }}
+            </button>
+            <span v-if="turn.events" class="chat-live">
+              {{ counts(turn).tools }} herramientas · {{ counts(turn).calls }} llamadas ·
+              {{ counts(turn).problems }} incidencias
+            </span>
+          </div>
+          <div v-if="turn.open" class="timeline">
+            <p v-if="turn.events && !turn.events.length" class="chat-hint">Sin eventos registrados.</p>
+            <details v-for="event in turn.events || []" :key="event.id" class="timeline-row" :class="eventTone(event)">
+              <summary>
+                <span class="timeline-icon">{{ eventIcon(event) }}</span>
+                <code>{{ event.event_type }}</code>
+                <span class="timeline-facts">{{ eventFacts(event) }}</span>
+              </summary>
+              <pre class="timeline-raw">{{ prettyJson(event.payload) }}</pre>
+            </details>
+          </div>
+          <div class="row-actions">
+            <button class="btn ghost compact" @click="openTask(turn)">Abrir tarea {{ shortId(turn.task_id) }}</button>
+            <button v-if="isActive(turn.status || '')" class="btn ghost compact danger" @click="cancelTurn(turn)">
+              Cancelar tarea
+            </button>
+          </div>
+        </template>
       </div>
     </div>
 
     <div class="chat-side">
-      <span class="chat-live" aria-live="polite">{{ live || modeHelp }}</span>
-      <button v-if="sending" class="btn ghost" @click="stop">Detener flujo</button>
+      <span class="chat-live" aria-live="polite">{{ live || 'Cada mensaje se ejecuta en la cola persistente.' }}</span>
+      <button v-if="streaming" class="btn ghost" @click="stopStream">Detener flujo</button>
     </div>
 
     <form class="chat-form" @submit.prevent="send">
-      <textarea
-        v-model="message"
-        class="textarea"
-        placeholder="¿Qué necesitas que haga?"
-        aria-label="Mensaje"
-        @keydown.enter.exact.prevent="send"
-      />
+      <div class="composer">
+        <div v-if="mention.open" class="mention">
+          <button
+            v-for="(item, i) in mentionMatches"
+            :key="item.value"
+            type="button"
+            class="mention-item"
+            :class="{ active: i === mention.index }"
+            @click="applyMention(item)"
+          >
+            <span>{{ item.label }}</span>
+            <em>{{ item.kind }}<template v-if="item.is_default"> · por defecto</template></em>
+          </button>
+          <p v-if="!mentionMatches.length" class="chat-hint">Sin coincidencias.</p>
+        </div>
+        <textarea
+          v-model="message"
+          class="textarea"
+          placeholder="¿Qué necesitas? Escribe @ para elegir proyecto o dispositivo, o / para un comando de cola."
+          aria-label="Mensaje"
+          @input="onType"
+          @keydown.enter.exact.prevent="mention.open ? pickMention() : send()"
+          @keydown.down.exact.prevent="moveMention(1)"
+          @keydown.up.exact.prevent="moveMention(-1)"
+          @keydown.esc="mention.open = false"
+        />
+      </div>
+
       <div class="chat-controls">
-        <select v-model="mode" class="select" aria-label="Modo del chat">
-          <option value="chat">Consulta</option>
-          <option value="agent">Agente</option>
-        </select>
-        <select v-model="target" class="select" aria-label="Destino">
-          <option v-for="t in targets" :key="t.value" :value="t.value">{{ t.label }}</option>
-        </select>
+        <span class="chip">destino: {{ currentTarget?.label }}</span>
         <input
           class="input"
-          style="max-width:230px"
+          style="max-width: 210px"
           type="file"
           accept="image/png,image/jpeg,image/gif,image/webp"
           multiple
@@ -307,16 +595,15 @@ onUnmounted(() => {
           @change="onFiles"
         />
         <span class="grow" />
-        <button class="btn primary" type="submit" :disabled="sending || !message.trim()">
-          Enviar
-        </button>
+        <button class="btn primary" type="submit" :disabled="sending || !message.trim()">Enviar</button>
       </div>
+
       <p v-if="attachmentError" class="chat-hint">{{ attachmentError }}</p>
       <p v-else-if="files.length" class="chat-hint">
         Adjuntos: {{ files.map((f) => `${f.name} (${formatSize(f.size)})`).join(' · ') }}
       </p>
-      <p class="chat-hint">
-        Agente: <code>crear objetivo</code>, <code>cancelar id</code>, <code>borrar id</code>,
+      <p v-if="isCommand" class="chat-hint">
+        Comando de cola: <code>crear</code>, <code>cancelar id</code>, <code>borrar id</code>,
         <code>reanudar id</code>, <code>replanificar id</code> o <code>listar</code>.
       </p>
     </form>

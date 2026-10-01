@@ -45,7 +45,7 @@ async def overview(request: Request) -> dict:
         # queue, so the landing view has to say which ones are waiting.
         "needs_attention": await needs_attention(repository),
         "projects": [
-            {"id": project.id, "name": project.name, "enabled": project.enabled}
+            {"id": project.id, "name": project.name, "enabled": project.enabled, "is_default": project.is_default}
             for project in await repository.list_projects()
         ],
         "runtime": {

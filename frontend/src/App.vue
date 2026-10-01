@@ -9,6 +9,7 @@ const route = useRoute()
 
 const title = computed(() => route.meta?.title || 'Assistant')
 const nav = [
+  { to: '/chat', icon: '✦', label: 'Chat' },
   { to: '/', icon: '◎', label: 'Resumen' },
   { to: '/tasks', icon: '≣', label: 'Tareas' },
   { to: '/schedules', icon: '⏱', label: 'Horarios' },
@@ -17,7 +18,6 @@ const nav = [
   { to: '/resources', icon: '⌁', label: 'Recursos' },
   { to: '/projects', icon: '▣', label: 'Proyectos' },
   { to: '/memory', icon: '◈', label: 'Memoria' },
-  { to: '/chat', icon: '✦', label: 'Chat' },
 ]
 
 onMounted(() => system.start())

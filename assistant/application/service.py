@@ -405,7 +405,28 @@ class TaskService:
         project.path = str(Path(project.path).expanduser().resolve())
         if not Path(project.path).is_dir():
             raise ValueError(f"Project directory does not exist: {project.path}")
+        await self._refuse_duplicate_project_path(project)
         return await self.repository.create_project(project)
+
+    async def _refuse_duplicate_project_path(self, project: Project) -> None:
+        """One directory belongs to one project.
+
+        A second row for the same directory looks harmless and is not: it splits
+        the folder's tasks and its codegraph in two, and the dashboard then shows
+        the same path twice with different histories. The accident is invariably
+        a name typed in another case (``assistant`` next to ``Assistant``), so the
+        comparison is case-insensitive and the error names the project that
+        already owns the path.
+        """
+        target = str(Path(project.path).expanduser().resolve()).casefold()
+        for existing in await self.repository.list_projects():
+            if existing.id == project.id:
+                continue
+            current = str(Path(existing.path).expanduser().resolve()).casefold()
+            if current == target:
+                raise ValueError(
+                    f"The project '{existing.name}' already uses that directory ({existing.id})"
+                )
 
     async def get_project(self, project_id: str) -> Project | None:
         return await self.repository.get_project(project_id)
@@ -452,6 +473,7 @@ class TaskService:
         project.path = str(Path(project.path).expanduser().resolve())
         if not Path(project.path).is_dir():
             raise ValueError(f"Project directory does not exist: {project.path}")
+        await self._refuse_duplicate_project_path(project)
         project.created_at = existing.created_at
         project.last_used_at = existing.last_used_at
         project.last_audited_at = existing.last_audited_at
