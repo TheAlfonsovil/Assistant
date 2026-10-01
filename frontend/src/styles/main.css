@@ -135,6 +135,7 @@ code, pre, .mono { font-family: var(--mono); }
 .empty { color: var(--muted); padding: 22px; text-align: center; }
 .muted { color: var(--text-dim); }
 .chip { display: inline-block; padding: 3px 9px; border-radius: 8px; background: var(--bg-elev); border: 1px solid var(--border); font-size: 12px; margin: 0 6px 6px 0; }
+.chip.warn { border-color: var(--warn, #b8860b); color: var(--warn, #e0a800); }
 pre.code { background: #0a1120; border: 1px solid var(--border); border-radius: 10px; padding: 12px; overflow: auto; font-size: 12px; max-height: 420px; }
 .node-link { color: var(--brand); cursor: pointer; text-decoration: underline dotted; }
 .node-link:hover { color: var(--text); }

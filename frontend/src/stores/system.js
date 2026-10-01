@@ -17,6 +17,7 @@ export const useSystemStore = defineStore('system', {
     idle: (state) => state.overview?.runtime?.idle ?? {},
     offpeak: (state) => state.overview?.runtime?.offpeak ?? {},
     taskCounts: (state) => state.overview?.task_counts ?? {},
+    needsAttention: (state) => state.overview?.needs_attention ?? [],
     projects: (state) => state.overview?.projects ?? [],
   },
   actions: {

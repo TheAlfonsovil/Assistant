@@ -58,6 +58,13 @@ def _analytics(pricing: str = ""):
     return _dashboard_analytics(_context(pricing), [task], {task.id: []}, events)
 
 
+def _analytics_without_usage():
+    """Same shape, but no LLM call has reported usage yet."""
+    task = Task(goal="nada aún", status=TaskStatus.QUEUED)
+    task.started_at = task.created_at
+    return _dashboard_analytics(_context(), [task], {task.id: []}, [])
+
+
 def test_analytics_report_model_label_and_reliability():
     analytics = _analytics()
 
@@ -128,6 +135,41 @@ def test_cost_reports_an_unknown_model_instead_of_guessing():
 
     assert cost["configured"] is False
     assert "deepseek-flash" in cost["reason"]
+
+
+def test_cache_saving_is_the_difference_the_cache_actually_made():
+    pricing = json.dumps(
+        {"deepseek-flash": {"input": 1.0, "cached_input": 0.5, "output": 2.0}}
+    )
+
+    analytics = _analytics(pricing)
+
+    # 40 cached tokens saved 0.5 per million each: a measured difference, not a
+    # projection of what a cache could save.
+    assert analytics["cost"]["cache_saving_usd"] == 0.00002
+    assert analytics["cost"]["cached_prompt_usd"] == 0.00002
+    assert analytics["cost"]["total_without_cache_usd"] == 0.00012
+    cache = analytics["cache"]
+    assert cache["cached_tokens"] == 40
+    assert cache["miss_tokens"] == 60
+    assert cache["hit_rate"] == 40.0
+    assert cache["available"] is True
+    assert "prefix" in cache["note"]
+
+
+def test_cache_is_reported_without_pricing_but_without_inventing_money():
+    analytics = _analytics()
+
+    assert analytics["cache"]["hit_rate"] == 40.0
+    assert analytics["cache"]["saving_usd"] is None
+
+
+def test_no_cache_traffic_reports_zero_instead_of_an_error():
+    analytics = _analytics_without_usage()
+
+    assert analytics["cache"]["available"] is False
+    assert analytics["cache"]["hit_rate"] == 0
+    assert analytics["actual_tokens"]["cache_hit_rate"] == 0
 
 
 def test_latency_percentiles_are_present_and_zero_without_samples():

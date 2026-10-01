@@ -6,37 +6,42 @@ the clone is an ordinary task, so budgets, leases, retries, artifacts and the
 ledger all apply exactly as before.
 
 Intervals are bounded (one minute to thirty days) so a schedule cannot become a
-self-inflicted request loop.
+self-inflicted request loop. A schedule is either a fixed interval or a
+wall-clock time of day in a named timezone; bounds and timezone handling live in
+``assistant.recurrence`` so the tool, the API and the scheduler cannot drift.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from assistant.domain.models import (
-    ErrorType,
-    OperationResult,
-    Task,
+from assistant.domain.models import ErrorType, OperationResult
+from assistant.recurrence import (
+    MAX_EVERY_SECONDS,
+    MIN_EVERY_SECONDS,
+    ScheduleError,
 )
 from assistant.tools import Tool, ToolDefinition
 
-MIN_EVERY_SECONDS = 60
-MAX_EVERY_SECONDS = 30 * 24 * 3600
+__all__ = ["MAX_EVERY_SECONDS", "MIN_EVERY_SECONDS", "ScheduleTool"]
 
 
 class ScheduleTool(Tool):
     definition = ToolDefinition(
         name="schedule",
         description=(
-            "Recurring work. 'every' creates a task that runs again every N "
-            "seconds, 'list' shows the schedules, 'cancel' stops one. Use it for "
-            "monitoring, periodic audits or any repeated check."
+            "Recurring work. 'every' repeats after N seconds, 'daily' runs at a "
+            "wall-clock time in a named timezone, 'list' shows the schedules and "
+            "'cancel' stops one. Use it for monitoring, periodic audits or any "
+            "repeated check instead of staying in a loop."
         ),
-        methods=["every", "list", "cancel"],
+        methods=["every", "daily", "list", "cancel"],
         argument_schema={
             "goal": {"type": "string"},
             "every_seconds": {"type": "integer"},
+            "at_hour": {"type": "integer"},
+            "at_minute": {"type": "integer"},
+            "timezone": {"type": "string"},
             "title": {"type": "string"},
             "description": {"type": "string"},
             "task_id": {"type": "string"},
@@ -45,6 +50,14 @@ class ScheduleTool(Tool):
             "every": {
                 "goal": {"type": "string", "required": True},
                 "every_seconds": {"type": "integer", "required": True},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "daily": {
+                "goal": {"type": "string", "required": True},
+                "at_hour": {"type": "integer", "required": True},
+                "at_minute": {"type": "integer"},
+                "timezone": {"type": "string"},
                 "title": {"type": "string"},
                 "description": {"type": "string"},
             },
@@ -59,26 +72,12 @@ class ScheduleTool(Tool):
     def __init__(self, service):
         self.service = service
 
-    @staticmethod
-    def _serialize(task: Task) -> dict[str, Any]:
-        schedule = task.metadata.get("schedule") or {}
-        return {
-            "task_id": task.id,
-            "title": task.title,
-            "goal": task.goal,
-            "status": task.status.value,
-            "enabled": bool(schedule.get("enabled", True)),
-            "every_seconds": schedule.get("every_seconds"),
-            "next_run_at": schedule.get("next_run_at"),
-            "last_fired_at": schedule.get("last_fired_at"),
-            "runs": int(schedule.get("runs") or 0),
-            "project_id": task.project_id,
-        }
-
     async def execute(self, method: str, args: dict[str, Any], timeout: float) -> OperationResult:
         try:
             if method == "every":
-                return await self._create(args)
+                return await self._create(args, daily=False)
+            if method == "daily":
+                return await self._create(args, daily=True)
             if method == "list":
                 return await self._list()
             if method == "cancel":
@@ -88,6 +87,10 @@ class ScheduleTool(Tool):
                 error=f"Unsupported schedule method: {method}",
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
+        except ScheduleError as error:
+            return OperationResult(
+                success=False, error=str(error), error_type=ErrorType.INVALID_ARGUMENT
+            )
         except (AttributeError, KeyError, TypeError, ValueError) as error:
             return OperationResult(
                 success=False,
@@ -95,29 +98,12 @@ class ScheduleTool(Tool):
                 error_type=ErrorType.TOOL_FAILURE,
             )
 
-    async def _create(self, args: dict[str, Any]) -> OperationResult:
-        goal = str(args["goal"]).strip()
+    async def _create(self, args: dict[str, Any], *, daily: bool) -> OperationResult:
+        goal = str(args.get("goal") or "").strip()
         if not goal:
             return OperationResult(
                 success=False,
                 error="goal must not be empty",
-                error_type=ErrorType.INVALID_ARGUMENT,
-            )
-        try:
-            every = int(args["every_seconds"])
-        except (TypeError, ValueError):
-            return OperationResult(
-                success=False,
-                error="every_seconds must be an integer",
-                error_type=ErrorType.INVALID_ARGUMENT,
-            )
-        if not MIN_EVERY_SECONDS <= every <= MAX_EVERY_SECONDS:
-            return OperationResult(
-                success=False,
-                error=(
-                    f"every_seconds must be between {MIN_EVERY_SECONDS} and "
-                    f"{MAX_EVERY_SECONDS}"
-                ),
                 error_type=ErrorType.INVALID_ARGUMENT,
             )
         parent = None
@@ -126,7 +112,10 @@ class ScheduleTool(Tool):
             parent = await self.service.get_task(str(parent_id))
         created = await self.service.create_schedule(
             goal,
-            every,
+            every_seconds=None if daily else args.get("every_seconds"),
+            at_hour=args.get("at_hour") if daily else None,
+            at_minute=args.get("at_minute") if daily else None,
+            timezone_name=args.get("timezone"),
             title=str(args.get("title") or "").strip(),
             description=str(args.get("description") or "").strip(),
             project_id=parent.project_id if parent else None,
@@ -137,7 +126,7 @@ class ScheduleTool(Tool):
         return OperationResult(
             success=True,
             output={
-                "schedule": self._serialize(created),
+                "schedule": self.service.schedule_view(created),
                 "note": (
                     "Holder created in WAITING; the runtime clones it as a child "
                     "task on every due window."
@@ -147,16 +136,13 @@ class ScheduleTool(Tool):
         )
 
     async def _list(self) -> OperationResult:
-        schedules = [
-            self._serialize(task)
-            for task in await self.service.repository.list_tasks()
-            if isinstance(task.metadata.get("schedule"), dict)
-        ]
-        schedules.sort(key=lambda item: str(item.get("next_run_at") or ""))
-        return OperationResult(success=True, output={"count": len(schedules), "schedules": schedules})
+        schedules = await self.service.list_schedules()
+        return OperationResult(
+            success=True, output={"count": len(schedules), "schedules": schedules}
+        )
 
     async def _cancel(self, args: dict[str, Any]) -> OperationResult:
-        task_id = str(args["task_id"]).strip()
+        task_id = str(args.get("task_id") or "").strip()
         task = await self.service.cancel_schedule(task_id)
         if task is None:
             return OperationResult(
@@ -166,6 +152,6 @@ class ScheduleTool(Tool):
             )
         return OperationResult(
             success=True,
-            output={"schedule": self._serialize(task)},
+            output={"schedule": self.service.schedule_view(task)},
             side_effects=["schedule.cancelled"],
         )

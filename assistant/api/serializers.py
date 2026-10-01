@@ -60,6 +60,87 @@ def _task_json(task) -> dict:
     }
 
 
+async def needs_attention(repository, limit: int = 20) -> list[dict]:
+    """Tasks parked because a person has to decide something.
+
+    A waiting task does not block the queue: the runtime keeps dispatching the
+    others. What was missing is being told. Schedule holders also live in
+    ``WAITING`` (that is how recurrence is expressed), so they are excluded —
+    a permanent timer is not a question waiting for you.
+    """
+    from ..domain.models import NodeStatus, TaskStatus
+
+    try:
+        tasks = await repository.list_tasks_by_status({TaskStatus.WAITING})
+    except (AttributeError, TypeError):
+        return []
+    items: list[dict] = []
+    for task in tasks:
+        metadata = task.metadata or {}
+        if metadata.get("schedule"):
+            continue
+        try:
+            nodes = await repository.list_nodes(task.id)
+        except (AttributeError, TypeError):
+            nodes = []
+        waiting = [node for node in nodes if node.status is NodeStatus.WAITING]
+        clarification = task.runtime.clarification or {}
+        question = (
+            (waiting[0].error if waiting else None)
+            or task.failure_reason
+            or clarification.get("question")
+            or ("choose a project" if clarification else None)
+            or "the task needs your input to continue"
+        )
+        items.append(
+            {
+                "task_id": task.id,
+                "title": task.title or task.goal,
+                "goal": (task.goal or "")[:200],
+                "question": str(question)[:400],
+                "node_id": waiting[0].id if waiting else None,
+                "kind": "project_selection" if clarification else "question",
+                "options": [
+                    item.get("name") or item.get("id")
+                    for item in clarification.get("options", [])
+                ][:10],
+                "since": task.created_at.isoformat() if task.created_at else None,
+                "answer_with": f"POST /api/v1/tasks/{task.id}/input",
+            }
+        )
+    return items[:limit]
+
+
+def project_view(project) -> dict:
+    """Project payload without the stored graph payload.
+
+    The full index is megabytes of modules, symbols and edges (1.3 MB for this
+    repository, and it grows with the project). It is prompt material for the
+    engine, not something a client needs to list projects or draw a card, so the
+    response carries its shape (counts, version, partiality) instead of its bulk.
+    """
+    data = project.model_dump(mode="json")
+    graph = data.pop("codegraph", None) or {}
+    summary = {
+        key: graph.get(key)
+        for key in ("root", "file_count", "project_kind", "languages", "truncated")
+        if graph.get(key) not in (None, [], {})
+    }
+    nodes = (graph.get("graph") or {}).get("nodes") or []
+    edges = (graph.get("graph") or {}).get("edges") or graph.get("dependency_edges") or []
+    if graph:
+        summary["module_count"] = sum(1 for node in nodes if node.get("kind") == "module")
+        summary["symbol_count"] = sum(1 for node in nodes if node.get("kind") == "symbol")
+        summary["edge_count"] = len(edges)
+        summary["partial"] = bool(
+            graph.get("truncated")
+            or (graph.get("graph") or {}).get("edges_truncated")
+            or (graph.get("graph") or {}).get("symbols_truncated")
+        )
+    data["codegraph"] = summary or None
+    return data
+
+
 def _usage_tokens(usage: dict) -> tuple[int, int]:
     return (
         int(usage.get("prompt_tokens", usage.get("prompt_eval_count", 0)) or 0),
@@ -185,12 +266,18 @@ def _cost_estimate(
     input_cost = billable_prompt * input_rate / 1_000_000
     cached_cost = max(0, cached) * cached_rate / 1_000_000
     output_cost = completion * output_rate / 1_000_000
+    # What the cached part would have cost at the normal input rate: the
+    # difference is the saving the cache actually produced, not a projection.
+    saving = max(0.0, max(0, cached) * (input_rate - cached_rate) / 1_000_000)
     return {
         "configured": True,
         "currency": getattr(settings, "cost_currency", "USD"),
         "prompt_usd": round(input_cost + cached_cost, 6),
         "completion_usd": round(output_cost, 6),
         "total_usd": round(input_cost + cached_cost + output_cost, 6),
+        "cached_prompt_usd": round(cached_cost, 6),
+        "cache_saving_usd": round(saving, 6),
+        "total_without_cache_usd": round(input_cost + cached_cost + saving + output_cost, 6),
         "rates_per_million": {
             "input": input_rate,
             "cached_input": cached_rate,
@@ -575,6 +662,26 @@ def _dashboard_analytics(context, tasks, task_nodes, events):
         "model": model,
         "model_label": model_label,
         "cost": cost,
+        # A provider-side context cache is a *prefix* cache, so this number is a
+        # measure of how much of each prompt is identical to the previous one.
+        # It is the only lever this project controls over the price per turn.
+        "cache": {
+            "cached_tokens": cached_tokens,
+            "miss_tokens": cache_miss_tokens,
+            "hit_rate": round(
+                cached_tokens / (cached_tokens + cache_miss_tokens) * 100, 1
+            )
+            if (cached_tokens + cache_miss_tokens)
+            else 0,
+            "saving_usd": cost.get("cache_saving_usd") if cost.get("configured") else None,
+            "currency": cost.get("currency"),
+            "note": (
+                "Hits are counted on the identical prefix of a prompt, so stable "
+                "sections (instructions, tool catalog, schema) are placed first in "
+                "every template and volatile evidence last."
+            ),
+            "available": bool(cached_tokens or cache_miss_tokens),
+        },
         "reliability": {
             "tool_calls": tool_calls_total,
             "tool_failures": tool_calls_failed,

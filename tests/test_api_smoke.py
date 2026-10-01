@@ -7,6 +7,9 @@ renamed field actually breaks a deployment.
 
 from __future__ import annotations
 
+import json
+import pathlib
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -64,6 +67,25 @@ async def test_read_only_endpoints_respond(client):
 
 
 @pytest.mark.asyncio
+async def test_resources_report_perception_honestly(client):
+    """The panel must say whether the configured model can read images."""
+    http, _context = client
+
+    payload = (await http.get(f"{API_PREFIX}/resources")).json()
+
+    vision = payload["vision"]
+    assert isinstance(vision["model_reads_images"], bool)
+    assert vision["model"] == "deepseek-flash"
+    assert "detail" in vision
+    if vision["model_reads_images"]:
+        assert vision["images_per_request"] >= 1
+    else:
+        assert vision["images_per_request"] == 0
+        assert "text-only" in vision["note"]
+    assert {"hardware", "devices", "tools"} <= set(payload)
+
+
+@pytest.mark.asyncio
 async def test_creating_a_task_returns_the_stored_fields_and_runs_to_terminal(client):
     http, context = client
 
@@ -88,6 +110,34 @@ async def test_creating_a_task_returns_the_stored_fields_and_runs_to_terminal(cl
     assert result.runtime.final_response is not None
     # The instruction carries both halves of the request.
     assert "detalle de la tarea" in result.instruction
+
+
+@pytest.mark.asyncio
+async def test_the_project_payload_lists_the_index_shape_not_the_index(client):
+    http, context = client
+    root = pathlib.Path(context.settings.projects_root) / "sample"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "main.py").write_text("def entry():\n    return 1\n", encoding="utf-8")
+
+    created = await http.post(
+        f"{API_PREFIX}/projects",
+        json={"name": "sample", "path": str(root), "project_type": "code"},
+    )
+    assert created.status_code == 200, created.text
+    project_id = created.json()["id"]
+    refreshed = await http.post(f"{API_PREFIX}/projects/{project_id}/codegraph/refresh")
+    assert refreshed.status_code == 200, refreshed.text
+
+    listing = (await http.get(f"{API_PREFIX}/projects")).json()
+    payload = next(item for item in listing if item["id"] == project_id)
+
+    assert payload["codegraph"]["file_count"] >= 1
+    assert payload["codegraph"]["module_count"] >= 1
+    # The stored graph itself never rides along in a list response.
+    assert "symbols" not in payload["codegraph"]
+    assert "graph" not in payload["codegraph"]
+    assert "dependency_edges" not in payload["codegraph"]
+    assert len(json.dumps(listing)) < 4_000
 
 
 @pytest.mark.asyncio

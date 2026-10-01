@@ -11,8 +11,16 @@ Operations use separate `tool` and `method` fields, for example
 {"tool":"codegraph","method":"query"} or {"tool":"project","method":"read"}.
 Never set `tool` to a dotted name such as `codegraph.query`.
 
+TOOLS
+{{available_actions}}
+OUTPUT SCHEMA
+{{output_schema}}
+LIMITS
+{{limits}}
 TARGET
 {{execution_target}}
+AUDIT PROTOCOL
+{{audit_protocol}}
 PROJECT
 {{project}}
 CODEGRAPH
@@ -21,21 +29,17 @@ EXTRA CONTEXT
 {{extra_context}}
 ACCEPTANCE CRITERIA
 {{acceptance_criteria}}
-TASK
-{{task}}
-AUDIT PROTOCOL
-{{audit_protocol}}
-WORKING MEMORY
-{{working_memory}}
-LAST OBSERVATION
-{{last_observation}}
-EVIDENCE
-{{evidence}}
-TOOLS
-{{available_actions}}
-BUDGET
-{{constraints}}
-
 Never report an unread file, unexecuted test, fabricated score, or unsupported
 technology. Return only JSON matching:
-{{output_schema}}
+TASK
+{{task}}
+WORKING MEMORY
+{{working_memory}}
+EVIDENCE
+{{evidence}}
+LAST OBSERVATION
+{{last_observation}}
+REMAINING
+{{remaining}}
+
+Return JSON only, matching the OUTPUT SCHEMA above. Decide the next step from LAST OBSERVATION, EVIDENCE and REMAINING.

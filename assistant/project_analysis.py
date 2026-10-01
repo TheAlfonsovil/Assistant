@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
+import os
 import re
 from collections import Counter
 from datetime import UTC, datetime
@@ -12,10 +14,42 @@ from .domain.models import ErrorType, OperationResult
 from .project_audit.analyzer import ProjectAuditMixin
 
 
+def project_tree_fingerprint(root: str, max_files: int = 5000) -> str:
+    """Cheap change detector for a project tree: path, size and mtime per file.
+
+    Stat-only, so it costs one directory walk instead of a full parse. It is the
+    signal that lets an unchanged project reuse the structural index it already
+    has, instead of re-analysing before every LLM phase. Returns an empty string
+    when the tree cannot be read, which callers treat as "cannot prove it is
+    unchanged" and therefore refresh.
+    """
+    base = Path(root).resolve()
+    try:
+        files = ProjectAnalyzer._collect_files(base, max_files)
+    except (OSError, ValueError):
+        return ""
+    digest = hashlib.sha1()
+    for path in files:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        digest.update(
+            f"{path.relative_to(base).as_posix()}|{stat.st_size}|{stat.st_mtime_ns}\n".encode()
+        )
+    return digest.hexdigest()
+
+
 class ProjectAnalyzer(ProjectAuditMixin):
     """Builds a bounded structural inventory and dependency graph for a local project."""
 
-    async def analyze(self, root: str, max_files: int = 500) -> OperationResult:
+    async def analyze(
+        self,
+        root: str,
+        max_files: int = 500,
+        max_symbols: int = 2000,
+        max_edges: int = 4000,
+    ) -> OperationResult:
         started_at = datetime.now(UTC)
         started_files = Path(root).resolve()
         try:
@@ -52,10 +86,17 @@ class ProjectAnalyzer(ProjectAuditMixin):
                 "file_count": len(files),
                 "languages": dict(languages),
                 "project_kind": self._classify_project(started_files, files),
-                "modules": modules[:2000],
-                "symbols": symbols[:2000],
-                "dependency_edges": edges[:4000],
+                "modules": modules[: max_files],
+                "symbols": symbols[:max_symbols],
+                "dependency_edges": edges[:max_edges],
+                # Honest reporting: a silently capped index makes a model read
+                # "no edge" where the edge simply was not stored.
                 "truncated": truncated,
+                "modules_total": len(modules),
+                "symbols_total": len(symbols),
+                "edges_total": len(edges),
+                "symbols_truncated": len(symbols) > max_symbols,
+                "edges_truncated": len(edges) > max_edges,
             }
             finished_at = datetime.now(UTC)
             return OperationResult(
@@ -90,16 +131,27 @@ class ProjectAnalyzer(ProjectAuditMixin):
             ".pytest_cache",
             ".ruff_cache",
         }
-        files = [
-            path
-            for path in root.rglob("*")
-            if path.is_file()
-            and not ignored.intersection(path.parts)
-            and not any(part.endswith(".egg-info") for part in path.parts)
-            and path.name not in {".env", ".env.local", ".env.production"}
-            and path.suffix.lower() not in {".pyc", ".pyo", ".db", ".log"}
-            and not path.name.lower().endswith((".db-wal", ".db-shm"))
-        ]
+        files: list[Path] = []
+        for current, dirnames, filenames in os.walk(root):
+            # Prune ignored directories instead of walking them and filtering
+            # afterwards: node_modules alone can hold orders of magnitude more
+            # entries than the project, and this walk also runs before every
+            # structural refresh to detect changes.
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if name not in ignored and not name.endswith(".egg-info")
+            ]
+            directory = Path(current)
+            for name in filenames:
+                path = directory / name
+                if (
+                    path.name in {".env", ".env.local", ".env.production"}
+                    or path.suffix.lower() in {".pyc", ".pyo", ".db", ".log"}
+                    or path.name.lower().endswith((".db-wal", ".db-shm"))
+                ):
+                    continue
+                files.append(path)
         return sorted(files)[: max_files + 1]
 
     @staticmethod

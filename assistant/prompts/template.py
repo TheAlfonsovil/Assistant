@@ -18,6 +18,12 @@ MARKERS = (
     "completed_artifacts",
     "available_actions",
     "constraints",
+    # ``limits`` are the fixed maxima; ``remaining`` are the counters that change
+    # on every turn. Keeping them as separate markers is what lets a template put
+    # everything stable first and the volatile tail last, which is the only
+    # thing that makes a provider-side prefix cache hit.
+    "limits",
+    "remaining",
     "planner_feedback",
     "failure_context",
     "output_schema",
@@ -51,6 +57,8 @@ def render(template: str, context: dict[str, Any], output_schema: dict[str, Any]
         "completed_artifacts": context.get("completed_artifacts", []),
         "available_actions": context.get("available_actions", []),
         "constraints": context.get("constraints", {}),
+        "limits": context.get("limits", context.get("constraints", {})),
+        "remaining": context.get("remaining", {}),
         "planner_feedback": context.get("planner_feedback", ""),
         "failure_context": context.get("failure_context", {}),
         "execution_evidence": context.get(

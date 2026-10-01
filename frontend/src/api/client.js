@@ -25,6 +25,12 @@ export const api = {
   getEvent: (id) => request(`/observability/events/${id}`),
   getNode: (taskId, nodeId) => request(`/tasks/${taskId}/nodes/${nodeId}`),
   resources: () => request('/resources'),
+  captureScreen: (monitor = null, maxWidth = 1600) =>
+    request(
+      `/resources/capture?max_width=${maxWidth}${monitor === null ? '' : `&monitor=${monitor}`}`,
+      { method: 'POST' },
+    ),
+  screenshotUrl: (filename) => `${BASE}/resources/screenshot/${filename}`,
   metrics: (limit = 500) => request(`/metrics?limit=${limit}`),
   metricsSeries: (hours = 24) => request(`/metrics/series?hours=${hours}`),
   // tasks
@@ -58,11 +64,17 @@ export const api = {
   deleteMemory: (id) => request(`/memory/${id}`, { method: 'DELETE' }),
   purgeExpired: () => request('/memory/purge-expired', { method: 'POST' }),
   // runtime
-  getIdle: () => request('/runtime/idle'),
-  setIdle: (enabled) => request('/runtime/idle', { method: 'PUT', body: { enabled } }),
+  getIdle: () => request('/runtime/idle'),  setIdle: (enabled) => request('/runtime/idle', { method: 'PUT', body: { enabled } }),
   getOffPeak: () => request('/runtime/offpeak'),
   setOffPeak: (enabled) => request('/runtime/offpeak', { method: 'PUT', body: { enabled } }),
   resetRuntime: () => request('/runtime/reset', { method: 'POST' }),
+  // recurring work
+  listSchedules: () => request('/schedules'),
+  createSchedule: (payload) => request('/schedules', { method: 'POST', body: payload }),
+  updateSchedule: (id, payload) => request(`/schedules/${id}`, { method: 'PUT', body: payload }),
+  pauseSchedule: (id) => request(`/schedules/${id}/pause`, { method: 'POST' }),
+  resumeSchedule: (id) => request(`/schedules/${id}/resume`, { method: 'POST' }),
+  cancelSchedule: (id) => request(`/schedules/${id}/cancel`, { method: 'POST' }),
   // chat (non-streaming + agent)
   chat: (payload) => request('/chat', { method: 'POST', body: payload }),
   chatAgent: (payload) => request('/chat/agent', { method: 'POST', body: payload }),

@@ -16,6 +16,7 @@ from .routers import (
     memory_router,
     projects_router,
     runtime_router,
+    schedules_router,
     system_router,
     tasks_router,
 )
@@ -72,7 +73,7 @@ async def lifespan(app: FastAPI):
         await context.close()
 
 
-app = FastAPI(title="Assistant Core", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="Assistant Core", version="0.6.2", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -91,6 +92,7 @@ app.include_router(tasks_router, prefix=API_PREFIX)
 app.include_router(projects_router, prefix=API_PREFIX)
 app.include_router(memory_router, prefix=API_PREFIX)
 app.include_router(runtime_router, prefix=API_PREFIX)
+app.include_router(schedules_router, prefix=API_PREFIX)
 app.include_router(chat_router, prefix=API_PREFIX)
 
 

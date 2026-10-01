@@ -771,7 +771,9 @@ async def test_planner_context_filters_actions_and_keeps_argument_shapes(tmp_pat
 
     groups = {item["group"]: item["tools"] for item in planner_context["available_actions"]}
     action_names = {item["name"] for item in groups["primary"]}
-    assert action_names == {"audit", "project", "codegraph", "git"}
+    # An audit needs structure, history and real types: the semantic tool is
+    # part of the intent's primary set, not an optional extra.
+    assert action_names == {"audit", "project", "codegraph", "git", "types"}
     project = next(item for item in groups["primary"] if item["name"] == "project")
     assert "run_tests" not in project["args"]
     audit = next(item for item in groups["primary"] if item["name"] == "audit")

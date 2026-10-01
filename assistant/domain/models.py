@@ -179,7 +179,10 @@ class AgentBudget(BaseModel):
     max_steps: int = Field(default=100, ge=0)
     max_llm_calls: int = Field(default=20, ge=0)
     max_tool_calls: int = Field(default=50, ge=0)
-    max_execution_time: float = Field(default=86400.0, ge=0.0)
+    # An agent run cannot outlive the task that owns it, so this mirrors
+    # TaskBudget above. It used to say 86400 (a full day, twelve times the
+    # task's own ceiling), which read as a second, contradictory policy.
+    max_execution_time: float = Field(default=7200.0, ge=0.0)
     max_tokens: int | None = Field(default=None, ge=0)
 
 
@@ -565,6 +568,33 @@ class TaskRedefinitionRequest(BaseModel):
     title: str | None = Field(default=None, max_length=200)
     description: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ScheduleRequest(BaseModel):
+    """Ask for recurring work.
+
+    Either ``every_seconds`` (interval) or ``at_hour``/``at_minute`` (daily).
+    Range checks live in ``assistant.recurrence`` so the API, the tool and the
+    scheduler all validate identically.
+    """
+
+    goal: str = Field(min_length=1, max_length=10000)
+    title: str = Field(default="", max_length=200)
+    description: str = Field(default="", max_length=20000)
+    project_id: str | None = None
+    every_seconds: int | None = None
+    at_hour: int | None = None
+    at_minute: int | None = None
+    timezone: str | None = None
+
+
+class ScheduleUpdateRequest(BaseModel):
+    """Change the recurrence of an existing holder; omitted fields are kept."""
+
+    every_seconds: int | None = None
+    at_hour: int | None = None
+    at_minute: int | None = None
+    timezone: str | None = None
 
 
 class ProjectRequest(BaseModel):

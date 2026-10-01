@@ -221,6 +221,179 @@ async def test_recurring_work_inherits_the_project_and_attachments(make_service,
     assert holder.metadata["attachments"] == parent.metadata["attachments"]
 
 
+@pytest.mark.asyncio
+async def test_daily_creates_a_holder_for_a_wall_clock_time(make_service):
+    service = await make_service("schedule-daily.db")
+
+    result = await ScheduleTool(service).execute(
+        "daily",
+        {
+            "goal": "revisa las alertas",
+            "at_hour": 8,
+            "at_minute": 30,
+            "timezone": "UTC+02:00",
+        },
+        timeout=5,
+    )
+
+    assert result.success is True, result.error
+    schedule = result.output["schedule"]
+    assert schedule["kind"] == "daily"
+    assert schedule["every_seconds"] is None
+    assert (schedule["at_hour"], schedule["at_minute"]) == (8, 30)
+    assert schedule["timezone"] == "UTC+02:00"
+    assert schedule["text"] == "every day at 08:30 (UTC+02:00)"
+    assert datetime.fromisoformat(schedule["next_run_at"]).minute == 30
+
+
+@pytest.mark.asyncio
+async def test_a_daily_schedule_fires_once_and_advances_a_day(make_service):
+    service = await make_service("schedule-daily-fire.db")
+    created = await ScheduleTool(service).execute(
+        "daily", {"goal": "parte diario", "at_hour": 7}, timeout=5
+    )
+    holder_id = created.output["schedule"]["task_id"]
+    holder = await service.get_task(holder_id)
+    now = datetime(2026, 9, 30, 9, 0, tzinfo=UTC)
+    # The 07:00 window of today has passed; it becomes due immediately.
+    holder.metadata["schedule"]["next_run_at"] = datetime(2026, 9, 30, 7, 0, tzinfo=UTC).isoformat()
+    await service.repository.save_task(holder)
+
+    fired = await service.reconcile_schedules(now=now)
+
+    assert fired == 1
+    refreshed = await service.get_task(holder_id)
+    schedule = refreshed.metadata["schedule"]
+    assert schedule["runs"] == 1
+    # A daily schedule never queues the days it missed.
+    assert schedule["next_run_at"] == datetime(2026, 10, 1, 7, 0, tzinfo=UTC).isoformat()
+    assert schedule["kind"] == "daily"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_schedule_is_skipped_instead_of_guessed(make_service):
+    service = await make_service("schedule-broken.db")
+    created = await ScheduleTool(service).execute(
+        "every", {"goal": "vigila", "every_seconds": 300}, timeout=5
+    )
+    holder = await service.get_task(created.output["schedule"]["task_id"])
+    # The record survives a downgrade: an interval without bounds is not a
+    # schedule this version can honour, so it must not fire.
+    holder.metadata["schedule"] = {"every_seconds": 0, "enabled": True, "runs": 0}
+    await service.repository.save_task(holder)
+
+    assert await service.reconcile_schedules() == 0
+
+
+@pytest.mark.asyncio
+async def test_update_replaces_the_recurrence_and_keeps_the_history(make_service):
+    service = await make_service("schedule-update.db")
+    created = await ScheduleTool(service).execute(
+        "every", {"goal": "vigila", "every_seconds": 600}, timeout=5
+    )
+    holder_id = created.output["schedule"]["task_id"]
+    holder = await service.get_task(holder_id)
+    holder.metadata["schedule"]["runs"] = 4
+    await service.repository.save_task(holder)
+
+    updated = await service.update_schedule(holder_id, at_hour=6, timezone_name="UTC+01:00")
+
+    assert updated is not None
+    schedule = updated.metadata["schedule"]
+    assert schedule["kind"] == "daily"
+    assert schedule["every_seconds"] is None
+    assert schedule["timezone"] == "UTC+01:00"
+    # Changing the recurrence cannot erase what already ran.
+    assert schedule["runs"] == 4
+    events = [event.event_type for event in await service.repository.list_events(holder_id)]
+    assert "SCHEDULE_UPDATED" in events
+
+
+@pytest.mark.asyncio
+async def test_pause_and_resume_keep_the_holder_alive(make_service):
+    service = await make_service("schedule-resume.db")
+    created = await ScheduleTool(service).execute(
+        "every", {"goal": "vigila", "every_seconds": 3600}, timeout=5
+    )
+    holder_id = created.output["schedule"]["task_id"]
+
+    paused = await service.pause_schedule(holder_id)
+    assert paused is not None
+    assert paused.metadata["schedule"]["enabled"] is False
+    # Pausing is not cancelling: the holder stays alive and stays WAITING.
+    assert paused.status is TaskStatus.WAITING
+    assert service.schedule_view(paused)["paused"] is True
+
+    resumed = await service.resume_schedule(holder_id)
+
+    assert resumed is not None
+    assert resumed.status is TaskStatus.WAITING
+    schedule = resumed.metadata["schedule"]
+    assert schedule["enabled"] is True
+    assert "paused_at" not in schedule
+    # Resuming never fires the instant it is resumed.
+    assert datetime.fromisoformat(schedule["next_run_at"]) > datetime.now(UTC)
+    events = [event.event_type for event in await service.repository.list_events(holder_id)]
+    assert {"SCHEDULE_PAUSED", "SCHEDULE_RESUMED"} <= set(events)
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_schedule_is_final(make_service):
+    service = await make_service("schedule-final.db")
+    created = await ScheduleTool(service).execute(
+        "every", {"goal": "vigila", "every_seconds": 600}, timeout=5
+    )
+    holder_id = created.output["schedule"]["task_id"]
+    await service.cancel_schedule(holder_id)
+
+    with pytest.raises(ValueError, match="final"):
+        await service.resume_schedule(holder_id)
+    with pytest.raises(ValueError, match="finished"):
+        await service.update_schedule(holder_id, every_seconds=900)
+    with pytest.raises(ValueError, match="already"):
+        await service.pause_schedule(holder_id)
+
+    cancelled = await service.get_task(holder_id)
+    assert cancelled.status is TaskStatus.CANCELLED
+    view = service.schedule_view(cancelled)
+    assert (view["cancelled"], view["paused"]) == (True, False)
+
+
+@pytest.mark.asyncio
+async def test_list_schedules_puts_the_enabled_and_nearest_first(make_service):
+    service = await make_service("schedule-list.db")
+    tool = ScheduleTool(service)
+    soon = await tool.execute("every", {"goal": "cada minuto", "every_seconds": 60}, timeout=5)
+    later = await tool.execute("every", {"goal": "cada día", "every_seconds": 86400}, timeout=5)
+    await service.cancel_schedule(soon.output["schedule"]["task_id"])
+
+    listed = await tool.execute("list", {}, timeout=5)
+
+    schedules = listed.output["schedules"]
+    assert listed.output["count"] == 2
+    assert schedules[0]["task_id"] == later.output["schedule"]["task_id"]
+    assert schedules[-1]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_holder_written_before_the_daily_kind_still_fires(make_service):
+    service = await make_service("schedule-legacy.db")
+    created = await ScheduleTool(service).execute(
+        "every", {"goal": "vigila", "every_seconds": 300}, timeout=5
+    )
+    holder_id = created.output["schedule"]["task_id"]
+    holder = await service.get_task(holder_id)
+    # Exactly what the previous version persisted: no "kind" key at all.
+    holder.metadata["schedule"].pop("kind")
+    holder.metadata["schedule"]["next_run_at"] = (
+        datetime.now(UTC) - timedelta(minutes=5)
+    ).isoformat()
+    await service.repository.save_task(holder)
+
+    assert await service.reconcile_schedules() == 1
+    assert (await service.get_task(holder_id)).metadata["schedule"]["runs"] == 1
+
+
 def test_schedule_capability_is_visible_to_the_model():
     class _Repository:
         async def get_project(self, project_id):

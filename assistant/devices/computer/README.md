@@ -11,6 +11,9 @@ The computer branch is the only real device branch in V1. Its capabilities are r
 - `audit`: run
 - `system`: info (read-only local diagnostics)
 - `codegraph`: build (bounded project module, symbol and dependency graph)
+- `types`: probe, hover, definition, references, rename, diagnostics, symbols (semantic answers from pyright)
+- `debug`: probe, trace (run a program under debugpy and read real locals)
+- `window`: probe, list, snapshot (desktop windows as a control tree, via UI Automation)
 - `web`: search, fetch (public HTTP(S) only)
 - `browser`: inspect, open, log, close_tab, close_site, close_browser
 
@@ -21,7 +24,38 @@ Tool implementations live in `actions/audit.py`, `actions/filesystem.py`,
 `actions/deployment.py`, and `actions/project_tool.py`. Project handlers are
 split across `project_create.py`, `project_read.py`, `project_edit.py`, and
 `project_validate.py`. `actions/registry.py` only composes and registers them;
-browser, codegraph, system, and web each have their own sibling module.
+browser, codegraph, semantics, system, and web each have their own sibling module.
+
+`types` is the semantic layer: `lsp.py` is a small LSP client (Content-Length
+framed JSON-RPC over stdio) and `semantics.py` turns its answers into bounded
+tool output. It reports `available: false` with the reason when node or pyright
+is missing, and it locates the symbol by name so a caller does not need to know
+the exact column. `rename` is the semantic operation text search cannot do: the
+server resolves the symbol, so the edit set is complete, and applying it is
+opt-in (a truncated plan is never half-applied). `diagnostics` runs the batch
+checker (`index.js` with `node` directly: 1.1 s against 18.5 s through `npx`)
+and returns type errors as evidence.
+
+`debug` is runtime truth: `dap.py` is a DAP client (same framing) for
+`debugpy`, and `debugger.py` runs a program with breakpoints and reports each
+stop with its frame and local values. Three protocol facts are encoded there
+because they are not obvious: the `launch` response arrives only after
+`configurationDone`, the program's output travels as `output` events, and the
+session must be torn down inside the call that started it.
+
+`window` is the desktop equivalent of `browser.snapshot`: `window.py` uses the
+Windows accessibility tree (UI Automation) to list top-level windows and to walk
+one window's controls with name, type, state and screen rectangle. It is
+observation only — acting stays with the opt-in `input.*` — and it is pruned
+because anonymous panes are noise: a control is kept when it has a name, is
+actionable, or its type says something structural (a menu bar, a tab strip, a
+document). Two host facts are handled explicitly: COM must be initialised **in
+the thread that uses it** (hence the initialiser wrapper around every call) and
+the API is blocking, so every call runs off the event loop.
+
+The optional extras are declared in `pyproject.toml`: `debug` for `debugpy` and
+`uia` for `uiautomation`. Neither is required to run the assistant; each tool
+reports what is missing (`missing-debugpy`, `missing-uiautomation`).
 
 `project.analyze` is a bounded structural inventory. `audit.run` is a separate,
 structured evidence report; it does not modify project files directly, and

@@ -4,28 +4,31 @@ Use focused queries for files, symbols, callers, dependencies and impact; never
 place the entire graph in the prompt. Return query provenance and compact
 references that another worker can follow.
 
+TOOLS
+{{available_actions}}
+OUTPUT SCHEMA
+{{output_schema}}
+LIMITS
+{{limits}}
 TARGET
 {{execution_target}}
 PROJECT
 {{project}}
 CODEGRAPH
 {{codegraph}}
-TASK
-{{task}}
 EXTRA CONTEXT
 {{extra_context}}
 ACCEPTANCE CRITERIA
 {{acceptance_criteria}}
+TASK
+{{task}}
 WORKING MEMORY
 {{working_memory}}
-LAST OBSERVATION
-{{last_observation}}
 EVIDENCE
 {{evidence}}
-TOOLS
-{{available_actions}}
-BUDGET
-{{constraints}}
+LAST OBSERVATION
+{{last_observation}}
+REMAINING
+{{remaining}}
 
-Return only JSON matching:
-{{output_schema}}
+Return JSON only, matching the OUTPUT SCHEMA above. Decide the next step from LAST OBSERVATION, EVIDENCE and REMAINING.

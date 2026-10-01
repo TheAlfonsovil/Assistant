@@ -38,8 +38,14 @@ function formatSize(bytes) {
 }
 
 // Recurring holders carry metadata.schedule (set by the `schedule` capability).
-function everyLabel(seconds) {
-  const value = Number(seconds) || 0
+function everyLabel(schedule) {
+  if (!schedule) return ''
+  if (schedule.kind === 'daily' || schedule.at_hour != null) {
+    const hour = String(schedule.at_hour ?? 0).padStart(2, '0')
+    const minute = String(schedule.at_minute ?? 0).padStart(2, '0')
+    return `${hour}:${minute} (${schedule.timezone || 'UTC'})`
+  }
+  const value = Number(schedule.every_seconds) || 0
   if (value >= 86400 && value % 86400 === 0) return `${value / 86400} d`
   if (value >= 3600 && value % 3600 === 0) return `${value / 3600} h`
   if (value >= 60 && value % 60 === 0) return `${value / 60} min`
@@ -191,7 +197,7 @@ onMounted(load)
               📎 {{ t.metadata.attachments.length }}
             </small>
             <small v-if="t.metadata?.schedule" class="muted">
-              🔁 cada {{ everyLabel(t.metadata.schedule.every_seconds) }}
+              🔁 {{ everyLabel(t.metadata.schedule) }}
               <template v-if="t.metadata.schedule.runs"> · {{ t.metadata.schedule.runs }} ejec.</template>
             </small>
             <small v-if="t.goal && t.goal !== t.title" class="muted"> · {{ t.goal }}</small>

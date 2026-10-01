@@ -1,13 +1,51 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from typing import Any
 
 from .attachments import attachment_view, infer_content_type
+from .config import DEFAULT_AGENT_CONTEXT_CHARS, DEFAULT_PROJECTS_ROOT
 from .domain.contracts import ContractScope, InputRef, OutputSpec, ResolvedInput
 from .domain.graph import TaskGraph
 from .domain.models import Operation, OperationResult, Task, TaskNode
 from .observability import compact
+
+# Every capability the model may be shown, by tool name.
+#
+# The catalog leads with the tools an intent prefers and offers the rest of this
+# set as optional, so a registered capability missing from this list is invisible
+# in that intent: the worker will not use what it cannot see, and it must never
+# invent a tool it has not been told about. `system` and `notify` were missing
+# here while being registered, which is exactly the failure this list exists to
+# prevent. The placeholder branches (``device.*``, which can only answer
+# "adapter not connected") stay out on purpose. `tests/test_capabilities.py`
+# keeps this set equal to the real registry.
+VISIBLE_TOOL_NAMES = frozenset(
+    {
+        "artifact",
+        "audit",
+        "browser",
+        "codegraph",
+        "debug",
+        "deployment",
+        "filesystem",
+        "git",
+        "http",
+        "input",
+        "memory",
+        "notify",
+        "process",
+        "project",
+        "schedule",
+        "screen",
+        "shell",
+        "system",
+        "types",
+        "web",
+        "window",
+    }
+)
 
 
 class ContextBuilder:
@@ -18,13 +56,16 @@ class ContextBuilder:
         repository,
         tools,
         workspace_root: str = ".",
-        projects_root: str = r"C:\Assistant",
+        projects_root: str = DEFAULT_PROJECTS_ROOT,
         vision_enabled: bool = False,
+        agent_context_chars: int = DEFAULT_AGENT_CONTEXT_CHARS,
     ):
         self.repository = repository
         self.tools = tools
         self.workspace_root = workspace_root
         self.projects_root = projects_root
+        # Prompt-side evidence budget for one agent/orchestrator turn.
+        self.agent_context_chars = max(4_000, int(agent_context_chars))
         # True only when the configured model can actually read image bytes.
         # Otherwise attachments are references the model must not pretend to see.
         self.vision_enabled = bool(vision_enabled)
@@ -59,10 +100,12 @@ class ContextBuilder:
                 "key_files",
                 "languages",
                 "truncated",
+                "partial",
                 "module_count",
                 "symbol_count",
                 "edge_count",
                 "entry_modules",
+                "hot_files",
                 "query",
             )
             if codegraph.get(key) not in (None, [], {})
@@ -88,31 +131,45 @@ class ContextBuilder:
         return {key: value for key, value in extra.items() if key not in dropped}
 
     @staticmethod
-    def _bound_agent_context(context: dict[str, Any], limit: int = 32_000) -> dict[str, Any]:
+    def _bound_agent_context(
+        context: dict[str, Any], limit: int = DEFAULT_AGENT_CONTEXT_CHARS
+    ) -> dict[str, Any]:
         """Keep every agent turn below a predictable prompt-side evidence budget.
 
-        Variable index dumps are trimmed first. Turn-local evidence, tools, and
-        the last observation stay available so the worker can change course.
+        The degradation order is deliberate. Volatile payloads shrink first
+        (index dumps, old evidence, oversized observations), and the tool catalog
+        is trimmed **by detail, never by dropping tools**: a capability the model
+        cannot see is a capability the worker will not use, and inventing a
+        catalog entry it does not have is worse than any size overrun.
+
+        The default budget is sized for the configured model window, not for the
+        small local model this loop originally ran on: a context that fits should
+        never be trimmed, because trimming either hides evidence or moves the
+        cacheable prefix. Raise ``agent_context_chars`` to spend more window,
+        lower it to spend fewer tokens.
         """
         def serialized(value: Any) -> int:
             return len(json.dumps(value, ensure_ascii=False, default=str))
 
-        def compact_actions(actions: Any) -> Any:
+        def compact_actions(actions: Any, level: int = 1) -> Any:
+            """Shrink the catalog while keeping every group and every tool."""
             if not isinstance(actions, list):
                 return []
             compacted = []
-            for item in actions[:6]:
+            for item in actions:
                 if not isinstance(item, dict):
                     continue
                 tools = item.get("tools", [])
                 compacted_tools = []
                 if isinstance(tools, list):
-                    for tool in tools[:6]:
+                    for tool in tools:
                         if isinstance(tool, dict):
-                            compacted_tools.append({
+                            entry: dict[str, Any] = {
                                 "name": tool.get("name"),
                                 "methods": tool.get("methods", []),
-                                "args": {
+                            }
+                            if level < 2:
+                                entry["args"] = {
                                     key: {
                                         field: value
                                         for field, value in schema.items()
@@ -120,9 +177,9 @@ class ContextBuilder:
                                     }
                                     for key, schema in (tool.get("args") or {}).items()
                                     if isinstance(schema, dict)
-                                },
-                                "method_args": tool.get("method_args", {}),
-                            })
+                                }
+                                entry["method_args"] = tool.get("method_args", {})
+                            compacted_tools.append(entry)
                         else:
                             compacted_tools.append({"name": str(tool), "methods": []})
                 compacted.append({
@@ -143,12 +200,14 @@ class ContextBuilder:
             bounded["project"]["codegraph"] = ContextBuilder._slim_codegraph(
                 bounded["project"]["codegraph"]
             )
-        bounded["evidence"] = list(context.get("evidence", []))[-4:]
-        bounded["last_observation"] = compact(context.get("last_observation"), 1200)
+        bounded["evidence"] = list(context.get("evidence", []))[-12:]
+        bounded["last_observation"] = compact(context.get("last_observation"), 4000)
         if serialized(bounded) > limit:
-            bounded["available_actions"] = compact_actions(context.get("available_actions"))
+            bounded["evidence"] = bounded["evidence"][-6:]
         if serialized(bounded) > limit:
-            bounded["evidence"] = bounded["evidence"][-1:]
+            bounded["last_observation"] = compact(context.get("last_observation"), 1500)
+        if serialized(bounded) > limit:
+            bounded["evidence"] = bounded["evidence"][-2:]
         if serialized(bounded) > limit:
             bounded["last_observation"] = compact(context.get("last_observation"), 400)
         if serialized(bounded) > limit:
@@ -158,7 +217,7 @@ class ContextBuilder:
                 if key in {"id", "goal"}
             }
         if serialized(bounded) > limit:
-            bounded["user_prompt"] = str(bounded.get("user_prompt", ""))[:2000]
+            bounded["user_prompt"] = str(bounded.get("user_prompt", ""))[:8000]
         if serialized(bounded) > limit:
             bounded["long_term_memory"] = []
         if serialized(bounded) > limit:
@@ -173,8 +232,40 @@ class ContextBuilder:
                 for key, value in bounded.get("constraints", {}).items()
                 if key in {"max_llm_calls", "remaining_llm_calls", "max_tool_calls", "remaining_tool_calls"}
             }
+        # Last resort before anything is dropped: keep the whole inventory and
+        # cut only the argument detail.
         if serialized(bounded) > limit:
-            bounded["available_actions"] = [{"group": "core", "tools": ["read", "write", "search"]}]
+            bounded["available_actions"] = compact_actions(context.get("available_actions"), 1)
+        if serialized(bounded) > limit:
+            bounded["available_actions"] = compact_actions(
+                context.get("available_actions"), 2
+            )
+        if serialized(bounded) > limit:
+            # A prompt that does not fit the model window fails outright, so at
+            # this point something must give. Keep the best possible inventory,
+            # truncate it explicitly, and tell the model it is partial instead of
+            # handing it a shorter list that looks complete.
+            full = compact_actions(context.get("available_actions"), 2)
+            for keep in (3, 2, 1):
+                candidate = [
+                    {
+                        **group,
+                        "tools": group.get("tools", [])[:keep],
+                        "note": (
+                            "catalog truncated to fit the prompt budget; some tools "
+                            "are not listed. Ask for the ones you need by name."
+                        ),
+                    }
+                    for group in full
+                ]
+                if serialized({**bounded, "available_actions": candidate}) <= limit:
+                    bounded["available_actions"] = candidate
+                    break
+            else:
+                bounded["available_actions"] = [
+                    {**group, "tools": group.get("tools", [])[:1], "note": "catalog truncated"}
+                    for group in full
+                ]
         if serialized(bounded) > limit:
             bounded["task"] = {
                 "id": bounded.get("task", {}).get("id"),
@@ -185,6 +276,7 @@ class ContextBuilder:
                 "phase": bounded.get("phase"),
                 "user_prompt": str(bounded.get("user_prompt", ""))[:400],
                 "task": bounded.get("task", {}),
+                "available_actions": compact_actions(context.get("available_actions"), 2),
             }
         return bounded
 
@@ -240,13 +332,34 @@ class ContextBuilder:
         edges = graph.get("edges") or codegraph.get("dependency_edges", [])
         modules = [node for node in nodes if node.get("kind") == "module"]
         symbols = [node for node in nodes if node.get("kind") == "symbol"]
+        files_truncated = bool(codegraph.get("truncated") or graph.get("truncated"))
+        edges_truncated = bool(graph.get("edges_truncated"))
+        symbols_truncated = bool(codegraph.get("symbols_truncated") or graph.get("symbols_truncated"))
+        # A capped index must never look complete: the model reads "no edge" as
+        # "no dependency" otherwise, and silently guesses instead of querying.
+        partial = files_truncated or edges_truncated or symbols_truncated
+        per_file = Counter(node.get("file") for node in symbols if node.get("file"))
         return {
             "root": codegraph.get("root"),
             "project_kind": codegraph.get("project_kind", []),
             "file_count": codegraph.get("file_count"),
             "key_files": (codegraph.get("key_files") or [])[:20],
             "languages": codegraph.get("languages", {}),
-            "truncated": codegraph.get("truncated") or graph.get("truncated", False),
+            "truncated": partial,
+            "partial": (
+                {
+                    "files": files_truncated,
+                    "symbols": symbols_truncated,
+                    "edges": edges_truncated,
+                    "note": (
+                        "The stored index is capped: absent symbols or edges may still "
+                        "exist in the project. Query with a distinctive term and read the "
+                        "file when a decision depends on an edge you cannot see."
+                    ),
+                }
+                if partial
+                else None
+            ),
             "module_count": len(modules),
             "symbol_count": len(symbols),
             "edge_count": len(edges),
@@ -254,6 +367,12 @@ class ContextBuilder:
                 item.get("id") or item.get("file")
                 for item in modules[:12]
                 if item.get("id") or item.get("file")
+            ],
+            # Orientation only: the files carrying most symbols are where the
+            # real code is, which is what usually decides the first read.
+            "hot_files": [
+                {"file": name, "symbols": count}
+                for name, count in per_file.most_common(8)
             ],
             "query": {
                 "tool": "codegraph",
@@ -272,6 +391,10 @@ class ContextBuilder:
             return "create"
         if any(term in normalized for term in ("open", "abre", "browser", "navegador", "youtube", "url")):
             return "browser"
+        if any(term in normalized for term in ("deploy", "despliega", "despliegue", "rollback", "release to", "publica")):
+            return "deploy"
+        if any(term in normalized for term in ("commit", "commitea", "rama", "branch", "merge", "fusiona", "push", "etiqueta", "tag")):
+            return "release"
         if any(term in normalized for term in ("edit", "editar", "modify", "modifica", "implement", "implementa", "add", "añade", "mejora")):
             return "edit"
         return "general"
@@ -312,9 +435,25 @@ class ContextBuilder:
                 "codegraph_available": project.codegraph is not None,
                 "codegraph": self._codegraph_summary(project.codegraph),
             } if project else None,
-            "codegraph": self._codegraph_summary(project.codegraph) if project else None,
             "execution_target": task.runtime.target,
             "constraints": {
+                "max_retries": task.budget.max_retries,
+                "max_execution_time": task.budget.max_execution_time,
+                "max_tool_calls": task.budget.max_tool_calls,
+                "max_codegraph_queries": task.budget.max_codegraph_queries,
+                "max_project_reads": task.budget.max_project_reads,
+                "max_source_bytes": task.budget.max_source_bytes,
+                "max_plan_nodes": task.budget.max_plan_nodes,
+                "planning_rules": [
+                    "Each node must be independently executable and have a testable outcome.",
+                    "Prefer 3-8 focused nodes; use subtasks instead of speculative detail.",
+                    "Include acceptance evidence for operations whenever it is observable.",
+                    "A direct answer must contain no executable nodes.",
+                ],
+            },
+            # Planning limits are fixed for the whole task, so they are stable
+            # prefix material; see the note in ``for_agent_decision``.
+            "limits": {
                 "max_retries": task.budget.max_retries,
                 "max_execution_time": task.budget.max_execution_time,
                 "max_tool_calls": task.budget.max_tool_calls,
@@ -388,8 +527,7 @@ class ContextBuilder:
         raw_intent = task.metadata.get("orchestrator_intent") or self._planner_intent(task.goal)
         intent = self._planner_intent(str(raw_intent))
         return self._bound_agent_context({
-            "phase": "AGENT",
-            "user_prompt": task.instruction,
+            "phase": "AGENT",            "user_prompt": task.instruction,
             "attachments": self._attachments(task),
             "screenshots": await self._screenshots(task),
             "task": {
@@ -428,7 +566,23 @@ class ContextBuilder:
                     task.contract.forbidden_side_effects if task.contract else []
                 ),
             },
-        })
+            # Same numbers split by volatility: the maxima never change while the
+            # task runs, so they can sit in the cacheable prefix; the counters
+            # change every turn and belong in the tail.
+            "limits": {
+                "max_llm_calls": task.budget.max_llm_calls,
+                "max_tool_calls": task.budget.max_tool_calls,
+                "max_steps": task.budget.max_plan_nodes,
+                "forbidden_side_effects": (
+                    task.contract.forbidden_side_effects if task.contract else []
+                ),
+            },
+            "remaining": {
+                "llm_calls": max(0, task.budget.max_llm_calls - task.runtime.llm_calls),
+                "tool_calls": max(0, task.budget.max_tool_calls - task.runtime.tool_calls),
+                "steps": max(0, task.budget.max_plan_nodes - task.runtime.agent_turns),
+            },
+        }, limit=self.agent_context_chars)
 
     async def for_orchestrator(self, task: Task) -> dict[str, Any]:
         """Build the small routing envelope used before worker execution."""
@@ -501,6 +655,12 @@ class ContextBuilder:
                 {"name": "CODEGRAPH_WORKER", "templates": ["codegraph"]},
                 {"name": "RESEARCH_WORKER", "templates": ["research"]},
                 {"name": "BROWSER_WORKER", "templates": ["browser"]},
+                # Backed by tools that exist, so they were missing capabilities
+                # rather than missing prose: git work, declared build/deploy
+                # commands, and a read-only review that judges finished work.
+                {"name": "RELEASE_WORKER", "templates": ["release"]},
+                {"name": "DEPLOYMENT_WORKER", "templates": ["deployment"]},
+                {"name": "REVIEW_WORKER", "templates": ["review"]},
             ],
             "long_term_memory": await self._memory_context(task.goal, task),
             "assistant_state": {
@@ -509,7 +669,7 @@ class ContextBuilder:
                 "turn": task.runtime.agent_turns,
                 "codegraph_error": task.metadata.get("codegraph_error"),
             },
-        })
+        }, limit=self.agent_context_chars)
 
     async def for_resolver(self, task: Task, node: TaskNode, graph: TaskGraph) -> dict[str, Any]:
         memories = await self._memory_context(task.goal, task)
@@ -601,6 +761,12 @@ class ContextBuilder:
                 "cancelled": task.status.value == "CANCELLED",
                 "must_choose_one_action": True,
                 "do_not_repeat_previous_error": bool(node.error),
+            },
+            "limits": {"must_choose_one_action": True},
+            "remaining": {
+                "cancelled": task.status.value == "CANCELLED",
+                "do_not_repeat_previous_error": bool(node.error),
+                "deadline": task.deadline,
             },
         }
 
@@ -718,22 +884,17 @@ class ContextBuilder:
         definitions = self.tools.definitions()
         normalized_intent = self._planner_intent(str(intent))
         preferred = {
-            "audit": {"audit", "project", "codegraph", "git", "artifact"},
+            "audit": {"audit", "project", "codegraph", "git", "artifact", "types"},
             "create": {"project", "filesystem"},
-            "edit": {"project", "codegraph", "artifact"},
-            "browser": {"browser", "web", "screen", "input"},
+            "edit": {"project", "codegraph", "artifact", "types", "debug"},
+            "browser": {"browser", "web", "screen", "input", "window"},
+            "release": {"git", "filesystem", "shell", "types"},
+            "deploy": {"deployment", "shell", "process", "git", "filesystem"},
         }.get(normalized_intent)
         primary = [definition for definition in definitions if not preferred or definition.name in preferred]
-        optional_names = {
-            "web", "browser", "deployment", "filesystem", "shell", "process", "git",
-            "codegraph", "project", "audit",
-            # Capabilities added later must be listed here or the model never
-            # sees them: this is an allowlist, not a filter of convenience.
-            "screen", "input", "memory", "artifact", "http", "schedule",
-        }
         optional = [
             definition for definition in definitions
-            if definition not in primary and definition.name in optional_names
+            if definition not in primary and definition.name in VISIBLE_TOOL_NAMES
         ]
         def describe(definition, *, include_args: bool = True):
             item = {

@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from ...domain.models import Project, ProjectRequest
 from ..deps import get_context, get_runtime
+from ..serializers import project_view
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -11,7 +12,7 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 @router.get("")
 async def list_projects(request: Request) -> list:
     projects = await get_context(request).service.list_projects()
-    return [project.model_dump(mode="json") for project in projects]
+    return [project_view(project) for project in projects]
 
 
 @router.post("")
@@ -19,7 +20,7 @@ async def create_project(request: Request, project_request: ProjectRequest) -> d
     project = await get_context(request).service.create_project(
         Project.model_validate(project_request.model_dump())
     )
-    return project.model_dump(mode="json")
+    return project_view(project)
 
 
 @router.get("/{project_id}")
@@ -27,7 +28,7 @@ async def get_project(request: Request, project_id: str) -> dict:
     project = await get_context(request).service.get_project(project_id)
     if not project:
         raise HTTPException(404, "Project not found")
-    return project.model_dump(mode="json")
+    return project_view(project)
 
 
 @router.put("/{project_id}")
@@ -37,7 +38,7 @@ async def update_project(request: Request, project_id: str, project_request: Pro
         updated = await get_context(request).service.update_project(project)
     except KeyError:
         raise HTTPException(404, "Project not found") from None
-    return updated.model_dump(mode="json")
+    return project_view(updated)
 
 
 @router.delete("/{project_id}")
@@ -63,11 +64,14 @@ async def audit_project(request: Request, project_id: str, run_tests: bool = Fal
 
 
 @router.post("/{project_id}/codegraph/refresh")
-async def refresh_project_codegraph(request: Request, project_id: str) -> dict:
+async def refresh_project_codegraph(request: Request, project_id: str, force: bool = True) -> dict:
+    """Rebuild a project's structural index. An explicit request rebuilds by default."""
     try:
-        project = await get_context(request).service.refresh_project_codegraph(project_id)
+        project = await get_context(request).service.refresh_project_codegraph(
+            project_id, force=force
+        )
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     if not project:
         raise HTTPException(404, "Project not found")
-    return project.model_dump(mode="json")
+    return project_view(project)

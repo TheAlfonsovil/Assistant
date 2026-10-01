@@ -4,26 +4,29 @@ when requested or necessary, preserving source URLs and retrieval evidence.
 For books, notebooks and scientific projects, report the analyzed scope rather
 than pretending the entire corpus was read.
 
+TOOLS
+{{available_actions}}
+OUTPUT SCHEMA
+{{output_schema}}
+LIMITS
+{{limits}}
 TARGET
 {{execution_target}}
 PROJECT
 {{project}}
-TASK
-{{task}}
 EXTRA CONTEXT
 {{extra_context}}
 ACCEPTANCE CRITERIA
 {{acceptance_criteria}}
+TASK
+{{task}}
 WORKING MEMORY
 {{working_memory}}
-LAST OBSERVATION
-{{last_observation}}
 EVIDENCE
 {{evidence}}
-TOOLS
-{{available_actions}}
-BUDGET
-{{constraints}}
+LAST OBSERVATION
+{{last_observation}}
+REMAINING
+{{remaining}}
 
-Return only JSON matching:
-{{output_schema}}
+Return JSON only, matching the OUTPUT SCHEMA above. Decide the next step from LAST OBSERVATION, EVIDENCE and REMAINING.

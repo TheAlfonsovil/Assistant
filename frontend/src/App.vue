@@ -11,6 +11,7 @@ const title = computed(() => route.meta?.title || 'Assistant')
 const nav = [
   { to: '/', icon: '◎', label: 'Resumen' },
   { to: '/tasks', icon: '≣', label: 'Tareas' },
+  { to: '/schedules', icon: '⏱', label: 'Horarios' },
   { to: '/observability', icon: '♡', label: 'Observabilidad' },
   { to: '/metrics', icon: '∑', label: 'Métricas' },
   { to: '/resources', icon: '⌁', label: 'Recursos' },

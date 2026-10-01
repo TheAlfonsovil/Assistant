@@ -3,6 +3,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from assistant.config import DEFAULT_AGENT_CONTEXT_CHARS
 from assistant.context import ContextBuilder
 from assistant.domain.contracts import ContractScope, DecisionRecord, MemoryFact
 from assistant.domain.models import (
@@ -106,6 +107,79 @@ def test_agent_context_bound_is_global_and_preserves_core_fields():
     assert len(json.dumps(bounded, default=str)) <= 4_000
     assert bounded["phase"] == "AGENT"
     assert bounded["task"]["id"] == "task-1"
+
+
+def _realistic_catalog(groups: int = 20, per_group: int = 4) -> list[dict]:
+    return [
+        {
+            "group": f"group-{index}",
+            "when": "when the work needs this capability",
+            "tools": [
+                {
+                    "name": f"tool-{index}-{tool}",
+                    "methods": ["read", "write"],
+                    "args": {
+                        "path": {"type": "string", "required": True},
+                        "mode": {"type": "string", "enum": ["a", "b"]},
+                    },
+                    "method_args": {
+                        "read": {"path": {"type": "string", "required": True}},
+                        "write": {"path": {"type": "string", "required": True}},
+                    },
+                }
+                for tool in range(per_group)
+            ],
+        }
+        for index in range(groups)
+    ]
+
+
+def test_a_context_that_fits_the_budget_is_left_untouched():
+    """The budget exists to fit the window, not to trim evidence by habit."""
+    catalog = _realistic_catalog()
+    context = {
+        "phase": "AGENT",
+        "user_prompt": "audit",
+        "task": {"id": "task-1", "goal": "audit"},
+        "evidence": [{"payload": "x" * 2_000} for _ in range(12)],
+        "last_observation": {"stdout": "y" * 30_000},
+        "available_actions": catalog,
+        "project": {"codegraph": {"hot_files": [{"file": "a.py", "symbols": 9}]}},
+        "working_memory": {"note": "keep me"},
+    }
+    size = len(json.dumps(context, default=str))
+
+    # The fixture must be comfortably under the real budget, not under a number
+    # copied into the test: this assertion is what proves nothing was trimmed.
+    assert size < DEFAULT_AGENT_CONTEXT_CHARS
+
+    bounded = ContextBuilder._bound_agent_context(context)
+
+    assert bounded is context
+    assert bounded["available_actions"] == catalog
+    assert len(bounded["evidence"]) == 12
+    assert bounded["working_memory"] == {"note": "keep me"}
+
+
+def test_a_context_over_the_budget_keeps_every_tool_and_every_group():
+    catalog = _realistic_catalog()
+    context = {
+        "phase": "AGENT",
+        "user_prompt": "audit",
+        "task": {"id": "task-1", "goal": "audit"},
+        "evidence": [{"payload": "x" * 5_000} for _ in range(12)],
+        "last_observation": {"stdout": "y" * 40_000},
+        "available_actions": catalog,
+    }
+
+    bounded = ContextBuilder._bound_agent_context(context, limit=40_000)
+
+    assert len(json.dumps(bounded, default=str)) <= 40_000
+    groups = bounded["available_actions"]
+    assert [group["group"] for group in groups] == [group["group"] for group in catalog]
+    assert all(group["tools"] for group in groups)
+    # Volatile evidence is what shrinks; capabilities are not hidden.
+    assert len(bounded["evidence"]) < 12
 
 
 def test_worker_contracts_round_trip_through_json_and_validate_payloads():

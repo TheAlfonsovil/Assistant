@@ -13,6 +13,14 @@ import httpx
 from pydantic import BaseModel, Field
 
 from .attachments import image_parts
+from .config import (
+    DEFAULT_LLM_TIMEOUT,
+    DEFAULT_MAX_PROMPT_CHARS,
+    DEFAULT_MAX_RESPONSE_CHARS,
+    DEFAULT_THINKING,
+    DEFAULT_VISION_DETAIL,
+    DEFAULT_VISION_MAX_IMAGES,
+)
 from .domain.contracts import (
     AcceptanceCriterion,
     BranchConfig,
@@ -310,18 +318,20 @@ class _PromptLLMProvider:
         timeout: float | None = None,
         client: httpx.AsyncClient | None = None,
         temperature: float = 0.1,
-        thinking: bool = False,
+        thinking: bool = DEFAULT_THINKING,
         reasoning_effort: str = "low",
         reasoning_policy: str = "",
         trace_sink: Callable[[dict[str, Any]], None] | None = None,
         failure_threshold: int = 3,
         recovery_timeout: float = 30.0,
-        max_prompt_chars: int = 200_000,
-        max_response_chars: int = 1_000_000,
+        max_prompt_chars: int = DEFAULT_MAX_PROMPT_CHARS,
+        max_response_chars: int = DEFAULT_MAX_RESPONSE_CHARS,
         supports_vision: bool = False,
         max_image_bytes: int = 5_000_000,
         stream_responses: bool = False,
-        max_vision_images: int = 1,
+        max_vision_images: int = DEFAULT_VISION_MAX_IMAGES,
+        vision_detail: str = DEFAULT_VISION_DETAIL,
+        workspace_root: str = ".",
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -331,7 +341,7 @@ class _PromptLLMProvider:
         self.reasoning_effort = reasoning_effort if reasoning_effort in {"low", "high", "max"} else "low"
         self.reasoning_policy = self._parse_reasoning_policy(reasoning_policy)
         self.trace_sink = trace_sink
-        self.request_timeout = timeout if timeout is not None else 300.0
+        self.request_timeout = timeout if timeout is not None else DEFAULT_LLM_TIMEOUT
         self.failure_threshold = max(1, failure_threshold)
         self.recovery_timeout = max(0.1, recovery_timeout)
         self.max_prompt_chars = max(1, max_prompt_chars)
@@ -344,6 +354,10 @@ class _PromptLLMProvider:
         self.stream_responses = bool(stream_responses)
         # Embedding images costs tokens on every turn, so the newest one wins.
         self.max_vision_images = max(1, int(max_vision_images))
+        # Optional ``detail`` for image parts: empty keeps the provider default.
+        self.vision_detail = str(vision_detail or "").strip().casefold()
+        # Relative attachment paths resolve against the workspace, not the cwd.
+        self.workspace_root = str(workspace_root or ".")
         self._consecutive_failures = 0
         self._circuit_opened_at: float | None = None
         self.last_usage = {}
@@ -409,6 +423,9 @@ class _PromptLLMProvider:
                 "test": "test_worker",
                 "codegraph": "codegraph_worker",
                 "research": "research_worker",
+                "release": "release_worker",
+                "deployment": "deployment_worker",
+                "review": "review_worker",
                 "general": "general_worker",
             }.get(str(context.get("template", "general")), "general_worker")
         prompt_path = Path(__file__).parent / "prompts" / f"{prompt_name}.md"
@@ -531,11 +548,11 @@ class DeepSeekLLMProvider(_PromptLLMProvider):
         api_key: str,
         *,
         client: httpx.AsyncClient | None = None,
-        timeout: float = 600.0,
+        timeout: float = DEFAULT_LLM_TIMEOUT,
         max_tokens: int = 16384,
-        max_prompt_chars: int = 240_000,
-        max_response_chars: int = 250_000,
-        thinking: bool = True,
+        max_prompt_chars: int = DEFAULT_MAX_PROMPT_CHARS,
+        max_response_chars: int = DEFAULT_MAX_RESPONSE_CHARS,
+        thinking: bool = DEFAULT_THINKING,
         reasoning_policy: str = "",
         temperature: float = 0.1,
         trace_sink: Callable[[dict[str, Any]], None] | None = None,
@@ -544,7 +561,9 @@ class DeepSeekLLMProvider(_PromptLLMProvider):
         supports_vision: bool = False,
         max_image_bytes: int = 5_000_000,
         stream_responses: bool = False,
-        max_vision_images: int = 1,
+        max_vision_images: int = DEFAULT_VISION_MAX_IMAGES,
+        vision_detail: str = DEFAULT_VISION_DETAIL,
+        workspace_root: str = ".",
     ):
         super().__init__(
             base_url,
@@ -563,6 +582,8 @@ class DeepSeekLLMProvider(_PromptLLMProvider):
             max_image_bytes=max_image_bytes,
             stream_responses=stream_responses,
             max_vision_images=max_vision_images,
+            vision_detail=vision_detail,
+            workspace_root=workspace_root,
         )
         self.api_key = api_key
         self.max_tokens = max_tokens
@@ -809,11 +830,31 @@ class DeepSeekLLMProvider(_PromptLLMProvider):
                 continue
             seen.add(path)
             unique.append(item)
+        unreadable: list[str] = []
         parts = image_parts(
-            unique[-self.max_vision_images :], max_bytes=self.max_image_bytes
+            unique[-self.max_vision_images :],
+            max_bytes=self.max_image_bytes,
+            detail=self.vision_detail,
+            base_dir=self.workspace_root,
+            unreadable=unreadable,
         )
         if not parts:
+            if unreadable:
+                return (
+                    rendered
+                    + "\n\nNOTE: these image references could not be read from disk "
+                    "and are NOT attached: "
+                    + ", ".join(sorted(set(unreadable)))
+                )
             return rendered
+        if unreadable:
+            # Never claim to carry an image that is not there.
+            rendered = (
+                rendered
+                + "\n\nNOTE: these image references could not be read from disk and "
+                "are NOT attached: "
+                + ", ".join(sorted(set(unreadable)))
+            )
         return [{"type": "text", "text": rendered}, *parts]
 
     async def _ask(self, role: str, context: dict[str, Any], schema: type[BaseModel]) -> BaseModel:

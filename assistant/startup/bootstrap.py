@@ -32,6 +32,10 @@ class AssistantContext:
         await self.session.remove()
         if hasattr(self.service.llm, "close"):
             await self.service.llm.close()
+        # Semantic queries run a language-server process: stop it with the app.
+        from assistant.devices.computer.lsp import shutdown_language_server
+
+        await shutdown_language_server()
         await self.database.close()
 
 
@@ -62,6 +66,8 @@ async def create_context(
             max_image_bytes=resolved_settings.attachment_max_bytes,
             stream_responses=resolved_settings.deepseek_stream_responses,
             max_vision_images=resolved_settings.vision_max_images,
+            vision_detail=resolved_settings.vision_detail,
+            workspace_root=resolved_settings.workspace_root,
         )
     )
     startup = await StartupManager(database, resolved_settings, provider).initialize()
@@ -74,6 +80,8 @@ async def create_context(
         enable_input=resolved_settings.enable_input_control,
         repository=repository,
         rate_limit=resolved_settings.rate_limiter(),
+        workspace_root=resolved_settings.workspace_root,
+        langserver_path=resolved_settings.pyright_langserver,
     )
     service = TaskService(
         session,
@@ -90,6 +98,22 @@ async def create_context(
         attachment_max_bytes=resolved_settings.attachment_max_bytes,
         attachment_max_count=resolved_settings.attachment_max_count,
         vision_enabled=resolved_settings.deepseek_supports_vision,
+        schedule_timezone=resolved_settings.schedule_timezone,
+        agent_context_chars=resolved_settings.agent_context_chars,
+        codegraph_max_files=resolved_settings.codegraph_max_files,
+        codegraph_max_symbols=resolved_settings.codegraph_max_symbols,
+        codegraph_max_edges=resolved_settings.codegraph_max_edges,
+        codegraph_refresh_seconds=resolved_settings.codegraph_refresh_seconds,
+        task_budgets={
+            "max_llm_calls": resolved_settings.task_max_llm_calls,
+            "max_tool_calls": resolved_settings.task_max_tool_calls,
+            "max_codegraph_queries": resolved_settings.task_max_codegraph_queries,
+            "max_project_reads": resolved_settings.task_max_project_reads,
+            "max_source_bytes": resolved_settings.task_max_source_bytes,
+            "max_plan_nodes": resolved_settings.task_max_plan_nodes,
+            "max_retries": resolved_settings.task_max_retries,
+            "max_recovery_attempts": resolved_settings.task_max_recovery_attempts,
+        },
     )
     # Registered after the service exists: recurrence is expressed by creating
     # and cloning tasks, so this capability needs the service, not just tools.

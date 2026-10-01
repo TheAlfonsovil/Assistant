@@ -13,6 +13,7 @@ const active = computed(() => system.runtime.active_tasks ?? 0)
 const idle = computed(() => system.idle ?? {})
 const offpeak = computed(() => system.offpeak ?? {})
 const metrics = computed(() => system.metrics ?? {})
+const pending = computed(() => system.needsAttention || [])
 </script>
 
 <template>
@@ -22,6 +23,23 @@ const metrics = computed(() => system.metrics ?? {})
   </div>
 
   <template v-else>
+    <div v-if="pending.length" class="card" style="border-color:var(--warn, #b8860b);margin-bottom:16px">
+      <h2 style="margin-top:0">Esperando tu respuesta ({{ pending.length }})</h2>
+      <div v-for="item in pending" :key="item.task_id" style="margin-bottom:10px">
+        <RouterLink :to="{ name: 'task-detail', params: { id: item.task_id } }">
+          <strong>{{ item.title }}</strong>
+        </RouterLink>
+        <div class="muted" style="font-size:12px">{{ item.question }}</div>
+        <div v-if="item.options?.length" class="muted" style="font-size:12px">
+          opciones: {{ item.options.join(', ') }}
+        </div>
+        <div class="muted mono" style="font-size:11px">{{ item.answer_with }}</div>
+      </div>
+      <div class="muted" style="font-size:11px;margin-top:6px">
+        El resto de tareas sigue avanzando mientras tanto: una tarea en espera no bloquea la cola.
+      </div>
+    </div>
+
     <div class="grid cols-4" style="margin-bottom:16px">
       <MetricCard label="Tareas activas" :value="active" hint="Ejecutándose ahora" />
       <MetricCard label="Total tareas" :value="Object.values(counts).reduce((a, b) => a + b, 0)" />

@@ -74,15 +74,21 @@ function tone(status) { return statusTone(status) }
       <span class="wf-kind">{{ glyphs.codegraph }}</span>
       <div>
         <strong>CODEGRAPH PREFLIGHT</strong>
-        <small>{{ codegraphReady.payload?.file_count ?? 0 }} archivos indexados</small>
-        <em>actualizado {{ date(codegraphReady.created_at) }}</em>
+        <small>
+          {{ codegraphReady.payload?.file_count ?? 0 }} archivos ·
+          {{ codegraphReady.payload?.reused ? 'índice reutilizado (sin cambios)' : 'índice reconstruido' }}
+        </small>
+        <em>
+          {{ codegraphReady.payload?.reused ? 'huella del árbol igual' : 'v' + (codegraphReady.payload?.version ?? 0) }} ·
+          {{ date(codegraphReady.created_at) }}
+        </em>
       </div>
     </div>
-    <div v-if="!nested && codegraphFailed" class="wf-node tone-error">
+    <div v-if="!nested && codegraphFailed" class="wf-node">
       <span class="wf-kind">{{ glyphs.codegraph }}</span>
       <div>
         <strong>CODEGRAPH PREFLIGHT</strong>
-        <small>índice no disponible</small>
+        <small>índice no disponible · la tarea continúa</small>
         <em>{{ codegraphFailed.payload?.error || 'error desconocido' }}</em>
       </div>
     </div>

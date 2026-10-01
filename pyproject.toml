@@ -1,6 +1,6 @@
 [project]
 name = "assistant-core"
-version = "0.6.0"
+version = "0.6.2"
 description = "Persistent local task engine for Assistant"
 requires-python = ">=3.12"
 dependencies = [
@@ -13,6 +13,9 @@ dependencies = [
   "typer>=0.15,<1.0",
   "python-dotenv>=1.0,<2.0",
   "uvicorn[standard]>=0.30,<1.0",
+  # Windows ships no system timezone database, so IANA zone names (used by
+  # daily schedules) need this pure-Python package.
+  "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +23,16 @@ dev = [
   "pytest>=8.3,<9.0",
   "pytest-asyncio>=1.2,<2.0",
   "ruff>=0.8,<1.0",
+]
+# Runtime inspection (``debug.trace``). Optional on purpose: the tool reports
+# ``missing-debugpy`` instead of failing, so the assistant runs without it.
+debug = [
+  "debugpy>=1.8",
+]
+# Desktop window observation (``window.list`` / ``window.snapshot``) through the
+# Windows accessibility tree. Pure Python; the tool reports what is missing.
+uia = [
+  "uiautomation>=2.0",
 ]
 
 [project.scripts]

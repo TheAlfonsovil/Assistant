@@ -18,6 +18,8 @@ class CodeGraphTool(Tool):
         argument_schema={
             "root": {"type": "string"},
             "max_files": {"type": "integer"},
+            "max_symbols": {"type": "integer", "description": "Cap on stored symbols (default 2000)."},
+            "max_edges": {"type": "integer", "description": "Cap on stored dependency edges (default 4000)."},
             "query": {"type": "string", "description": "Space-separated terms matched independently against files, modules, and symbols."},
             "kind": {"type": "string", "description": "Optional node kind filter: module or symbol."},
             "limit": {"type": "integer", "description": "Maximum matching nodes to return (1-500)."},
@@ -27,6 +29,8 @@ class CodeGraphTool(Tool):
             "build": {
                 "root": {"type": "string", "required": True},
                 "max_files": {"type": "integer"},
+                "max_symbols": {"type": "integer"},
+                "max_edges": {"type": "integer"},
             },
             "system": {
                 "root": {"type": "string", "required": True},
@@ -36,6 +40,8 @@ class CodeGraphTool(Tool):
             "query": {
                 "root": {"type": "string", "required": True},
                 "max_files": {"type": "integer"},
+                "max_symbols": {"type": "integer"},
+                "max_edges": {"type": "integer"},
                 "query": {"type": "string"},
                 "kind": {"type": "string", "enum": ["module", "symbol"]},
                 "limit": {"type": "integer"},
@@ -82,6 +88,7 @@ class CodeGraphTool(Tool):
                     "edge_count": len(edges),
                     "edge_kinds": edge_kinds,
                     "truncated": graph.get("truncated", False),
+                    "edges_truncated": graph.get("edges_truncated", False),
                     "module_sample": modules[:40],
                     "symbol_sample": symbols[:40],
                     "edge_sample": edges[:60],
@@ -101,7 +108,12 @@ class CodeGraphTool(Tool):
         ):
             result = OperationResult(success=True, output=persisted)
         else:
-            result = await ProjectAnalyzer().analyze(args["root"], int(args.get("max_files", 500)))
+            result = await ProjectAnalyzer().analyze(
+                args["root"],
+                int(args.get("max_files", 500)),
+                int(args.get("max_symbols", 2000)),
+                int(args.get("max_edges", 4000)),
+            )
         if not result.success:
             return result
         output = result.output
@@ -123,6 +135,13 @@ class CodeGraphTool(Tool):
                 ],
             ],
             "edges": output.get("dependency_edges", []),
+            # Partiality travels with the graph so prompts never present a
+            # capped index as the complete truth.
+            "truncated": output.get("truncated", False),
+            "edges_truncated": output.get("edges_truncated", False),
+            "edges_total": output.get("edges_total"),
+            "symbols_truncated": output.get("symbols_truncated", False),
+            "symbols_total": output.get("symbols_total"),
         }
         if method == "query":
             graph = output["graph"]
@@ -149,6 +168,7 @@ class CodeGraphTool(Tool):
                 edge for edge in graph.get("edges", [])
                 if edge.get("from") in node_ids or edge.get("to") in node_ids
             ][: limit * 3]
+            matched_total = len(candidates)
             result.output = {
                 "root": result.output.get("root"),
                 "query": query,
@@ -156,7 +176,23 @@ class CodeGraphTool(Tool):
                 "kind": kind or None,
                 "nodes": nodes,
                 "edges": edges,
+                "matches": matched_total,
                 "truncated": len(nodes) == limit,
+                "index_partial": bool(
+                    graph.get("truncated")
+                    or graph.get("edges_truncated")
+                    or graph.get("symbols_truncated")
+                ),
+                "note": (
+                    "The stored index is partial: absent edges/symbols may exist in the project. "
+                    "Narrow the query or raise max_files/max_edges and rebuild."
+                    if (
+                        graph.get("truncated")
+                        or graph.get("edges_truncated")
+                        or graph.get("symbols_truncated")
+                    )
+                    else None
+                ),
             }
             return result
         return result

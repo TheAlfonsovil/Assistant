@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from assistant.application import TaskService
-from assistant.attachments import AttachmentError, persist_uploads
+from assistant.attachments import AttachmentError, image_parts, persist_uploads
 from assistant.context import ContextBuilder
 from assistant.domain.models import AgentDecision, Project, Task, TaskRequest
 from assistant.infrastructure.db import Database
@@ -236,6 +236,71 @@ async def test_vision_provider_sends_multimodal_parts_only_when_enabled(tmp_path
     text_content = seen[1]["messages"][1]["content"]
     assert isinstance(text_content, str)
     assert image.name in text_content
+
+
+def test_relative_image_paths_resolve_against_the_workspace(tmp_path):
+    """A capture must attach the same way whatever the process cwd is."""
+    shot = tmp_path / "data" / "screenshots" / "shot.png"
+    shot.parent.mkdir(parents=True, exist_ok=True)
+    shot.write_bytes(PNG_BYTES)
+    reference = [{"path": "data/screenshots/shot.png", "content_type": "image/png"}]
+
+    without_base = image_parts(reference, max_bytes=1_000_000)
+    with_base = image_parts(reference, max_bytes=1_000_000, base_dir=tmp_path)
+
+    assert without_base == []
+    assert len(with_base) == 1
+
+
+def test_an_image_that_cannot_be_read_is_reported_not_silently_dropped(tmp_path):
+    missing = [{"path": str(tmp_path / "gone.png"), "content_type": "image/png"}]
+    reported: list[str] = []
+
+    parts = image_parts(missing, max_bytes=1_000_000, unreadable=reported)
+
+    assert parts == []
+    assert reported and reported[0].endswith("gone.png")
+
+
+def test_the_prompt_says_when_an_attached_image_is_missing(tmp_path):
+    """Claiming to carry an image that is not there is worse than admitting it."""
+    provider = DeepSeekLLMProvider(
+        "https://api.deepseek.com",
+        "deepseek-flash",
+        "test-key",
+        supports_vision=True,
+        workspace_root=str(tmp_path),
+    )
+    request = {"rendered_instructions": "PROMPT"}
+    context = {
+        "screenshots": [
+            {"path": "data/screenshots/missing.png", "content_type": "image/png"}
+        ]
+    }
+
+    content = provider._user_content(request, context)
+
+    assert isinstance(content, str)
+    assert "PROMPT" in content
+    assert "NOT attached" in content
+    assert "missing.png" in content
+
+
+def test_image_detail_is_forwarded_only_when_it_is_a_known_value(tmp_path):
+    """``detail`` is optional: an unknown value is dropped, never sent blind."""
+    image = tmp_path / "shot.png"
+    image.write_bytes(PNG_BYTES)
+    reference = [{"path": str(image), "content_type": "image/png"}]
+
+    default = image_parts(reference, max_bytes=1_000_000)
+    low = image_parts(reference, max_bytes=1_000_000, detail="low")
+    loud = image_parts(reference, max_bytes=1_000_000, detail="LOW ")
+    bogus = image_parts(reference, max_bytes=1_000_000, detail="ultra")
+
+    assert "detail" not in default[0]["image_url"]
+    assert low[0]["image_url"]["detail"] == "low"
+    assert loud[0]["image_url"]["detail"] == "low"
+    assert "detail" not in bogus[0]["image_url"]
 
 
 @pytest.mark.asyncio

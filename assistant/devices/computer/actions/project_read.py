@@ -5,6 +5,15 @@ from typing import Any
 
 from assistant.domain.models import ErrorType, OperationResult
 
+# Characters of source a single read returns when the caller does not say.
+DEFAULT_MAX_CHARS = 120_000
+MAX_MAX_CHARS = 500_000
+# Whole-file reads above this are refused so a minified bundle or a generated
+# file cannot land in the context in one call. A bounded line range is not that
+# risk: it is how the outline from the codegraph or `types.symbols` gets read,
+# and the character budget below bounds it either way.
+MAX_FILE_BYTES = 200_000
+
 
 async def read_project(args: dict[str, Any]) -> OperationResult:
     root = args.get("root")
@@ -25,15 +34,21 @@ async def read_project(args: dict[str, Any]) -> OperationResult:
     metadata: dict[str, dict[str, Any]] = {}
     errors: list[dict[str, str]] = []
     total_bytes = 0
-    max_chars = min(max(int(args.get("max_chars", 120_000)), 1), 500_000)
+    max_chars = min(max(int(args.get("max_chars", DEFAULT_MAX_CHARS)), 1), MAX_MAX_CHARS)
     for item in files:
         relative = item if isinstance(item, str) else item["path"]
         path = (project_root / relative).resolve()
         try:
             if project_root not in path.parents or not path.is_file():
                 raise FileNotFoundError(relative)
-            if path.stat().st_size > 200_000:
-                raise ValueError(f"file is too large to read: {relative}")
+            # Only a range with an explicit end line is a bounded read; without
+            # one the read runs to the end of the file, so the gate still applies.
+            bounded_range = isinstance(item, dict) and isinstance(item.get("end_line"), int)
+            if path.stat().st_size > MAX_FILE_BYTES and not bounded_range:
+                raise ValueError(
+                    f"file is too large to read whole: {relative} "
+                    "(give start_line and end_line to read a range)"
+                )
             source_text = path.read_text(encoding="utf-8")
             text = source_text
             start_line = 1

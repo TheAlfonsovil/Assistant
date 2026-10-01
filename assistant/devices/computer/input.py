@@ -219,6 +219,9 @@ class InputTool(Tool):
         },
         permissions=["input.control"],
         idempotent=False,
+        # Acting on the desktop changes what a capture would show, so the runtime
+        # takes a fresh one and hands it to the next turn.
+        observable_methods=["click", "type", "key", "scroll"],
     )
 
     def _move_to(self, x: int, y: int) -> None:

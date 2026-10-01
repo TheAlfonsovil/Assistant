@@ -19,6 +19,12 @@ from sqlalchemy import delete, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from ..attachments import persist_uploads
+from ..config import (
+    DEFAULT_AGENT_CONTEXT_CHARS,
+    DEFAULT_FINAL_RESPONSE_TIMEOUT,
+    DEFAULT_MAX_STEPS,
+    DEFAULT_PROJECTS_ROOT,
+)
 from ..context import ContextBuilder
 from ..devices.computer.codegraph import CodeGraphTool
 from ..domain.contracts import (
@@ -29,6 +35,7 @@ from ..domain.contracts import (
     OperationHint,
 )
 from ..domain.graph import TaskGraph
+from ..domain.state import can_restart
 from ..domain.models import (
     AgentDecision,
     AgentDecisionType,
@@ -42,6 +49,7 @@ from ..domain.models import (
     Project,
     RecoveryExpansion,
     Task,
+    TaskBudget,
     TaskEvent,
     TaskNode,
     TaskRequest,
@@ -59,16 +67,34 @@ from ..llm import (
 )
 from ..observability import compact
 from ..planning import plan_coverage_warnings, validate_plan_quality
+from ..project_analysis import project_tree_fingerprint
+from ..recurrence import (
+    MAX_EVERY_SECONDS,
+    MIN_EVERY_SECONDS,
+    ScheduleError,
+    advance,
+    describe as describe_schedule,
+    local_label,
+    normalize_spec,
+    resolve_timezone,
+    spec_from_record,
+)
 from ..scheduler import NodeScheduler
 from ..tools import ToolRegistry
 from ..verifier import DeterministicVerifier
 
 logger = logging.getLogger(__name__)
 
-# Recurring work: one minute is the floor, so a schedule cannot become a
-# self-inflicted request loop; a month is the practical ceiling.
-SCHEDULE_MIN_SECONDS = 60
-SCHEDULE_MAX_SECONDS = 30 * 24 * 3600
+# Kept as service-level names: they are the documented bounds for a schedule.
+SCHEDULE_MIN_SECONDS = MIN_EVERY_SECONDS
+SCHEDULE_MAX_SECONDS = MAX_EVERY_SECONDS
+
+
+def _as_utc(moment: datetime | None) -> datetime | None:
+    """Normalise a stored timestamp: SQLite hands datetimes back without tzinfo."""
+    if moment is None:
+        return None
+    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment
 
 
 def _parse_schedule_time(value: Any) -> datetime | None:
@@ -81,7 +107,7 @@ def _parse_schedule_time(value: Any) -> datetime | None:
             return None
     else:
         return None
-    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment
+    return _as_utc(moment)
 
 
 class TaskService:
@@ -93,15 +119,22 @@ class TaskService:
         verifier=None,
         event_sink=None,
         workspace_root: str = ".",
-        projects_root: str = r"C:\Assistant",
+        projects_root: str = DEFAULT_PROJECTS_ROOT,
         default_execution_time: float | None = None,
-        final_response_timeout: float = 36000.0,
-        max_steps: int = 1000,
+        final_response_timeout: float = DEFAULT_FINAL_RESPONSE_TIMEOUT,
+        max_steps: int = DEFAULT_MAX_STEPS,
         event_retention_days: int = 30,
         event_retention_keep_recent: int = 1000,
         attachment_max_bytes: int = 5_000_000,
         attachment_max_count: int = 4,
         vision_enabled: bool = False,
+        schedule_timezone: str = "UTC",
+        agent_context_chars: int = DEFAULT_AGENT_CONTEXT_CHARS,
+        codegraph_max_files: int = 2000,
+        codegraph_max_symbols: int = 6000,
+        codegraph_max_edges: int = 20_000,
+        codegraph_refresh_seconds: int = 300,
+        task_budgets: dict[str, int | float] | None = None,
     ):
         self.repository = TaskRepository(session, event_sink=event_sink)
         self.session = session
@@ -112,6 +145,25 @@ class TaskService:
         self.attachment_max_bytes = max(1, int(attachment_max_bytes))
         self.attachment_max_count = max(0, int(attachment_max_count))
         self.vision_enabled = bool(vision_enabled)
+        # Default zone for daily schedules; validated lazily so a host without a
+        # timezone database still starts and keeps serving interval schedules.
+        self.schedule_timezone = str(schedule_timezone or "UTC")
+        # Structural index limits and how long a stored graph is trusted while
+        # the project tree is unchanged. 0 refresh seconds = always re-analyse.
+        self.codegraph_max_files = max(50, int(codegraph_max_files))
+        self.codegraph_max_symbols = max(100, int(codegraph_max_symbols))
+        self.codegraph_max_edges = max(200, int(codegraph_max_edges))
+        self.codegraph_refresh_seconds = max(0, int(codegraph_refresh_seconds))
+        # Per-task ceilings, applied to every task this service creates. The
+        # engine defaults are deliberately conservative (they are the floor a
+        # bare TaskBudget carries); the deployment decides its real budget here,
+        # because a ceiling that is too low stops useful work mid-task and the
+        # only signal is a BUDGET_EXHAUSTED event.
+        self.task_budgets: dict[str, int | float] = {
+            key: value
+            for key, value in (task_budgets or {}).items()
+            if key in TaskBudget.model_fields and isinstance(value, (int, float))
+        }
         self.workspace_root = workspace_root
         self.context_builder = ContextBuilder(
             self.repository,
@@ -119,6 +171,7 @@ class TaskService:
             workspace_root=workspace_root,
             projects_root=projects_root,
             vision_enabled=self.vision_enabled,
+            agent_context_chars=agent_context_chars,
         )
         self.projects_root = projects_root
         self.default_execution_time = default_execution_time
@@ -221,6 +274,8 @@ class TaskService:
                 task.runtime.workflow = "project_audit"
         if self.default_execution_time is not None:
             task.budget.max_execution_time = max(1.0, self.default_execution_time)
+        for key, value in self.task_budgets.items():
+            setattr(task.budget, key, value)
         if requires_project_selection:
             task.runtime.clarification = {
                 "kind": "project_selection",
@@ -405,18 +460,65 @@ class TaskService:
         project.codegraph_version = existing.codegraph_version
         return await self.repository.update_project(project)
 
-    async def refresh_project_codegraph(self, project_id: str, max_files: int = 500) -> Project | None:
+    async def refresh_project_codegraph(
+        self,
+        project_id: str,
+        max_files: int | None = None,
+        force: bool = False,
+    ) -> Project | None:
+        """Refresh a project's structural index, reusing it when nothing changed.
+
+        The graph is orientation material for prompts, so rebuilding it before
+        every LLM phase spends seconds of walking and parsing to produce the same
+        answer, and churns ``codegraph_version`` (which perturbs prompts). A
+        stat-only fingerprint plus a short TTL makes the common case a no-op;
+        pass ``force`` (or set ``codegraph_refresh_seconds=0``) to rebuild.
+        """
         project = await self.repository.get_project(project_id)
         if project is None:
             return None
+        limit_files = self.codegraph_max_files if max_files is None else max(50, int(max_files))
+        stored = project.codegraph if isinstance(project.codegraph, dict) else {}
+        record = stored.get("build") if isinstance(stored.get("build"), dict) else {}
+        fingerprint = await asyncio.to_thread(
+            project_tree_fingerprint, project.path, limit_files
+        )
+        updated_at = _as_utc(project.codegraph_updated_at)
+        if (
+            not force
+            and stored
+            and fingerprint
+            and record.get("fingerprint") == fingerprint
+            and int(record.get("max_files", -1)) == limit_files
+            and int(record.get("max_symbols", -1)) == self.codegraph_max_symbols
+            and int(record.get("max_edges", -1)) == self.codegraph_max_edges
+            and self.codegraph_refresh_seconds > 0
+            and updated_at is not None
+            and (datetime.now(UTC) - updated_at).total_seconds()
+            <= self.codegraph_refresh_seconds
+        ):
+            return project
         result = await CodeGraphTool().execute(
             "build",
-            {"root": project.path, "max_files": max_files},
+            {
+                "root": project.path,
+                "max_files": limit_files,
+                "max_symbols": self.codegraph_max_symbols,
+                "max_edges": self.codegraph_max_edges,
+            },
             300,
         )
         if not result.success:
             raise ValueError(result.error or "project graph analysis failed")
-        project.codegraph = result.output
+        output = dict(result.output)
+        output["build"] = {
+            "fingerprint": fingerprint,
+            "max_files": limit_files,
+            "max_symbols": self.codegraph_max_symbols,
+            "max_edges": self.codegraph_max_edges,
+            "analyzed_at": datetime.now(UTC).isoformat(),
+        }
+        project.codegraph = output
         project.codegraph_version += 1
         project.codegraph_updated_at = datetime.now(UTC)
         return await self.repository.update_project(project)
@@ -596,10 +698,10 @@ class TaskService:
             if task.status in {TaskStatus.CANCELLED, TaskStatus.FAILED}:
                 continue
             try:
-                every = int(schedule.get("every_seconds") or 0)
-            except (TypeError, ValueError):
-                continue
-            if not SCHEDULE_MIN_SECONDS <= every <= SCHEDULE_MAX_SECONDS:
+                spec = spec_from_record(schedule, self.schedule_timezone)
+            except ScheduleError:
+                # An unreadable schedule is skipped, never guessed at: firing
+                # work from a spec nobody can interpret is worse than not firing.
                 continue
             due = _parse_schedule_time(schedule.get("next_run_at"))
             if due is None or due > moment:
@@ -623,9 +725,8 @@ class TaskService:
             if task.attachments:
                 clone.metadata["attachments"] = [dict(ref) for ref in task.attachments]
             await self.repository.save_task(clone)
-            while due <= moment:
-                due += timedelta(seconds=every)
-            schedule["next_run_at"] = due.isoformat()
+            following = advance(spec, due, moment)
+            schedule["next_run_at"] = following.isoformat()
             schedule["last_fired_at"] = moment.isoformat()
             schedule["runs"] = int(schedule.get("runs") or 0) + 1
             schedule["last_task_id"] = clone.id
@@ -638,7 +739,9 @@ class TaskService:
                     task_id=task.id,
                     event_type="SCHEDULE_FIRED",
                     payload={
-                        "every_seconds": every,
+                        "kind": spec["kind"],
+                        "every_seconds": spec["every_seconds"],
+                        "timezone": spec["timezone"],
                         "next_run_at": schedule["next_run_at"],
                         "fired_task_id": clone.id,
                         "runs": schedule["runs"],
@@ -651,8 +754,11 @@ class TaskService:
     async def create_schedule(
         self,
         goal: str,
-        every_seconds: int,
         *,
+        every_seconds: int | None = None,
+        at_hour: int | None = None,
+        at_minute: int | None = None,
+        timezone_name: str | None = None,
         title: str = "",
         description: str = "",
         project_id: str | None = None,
@@ -666,12 +772,13 @@ class TaskService:
         the window where a concurrent pass could run it before the schedule
         metadata existed.
         """
-        every = int(every_seconds)
-        if not SCHEDULE_MIN_SECONDS <= every <= SCHEDULE_MAX_SECONDS:
-            raise ValueError(
-                f"every_seconds must be between {SCHEDULE_MIN_SECONDS} and "
-                f"{SCHEDULE_MAX_SECONDS}"
-            )
+        spec = normalize_spec(
+            every_seconds=every_seconds,
+            at_hour=at_hour,
+            at_minute=at_minute,
+            timezone_name=timezone_name,
+            default_timezone=self.schedule_timezone,
+        )
         now = datetime.now(UTC)
         task = Task(
             parent_task_id=parent_task_id,
@@ -683,8 +790,8 @@ class TaskService:
             status=TaskStatus.WAITING,
             metadata={
                 "schedule": {
-                    "every_seconds": every,
-                    "next_run_at": (now + timedelta(seconds=every)).isoformat(),
+                    **spec,
+                    "next_run_at": advance(spec, None, now).isoformat(),
                     "enabled": True,
                     "runs": 0,
                     "created_at": now.isoformat(),
@@ -730,14 +837,72 @@ class TaskService:
                 node_id=root.id,
                 event_type="SCHEDULE_CREATED",
                 payload={
-                    "every_seconds": every,
+                    "kind": spec["kind"],
+                    "every_seconds": spec["every_seconds"],
+                    "at_hour": spec["at_hour"],
+                    "at_minute": spec["at_minute"],
+                    "timezone": spec["timezone"],
                     "next_run_at": task.metadata["schedule"]["next_run_at"],
                 },
             )
         )
         return task
 
-    async def cancel_schedule(self, task_id: str) -> Task | None:
+    def schedule_view(self, task: Task) -> dict[str, Any] | None:
+        """Serialise a holder task for the API, the dashboard and the tool."""
+        schedule = task.metadata.get("schedule")
+        if not isinstance(schedule, dict):
+            return None
+        try:
+            spec = spec_from_record(schedule, self.schedule_timezone)
+            description_text = describe_schedule(spec)
+        except ScheduleError:
+            spec, description_text = None, "unreadable schedule"
+        next_run = _parse_schedule_time(schedule.get("next_run_at"))
+        enabled = bool(schedule.get("enabled", True))
+        return {
+            "task_id": task.id,
+            "title": task.title,
+            "goal": task.goal,
+            "description": task.description,
+            "status": task.status.value,
+            "enabled": enabled,
+            # Paused and cancelled are both disabled; only one is reversible.
+            "paused": not enabled and can_restart(task.status),
+            "cancelled": not enabled and not can_restart(task.status),
+            "kind": spec["kind"] if spec else None,
+            "every_seconds": spec["every_seconds"] if spec else None,
+            "at_hour": spec["at_hour"] if spec else None,
+            "at_minute": spec["at_minute"] if spec else None,
+            "timezone": spec["timezone"] if spec else schedule.get("timezone"),
+            "text": description_text,
+            "next_run_at": next_run.isoformat() if next_run else None,
+            "next_run_local": (
+                local_label(next_run, spec["timezone"]) if next_run and spec else None
+            ),
+            "last_fired_at": schedule.get("last_fired_at"),
+            "last_task_id": schedule.get("last_task_id"),
+            "created_at": schedule.get("created_at"),
+            "cancelled_at": schedule.get("cancelled_at"),
+            "runs": int(schedule.get("runs") or 0),
+            "project_id": task.project_id,
+        }
+
+    async def list_schedules(self) -> list[dict[str, Any]]:
+        """Every holder task, nearest run first."""
+        views = [
+            view
+            for task in await self.repository.list_tasks()
+            if (view := self.schedule_view(task)) is not None
+        ]
+        views.sort(key=lambda item: (not item["enabled"], str(item["next_run_at"] or "")))
+        return views
+
+    async def _save_schedule(self, task: Task, schedule: dict[str, Any]) -> None:
+        task.metadata["schedule"] = schedule
+        await self.repository.save_task(task)
+
+    async def cancel_schedule(self, task_id: str, reason: str = "cancelled by user") -> Task | None:
         """Disable a schedule, stopping future runs but keeping its history."""
         task = await self.get_task(task_id)
         if task is None or not isinstance(task.metadata.get("schedule"), dict):
@@ -745,14 +910,127 @@ class TaskService:
         schedule = dict(task.metadata["schedule"])
         schedule["enabled"] = False
         schedule["cancelled_at"] = datetime.now(UTC).isoformat()
-        task.metadata["schedule"] = schedule
+        schedule["cancel_reason"] = reason
+        await self._save_schedule(task, schedule)
         if task.status in {TaskStatus.WAITING, TaskStatus.QUEUED, TaskStatus.READY}:
             task.status = TaskStatus.CANCELLED
             task.finished_at = datetime.now(UTC)
-        await self.repository.save_task(task)
+            await self.repository.save_task(task)
         await self.repository.save_event(
             TaskEvent(
-                task_id=task.id, event_type="SCHEDULE_CANCELLED", payload={"task_id": task.id}
+                task_id=task.id,
+                event_type="SCHEDULE_CANCELLED",
+                payload={"task_id": task.id, "reason": reason},
+            )
+        )
+        return task
+
+    async def resume_schedule(self, task_id: str) -> Task | None:
+        """Re-enable a paused schedule and place its next run in the future.
+
+        Recomputing from now avoids the surprise of a paused schedule firing the
+        instant it is resumed, which is what keeping a stale ``next_run_at``
+        would do. A cancelled schedule is terminal — the state machine forbids
+        reviving it — so this refuses instead of pretending otherwise.
+        """
+        task = await self.get_task(task_id)
+        if task is None or not isinstance(task.metadata.get("schedule"), dict):
+            return None
+        if not can_restart(task.status):
+            raise ValueError(
+                f"schedule is {task.status.value.lower()}; cancelled and finished "
+                "schedules are final. Create a new schedule instead of resuming this one."
+            )
+        schedule = dict(task.metadata["schedule"])
+        spec = spec_from_record(schedule, self.schedule_timezone)
+        now = datetime.now(UTC)
+        schedule["enabled"] = True
+        schedule.pop("paused_at", None)
+        schedule.pop("cancelled_at", None)
+        schedule.pop("cancel_reason", None)
+        schedule["resumed_at"] = now.isoformat()
+        schedule["next_run_at"] = advance(spec, None, now).isoformat()
+        await self._save_schedule(task, schedule)
+        if task.status is not TaskStatus.WAITING:
+            task.status = TaskStatus.WAITING
+            task.finished_at = None
+            await self.repository.save_task(task)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="SCHEDULE_RESUMED",
+                payload={"task_id": task.id, "next_run_at": schedule["next_run_at"]},
+            )
+        )
+        return task
+
+    async def pause_schedule(self, task_id: str) -> Task | None:
+        """Stop firing without ending the schedule.
+
+        Pausing keeps the holder alive and in ``WAITING``; only ``enabled``
+        flips, which is what ``reconcile_schedules`` checks. Cancelling is the
+        terminal version of the same intent and is a different call.
+        """
+        task = await self.get_task(task_id)
+        if task is None or not isinstance(task.metadata.get("schedule"), dict):
+            return None
+        if not can_restart(task.status):
+            raise ValueError(f"schedule is already {task.status.value.lower()}")
+        schedule = dict(task.metadata["schedule"])
+        now = datetime.now(UTC)
+        schedule["enabled"] = False
+        schedule["paused_at"] = now.isoformat()
+        await self._save_schedule(task, schedule)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="SCHEDULE_PAUSED",
+                payload={"task_id": task.id, "next_run_at": schedule.get("next_run_at")},
+            )
+        )
+        return task
+
+    async def update_schedule(
+        self,
+        task_id: str,
+        *,
+        every_seconds: int | None = None,
+        at_hour: int | None = None,
+        at_minute: int | None = None,
+        timezone_name: str | None = None,
+    ) -> Task | None:
+        """Replace the recurrence of an existing holder, keeping its history."""
+        task = await self.get_task(task_id)
+        if task is None or not isinstance(task.metadata.get("schedule"), dict):
+            return None
+        if not can_restart(task.status):
+            raise ValueError(
+                f"schedule is {task.status.value.lower()}; a finished schedule cannot "
+                "be edited. Create a new one instead."
+            )
+        schedule = dict(task.metadata["schedule"])
+        previous = spec_from_record(schedule, self.schedule_timezone)
+        spec = normalize_spec(
+            every_seconds=every_seconds,
+            at_hour=at_hour,
+            at_minute=at_minute,
+            timezone_name=timezone_name,
+            default_timezone=self.schedule_timezone,
+        )
+        now = datetime.now(UTC)
+        schedule.update(spec)
+        schedule["next_run_at"] = advance(spec, None, now).isoformat()
+        schedule["updated_at"] = now.isoformat()
+        await self._save_schedule(task, schedule)
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                event_type="SCHEDULE_UPDATED",
+                payload={
+                    "from": describe_schedule(previous),
+                    "to": describe_schedule(spec),
+                    "next_run_at": schedule["next_run_at"],
+                },
             )
         )
         return task
@@ -1564,6 +1842,138 @@ class TaskService:
                 if same_args:
                     return True
         return False
+
+    async def _observe_surface(
+        self, task: Task, node: TaskNode, operation: Operation
+    ) -> dict[str, Any] | None:
+        """Look again after an action whose effect is only knowable by looking.
+
+        This is the feedback half of the GUI loop. Without it a worker concludes
+        that a click worked because it issued one; with it, the runtime compares
+        the surface before and after and hands the *result* to the next turn,
+        including ``changed = false`` when nothing moved. Repeating an action
+        that changes nothing is how an agent loops forever, so the count of
+        fruitless attempts travels with the observation.
+        """
+        tool_definition = self.tools.definition(operation.tool)
+        if tool_definition is None or not tool_definition.observes_after(operation.method):
+            return None
+        if operation.tool == "browser":
+            # ``open`` and ``navigate`` name their url, so the observation can
+            # still fall back to a plain fetch when no debug port is listening.
+            args: dict[str, Any] = {}
+            if operation.args.get("port"):
+                args["port"] = operation.args["port"]
+            if operation.args.get("url"):
+                args["url"] = operation.args["url"]
+            follow_up = Operation(tool="browser", method="snapshot", args=args)
+            kind = "page"
+        elif operation.tool == "input":
+            follow_up = Operation(
+                tool="screen",
+                method="capture",
+                args={
+                    "monitor": operation.args.get("monitor"),
+                    "max_width": 1280,
+                },
+            )
+            kind = "screen"
+        else:
+            return None
+        try:
+            result = await self.tools.execute(follow_up)
+        except Exception:  # pragma: no cover - an observation must never break a turn
+            logger.debug("Post-action observation failed", exc_info=True)
+            return None
+        if not result.success or not isinstance(result.output, dict):
+            return None
+        output = result.output
+        artifacts = list(result.artifacts or [])
+        if artifacts:
+            await self._publish_operation_artifacts(task.id, node.id, artifacts, [])
+        if kind == "page":
+            digest = str(output.get("digest") or "")
+        else:
+            # The capture checksum is content-based, so two identical screens
+            # produce the same digest and "nothing moved" is decidable. Tools
+            # hand artifacts over as dicts; the ledger takes references.
+            first = artifacts[0] if artifacts else None
+            checksum = getattr(first, "checksum", None)
+            if checksum is None and isinstance(first, dict):
+                checksum = first.get("checksum")
+            digest = str(
+                checksum
+                or output.get("checksum")
+                or f"{output.get('image')}:{output.get('bytes')}"
+            )
+        previous = task.metadata.get("surface") if isinstance(task.metadata.get("surface"), dict) else {}
+        previous_digest = previous.get("digest")
+        changed = None if not previous_digest else previous_digest != digest
+        repeats = 0 if changed is not False else int(previous.get("repeats") or 0) + 1
+        now = datetime.now(UTC)
+        task.metadata["surface"] = {
+            "kind": kind,
+            "digest": digest,
+            "at": now.isoformat(),
+            "changed": changed,
+            "repeats": repeats,
+            "url": output.get("url"),
+            "action": f"{operation.tool}.{operation.method}",
+        }
+        await self.repository.save_task(task)
+        surface: dict[str, Any] = {
+            "kind": kind,
+            "digest": digest,
+            "previous_digest": previous_digest,
+            "changed": changed,
+            "attempts_without_change": repeats,
+            "at": now.isoformat(),
+        }
+        if repeats:
+            surface["hint"] = (
+                "The surface did not change after this action. Do not repeat it: "
+                "take a fresh observation and choose a different element, check that "
+                "the window or tab is focused, or ask the user."
+            )
+        if kind == "page":
+            surface.update(
+                {
+                    "url": output.get("url"),
+                    "title": output.get("title"),
+                    "text_excerpt": str(output.get("text", ""))[:1400],
+                    "elements": [
+                        {
+                            "ref": item.get("ref"),
+                            "role": item.get("role"),
+                            "name": item.get("name"),
+                        }
+                        for item in (output.get("elements") or [])[:24]
+                        if isinstance(item, dict)
+                    ],
+                    "elements_total": output.get("elements_total"),
+                    "coordinates": output.get("coordinates"),
+                }
+            )
+        else:
+            surface.update(
+                {
+                    "image": output.get("image"),
+                    "image_width": output.get("image_width"),
+                    "image_height": output.get("image_height"),
+                    "scale": output.get("scale"),
+                    "screen": output.get("screen"),
+                    "coordinate_hint": output.get("coordinate_hint"),
+                }
+            )
+        await self.repository.save_event(
+            TaskEvent(
+                task_id=task.id,
+                node_id=node.id,
+                event_type="SURFACE_OBSERVED",
+                payload={"action": f"{operation.tool}.{operation.method}", **surface},
+            )
+        )
+        return surface
 
     @staticmethod
     def _agent_observation(operation: Operation, observation: Any) -> dict[str, Any]:
@@ -2655,6 +3065,11 @@ class TaskService:
             verification = self.verifier.verify(operation_result)
             observation = operation_result.model_dump(mode="json")
             agent_observation = self._agent_observation(operation, observation)
+            # An action on a page or a screen is only finished once the runtime
+            # has looked again, so the next turn sees the result of its own action.
+            surface = await self._observe_surface(task, node, operation)
+            if surface is not None:
+                agent_observation["surface"] = surface
             if verification.decision.value != "SUCCESS":
                 agent_observation["verification"] = {
                     "decision": verification.decision.value,
@@ -2990,6 +3405,7 @@ class TaskService:
             if time_remaining is not None and time_remaining <= 0:
                 raise TimeoutError("codegraph refresh exceeded the task time budget")
             started = monotonic()
+            version_before = project.codegraph_version
             if time_remaining is None:
                 refreshed = await self.refresh_project_codegraph(project.id)
             else:
@@ -3008,19 +3424,23 @@ class TaskService:
                         "file_count": refreshed.codegraph.get("file_count") if refreshed.codegraph else 0,
                         "phase": phase,
                         "duration_seconds": monotonic() - started,
+                        # An unchanged version means the stored graph was reused:
+                        # no re-analysis, no prompt churn.
+                        "reused": refreshed.codegraph_version == version_before,
                     },
                 )
             )
             return True
         except Exception as error:
+            # A stale or missing index degrades orientation, it does not remove
+            # the capability: ``codegraph.query`` analyses on demand. Blocking the
+            # whole task because an index refresh failed is disproportionate, so
+            # the failure is recorded and reported instead of fatal.
             task.metadata["codegraph_error"] = str(error)
-            task.status = TaskStatus.BLOCKED
-            task.failure_reason = f"Unable to refresh project codegraph before {phase}: {error}"
-            task.finished_at = datetime.now(UTC)
-            if node is not None:
-                node.status = NodeStatus.BLOCKED
-                node.error = task.failure_reason
-                await self.repository.save_node(node)
+            task.metadata["codegraph_warning"] = (
+                "The structural index could not be refreshed; continue without it or "
+                "read the files directly."
+            )
             await self.repository.save_task(task)
             await self.repository.save_event(
                 TaskEvent(
@@ -3030,10 +3450,11 @@ class TaskService:
                         "error": str(error),
                         "project_id": task.project_id,
                         "phase": phase,
+                        "blocking": False,
                     },
                 )
             )
-            return False
+            return True
 
     async def execute_once(self, task_id: str, time_remaining: float | None = None) -> bool:
         task = await self.repository.get_task(task_id)

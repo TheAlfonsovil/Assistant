@@ -15,7 +15,7 @@ import pytest
 from assistant.application import TaskService
 from assistant.capabilities.artifacts import ArtifactTool
 from assistant.capabilities.memory import MemoryTool
-from assistant.context import ContextBuilder
+from assistant.context import VISIBLE_TOOL_NAMES, ContextBuilder
 from assistant.devices.registry import build_tool_registry
 from assistant.domain.contracts import ContractScope
 from assistant.domain.models import ErrorType, Operation, Project, Task, TaskRequest
@@ -198,14 +198,14 @@ def test_new_capabilities_are_visible_to_the_model(tmp_path):
     """A registered capability that the context builder drops does not exist."""
     registry = build_tool_registry(repository=_StubRepository())
     tool_names = {definition.name for definition in registry.definitions()}
-    assert {"screen", "memory", "artifact"} <= tool_names
+    assert {"screen", "memory", "artifact", "types"} <= tool_names
 
     builder = ContextBuilder(
         repository=_StubRepository(),
         tools=build_tool_registry(repository=_StubRepository()),
         vision_enabled=False,
     )
-    for intent in ("audit", "create", "edit", "browser", "general"):
+    for intent in ("audit", "create", "edit", "browser", "release", "deploy", "general"):
         groups = builder._available_actions(intent=intent)
         visible = {
             tool["name"]
@@ -213,7 +213,65 @@ def test_new_capabilities_are_visible_to_the_model(tmp_path):
             for tool in group["tools"]
             if isinstance(tool, dict)
         }
-        assert {"memory", "artifact", "screen"} <= visible, intent
+        assert {"memory", "artifact", "screen", "types"} <= visible, intent
+
+
+def test_every_real_capability_is_visible_in_every_intent():
+    """Not a sample of names: all of them, so a new tool cannot hide.
+
+    The failure this catches is the quiet one. Adding a tool and forgetting this
+    list does not raise anything: the tool is registered, dispatchable, and
+    invisible to the model, which then reports it cannot do what it can do.
+    """
+    registry = build_tool_registry(repository=_StubRepository())
+    registered = {
+        definition.name
+        for definition in registry.definitions()
+        # Placeholder branches only answer "adapter not connected".
+        if not definition.name.startswith("device.")
+    }
+    builder = ContextBuilder(repository=_StubRepository(), tools=registry, vision_enabled=False)
+
+    for intent in ("audit", "create", "edit", "browser", "release", "deploy", "general"):
+        groups = builder._available_actions(intent=intent)
+        visible = {
+            tool["name"]
+            for group in groups
+            for tool in group["tools"]
+            if isinstance(tool, dict)
+        }
+        assert registered <= visible, (intent, sorted(registered - visible))
+
+
+def test_the_visibility_list_names_only_real_capabilities():
+    """A stale name is a promise the catalog cannot keep."""
+    registry = build_tool_registry(repository=_StubRepository())
+    known = {definition.name for definition in registry.definitions()}
+    # ``schedule`` is registered by the composition root, which owns the service,
+    # and ``input`` only exists when the deployment opts into mouse/keyboard
+    # control. Both must be listed anyway: opting in has to be enough to make a
+    # capability visible, and the builder never sees whether input is on.
+    known |= {"schedule", "input"}
+
+    assert VISIBLE_TOOL_NAMES - known == set()
+    assert not [name for name in VISIBLE_TOOL_NAMES if name.startswith("device.")]
+
+
+def test_release_and_deploy_intents_lead_with_the_tools_that_do_the_work():
+    builder = ContextBuilder(
+        repository=_StubRepository(),
+        tools=build_tool_registry(repository=_StubRepository()),
+        vision_enabled=False,
+    )
+
+    def primary(intent: str) -> set[str]:
+        groups = builder._available_actions(intent=intent)
+        return {tool["name"] for tool in groups[0]["tools"]}
+
+    assert "git" in primary("release")
+    assert "deployment" in primary("deploy")
+    assert builder._planner_intent("haz commit de lo que hemos hecho") == "release"
+    assert builder._planner_intent("despliega la aplicacion") == "deploy"
 
 
 def test_task_scoped_capabilities_need_a_repository():

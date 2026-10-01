@@ -28,6 +28,7 @@ const distTools = computed(() => bars(m.value?.distribution?.tools))
 const distTasks = computed(() => bars(m.value?.distribution?.task_types))
 const distNodes = computed(() => bars(m.value?.distribution?.node_types))
 const actual = computed(() => m.value?.actual_tokens ?? {})
+const cache = computed(() => m.value?.cache ?? {})
 const reliability = computed(() => m.value?.reliability ?? {})
 const queue = computed(() => m.value?.queue ?? {})
 const cost = computed(() => m.value?.cost ?? {})
@@ -78,6 +79,15 @@ function hourLabel(iso) {
     </div>
 
     <div class="grid cols-3" style="margin-bottom:16px">
+      <div class="card"><h2>Caché de contexto</h2>
+        <div class="metric"><small>Acierto</small><b>{{ (cache.hit_rate ?? 0) }}%</b></div>
+        <div class="metric"><small>Tokens en caché</small><b>{{ formatNumber(cache.cached_tokens ?? 0) }}</b></div>
+        <div class="metric"><small>Tokens sin caché</small><b>{{ formatNumber(cache.miss_tokens ?? 0) }}</b></div>
+        <div v-if="cache.saving_usd !== null && cache.saving_usd !== undefined" class="metric">
+          <small>Ahorro por caché</small><b>{{ cache.saving_usd }} {{ cache.currency }}</b>
+        </div>
+        <div class="muted" style="font-size:11px;margin-top:8px">{{ cache.note }}</div>
+      </div>
       <div class="card"><h2>Cola</h2>
         <div class="metric"><small>En cola</small><b>{{ queue.queued ?? 0 }}</b></div>
         <div class="metric"><small>En ejecución</small><b>{{ queue.running ?? 0 }}</b></div>
@@ -92,8 +102,7 @@ function hourLabel(iso) {
         <div class="metric"><small>Éxito de herramienta</small><b>{{ reliability.tool_success_rate ?? 0 }}%</b></div>
         <div class="metric"><small>Reintentos programados</small><b>{{ reliability.retries ?? 0 }}</b></div>
       </div>
-      <div class="card"><h2>Motivos de bloqueo</h2>
-        <div v-if="!blockerRows.length" class="empty">Sin bloqueos registrados</div>
+      <div class="card"><h2>Motivos de bloqueo</h2>        <div v-if="!blockerRows.length" class="empty">Sin bloqueos registrados</div>
         <div v-for="[reason, count] in blockerRows" :key="reason" class="metric">
           <small class="truncate" style="max-width:240px">{{ reason }}</small><b>{{ count }}</b>
         </div>

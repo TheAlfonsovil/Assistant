@@ -28,6 +28,29 @@ blocking the task until its command timeout. Processes are tracked by the
 worker using their exact PID, and stdout/stderr are written under
 `data/processes/`; only processes started through this tool can be stopped.
 
+Interface work runs as an observation loop rather than a sequence of hopeful
+clicks: the runtime observes the surface, the worker acts on an element
+reference, and the runtime observes again and compares a digest. A click that
+changed nothing is reported as a failure, not as success, and the next turn gets
+the fresh observation (plus a warning when the same action keeps changing
+nothing). A page is observed as text — url, title, visible text, actionable
+elements — so it works with a text model; see
+`assistant/capabilities/README.md` for the contract.
+
+Code questions have two layers. `codegraph` is the structural index (files,
+symbols, imports) and is reused while the project tree does not change. `types`
+asks a real language server (pyright, via LSP) what a name **is**: the inferred
+type and signature (`hover`), where it is defined (`definition`) and every
+reference to it (`references`). It answers with the symbol located by name, and
+when Node or pyright is missing it says so with the exact reason instead of
+guessing.
+
+Budgets are configuration, not constants: LLM calls, tool calls, index queries,
+project reads, source bytes, plan nodes (also the agent step ceiling), retries,
+recovery attempts and wall-clock time are all enforced per task by the ledger
+and set from `ASSISTANT_TASK_MAX_*`. A ceiling that is too low does not fail
+loudly — it stops useful work halfway — so tune it in `.env` rather than in code.
+
 The initial user profile is read from `ASSISTANT_USER_*` variables in `.env`
 and persisted as one structured `user_profile` memory. The planner receives
 that profile together with task-relevant memories. The included
@@ -73,11 +96,18 @@ configuración, órdenes y monitorización está en [INITIALIZE.md](INITIALIZE.m
 El dashboard incluye un resumen operativo, una tabla de tareas filtrable, detalle
 de cada grafo con estados por nodo e histórico completo de transiciones,
 observabilidad del modo/decisión actual, vistas separadas de dispositivos,
-proyectos y memoria, y Chat-fast. Chat-fast confirma la petición inmediatamente
+proyectos, memoria y trabajo recurrente, y Chat-fast. Chat-fast confirma la petición inmediatamente
 por SSE y sigue emitiendo el estado de la tarea persistente hasta su resultado;
 si el navegador se desconecta, el runtime continúa ejecutándola y se puede
 retomar desde Tareas. El control de modo idle es independiente de cancelar una
 tarea: pausarlo detiene el mantenimiento automático, no borra ni cancela trabajo.
+
+El trabajo recurrente se programa desde la vista `Horarios` o pidiéndolo al
+asistente: cada horario es una tarea titular en espera que el runtime clona
+cuando vence, y puede ser un intervalo (`cada 30 minutos`) o una hora local
+(`todos los días a las 8:00 en Europe/Madrid`). Se puede pausar y reanudar;
+cancelar es final. Ver `assistant/capabilities/README.md` y §4 de
+[INITIALIZE.md](INITIALIZE.md).
 
 La ejecución normal muestra el resultado resumido. Para inspeccionar el ciclo completo usa `--fullflow`:
 

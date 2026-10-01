@@ -156,34 +156,59 @@ def infer_content_type(path: str | None) -> str:
     return _EXTENSION_TYPES.get(Path(str(path)).suffix.lower(), "")
 
 
+# ``detail`` is optional on an image part. ``low`` downscales the image before
+# inference (faster, cheaper) and ``original`` keeps it, which is what reading
+# text in a screenshot needs. Unknown values are dropped rather than forwarded.
+IMAGE_DETAILS = ("low", "high", "original", "auto")
+
+
 def image_parts(
     references: list[Any],
     *,
     content_type_prefix: str = "image/",
     max_bytes: int,
+    detail: str = "",
+    base_dir: str | Path | None = None,
+    unreadable: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build OpenAI-style multimodal parts for attachments that exist on disk."""
+    """Build OpenAI-style multimodal parts for attachments that exist on disk.
+
+    Relative paths resolve against ``base_dir`` (the workspace root) rather than
+    the process working directory, so a capture is attached the same way whatever
+    the process was started from. Anything that cannot be attached is recorded in
+    ``unreadable`` when the caller passes a list: a prompt that claims to carry
+    images it does not carry is worse than one that admits the gap.
+    """
+    normalized_detail = str(detail or "").strip().casefold()
+    if normalized_detail not in IMAGE_DETAILS:
+        normalized_detail = ""
+    base = Path(base_dir).expanduser() if base_dir else None
     parts: list[dict[str, Any]] = []
     for item in references or []:
         if not isinstance(item, dict):
             continue
-        path = item.get("path")
+        raw_path = item.get("path")
         content_type = str(item.get("content_type") or "") or infer_content_type(
-            str(path) if path else None
+            str(raw_path) if raw_path else None
         )
-        if not content_type.startswith(content_type_prefix) or not path:
+        if not content_type.startswith(content_type_prefix) or not raw_path:
             continue
+        path = Path(str(raw_path))
+        if base is not None and not path.is_absolute():
+            path = base / path
         try:
-            data = Path(str(path)).read_bytes()
+            data = path.read_bytes()
         except OSError:
+            if unreadable is not None:
+                unreadable.append(str(raw_path))
             continue
         if not data or len(data) > max_bytes:
+            if unreadable is not None:
+                unreadable.append(str(raw_path))
             continue
         encoded = base64.b64encode(data).decode("ascii")
-        parts.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{content_type};base64,{encoded}"},
-            }
-        )
+        payload: dict[str, Any] = {"url": f"data:{content_type};base64,{encoded}"}
+        if normalized_detail:
+            payload["detail"] = normalized_detail
+        parts.append({"type": "image_url", "image_url": payload})
     return parts

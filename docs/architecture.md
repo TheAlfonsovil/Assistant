@@ -25,6 +25,114 @@ than schema 5 are rejected at startup and must be recreated or exported.
 The recorded schema version must also match schema 5 exactly; the runtime does
 not silently reinterpret or upgrade an older database.
 
+## Prompt caching (why block order is a contract)
+
+The provider caches a request *prefix*: a hit is only counted for the leading
+tokens that are byte-identical to a previous request of the same role. Block
+order is therefore a cost decision, and it is enforced mechanically:
+
+- `scripts/reorder_prompts.py` puts stable blocks first (role instructions, tool
+  catalog, output schema, fixed limits, target descriptors) and volatile blocks
+  last (task, memory, evidence, observations, remaining budget). It refuses to
+  write a file that would lose a marker or a hand-written line, and it closes
+every prompt with a short anchor naming only the blocks that prompt has. The
+renderer is idempotent: the anchor is re-emitted from the blocks, never appended
+on top of a previous copy, so running the tool twice cannot duplicate it.
+- `constraints` is split into `limits` (fixed maxima → cached) and `remaining`
+  (counters that move every turn → tail).
+- `scripts/measure_prompt_cache.py` reports the identical prefix between two real
+  prompts, which is the number that predicts the cache hit rate.
+- The agent-side size ceiling follows the same rule. `agent_context_chars`
+  (default 200000, against a 400000 hard prompt cap) is the evidence budget for
+  one turn: a context that fits is passed through untouched, and when it does not
+  fit the degradation order is fixed — volatile evidence and observations shrink
+  first, then memory/project/index material, and the tool catalog is reduced in
+  argument detail only. It is never replaced by a fabricated catalog, and if it
+  must be truncated that is stated in the prompt. Hiding a capability is more
+  expensive than a longer prompt: the worker will not use what it cannot see.
+
+Measured effect on the agent turn: the identical prefix between two consecutive
+turns went from 13% of the prompt to 97.6%, so the tool catalog and the output
+schema — the two largest blocks — now bill at the cached rate on every turn.
+
+## The observation loop
+
+Perception is part of the engine, not a tool convention. `ToolDefinition
+.observable_methods` marks the methods whose effect is only knowable by looking;
+the runtime observes again after them, attaches the result to the next turn and
+records a `SURFACE_OBSERVED` event with a digest. `page.py` builds that
+observation (live DOM over CDP when a debug port answers, HTML parse otherwise),
+`cdp.py` is the protocol client, and `inventory.py` reports the peripherals. See
+`assistant/capabilities/README.md` for the full contract.
+
+## Semantic queries and the debugger (the two things text cannot answer)
+
+The codegraph is a heuristic index: it parses imports and symbols out of the
+source. It cannot say what a name *is*, and it cannot prove that a rename
+reached every call site. A language server can, so `types` asks one:
+
+- `lsp.py` is a small LSP client: `node` runs pyright's language server over
+  stdio with Content-Length framed JSON-RPC, one shared server per workspace
+  root, serialised with a lock, terminated when the application context closes.
+  Servers are cached per event loop, because a process belongs to the loop that
+  started it and reusing it from another one raises.
+- `semantics.py` is the tool. `hover` returns the real signature and docstring,
+  `definition` the site (across modules), `references` every use with a count and
+  an honest `truncated` flag, `rename` the language server's complete edit set,
+  and `diagnostics` the batch type checker's report as evidence. The symbol is
+  located by **name** inside the file, so a caller does not need the exact
+  column, and the number of name matches is reported so an ambiguous answer is
+  visible.
+- A rename is the operation text search cannot justify: the server resolves the
+  symbol, so the plan is complete by construction. Applying is opt-in
+  (`apply: true`) and refusen when the report was truncated — half a rename is
+  worse than none. Both workspace-edit shapes are accepted (`changes` and
+  `documentChanges`), and a file operation inside the plan is reported instead of
+  silently ignored.
+- Availability is a reported fact, not an assumption: `types.probe` returns
+  `available`, the resolved `node`/`langserver`/`type_checker` paths, the
+  analyzer version, and a reason when it cannot run (`missing-node`,
+  `missing-server`). The batch checker is invoked as `node index.js` directly:
+  measured 1.1 s against 18.5 s through `npx`, which is the difference between a
+  usable verification step and a stall.
+
+The debugger answers the third question: what the value **was**. `dap.py` speaks
+Debug Adapter Protocol to `debugpy` (same framing, same discipline: bounded
+output, explicit unavailability, per-call teardown) and `debugger.py` turns it
+into `debug.trace`: run a program with breakpoints, and for each stop report the
+frame, the file and line, and the local values. That replaces the print-statement
+loop for "why is this wrong on the second iteration", which is exactly the kind
+of evidence a deterministic verifier cannot produce on its own.
+
+## Desktop windows (the observation loop for native applications)
+
+The observation loop originally covered pages through CDP and everything else
+through a screenshot plus coordinates. Native windows had no structure at all
+until `window.py` added the Windows accessibility tree: `window.list` reports the
+top-level windows with title, class, process and rectangle, and
+`window.snapshot` walks one window's controls with name, type, enabled state and
+screen rectangle. The model gets a tree of names, which is what makes a desktop
+application reachable without a single per-application rule.
+
+Three rules keep it honest and bounded: it is **observation only** (acting stays
+with the opt-in `input.*`, which consumes the reported rectangle), the tree is
+**pruned** (a control is kept when it has a name, is actionable, or its type is
+structural — anonymous panes are noise), and `ref` values are valid **only inside
+the answer that produced them**, so nothing pretends to be a stable handle. COM
+must be initialised in the thread that uses it, and the API blocks, so every call
+runs off the event loop and reports its own duration.
+
+## Budgets (why they are configuration)
+
+The ledger enforces one budget per dimension and records `BUDGET_EXHAUSTED` when
+one runs out: LLM calls, tool calls, structural-index queries, project reads,
+source bytes, plan nodes (which also bound agent turns), retries and recovery
+attempts, plus wall-clock time. The `TaskBudget` model keeps conservative engine
+defaults for a bare task, and the deployment sets the real ceiling for every task
+it creates (`task_budgets` in `bootstrap.py`, from the `ASSISTANT_TASK_MAX_*`
+settings). A ceiling that is too low does not fail loudly: it stops useful work
+halfway, so it belongs in configuration rather than in a constant.
+
 ## Folder map
 
 ```text
@@ -45,6 +153,7 @@ assistant/
 |   |-- home/                 mock branch
 |   `-- robot/                mock branch
 |-- tools.py                 Tool contract, dispatch and normalized results
+|-- recurrence.py            when a schedule runs next (intervals and wall-clock)
 |-- capabilities/            user-facing abilities built from tools
 |-- application/              task lifecycle and graph execution
 |   |-- __init__.py            stable TaskService export
@@ -119,9 +228,28 @@ Planner-path codegraph queries refresh the project graph before querying, while
 direct codegraph queries never trust a persisted graph without a same-turn
 freshness proof.
 
+That refresh is conditional, because an index that is rebuilt on every phase
+costs seconds and moves the prompt prefix for nothing. A stat-only fingerprint of
+the project tree (path, size, mtime, ignoring the same directories the analysis
+ignores) is stored with the graph: unchanged tree, unchanged caps and a graph
+younger than `codegraph_refresh_seconds` means the stored graph is reused and
+`codegraph_version` does not move. Caps (`codegraph_max_files`,
+`codegraph_max_symbols`, `codegraph_max_edges`) are part of the identity, so
+raising one forces a rebuild. A failed refresh is recorded
+(`LLM_CODEGRAPH_REFRESH_FAILED`, `blocking: false`) and the phase continues:
+`codegraph.query` analyses on demand, so a stale index degrades orientation
+instead of killing the task. The manual endpoint rebuilds by default.
+
+Partiality travels with the graph. `truncated`, `edges_truncated`,
+`symbols_truncated` and the real totals are stored, `codegraph.query` reports
+`index_partial`, the prompt summary carries a `partial` block, and the summary
+keeps a `hot_files` list (files with most symbols) so a model can pick its first
+read without a round-trip. Presenting a capped index as complete would be worse
+than having none: the model reads "no edge" as "no dependency".
+
 For project work, the orchestrator receives only codegraph metadata and version
-information. The worker queries the graph or reads project files when evidence
-is needed; the complete graph is never copied into every prompt.
+information. The worker queries the graph or reads files when evidence is needed;
+the complete graph is never copied into every prompt.
 
 ## Add a new device branch
 

@@ -50,9 +50,13 @@ class DeviceRegistry:
         self,
         branches: tuple[DeviceBranch, ...] = DEVICE_BRANCHES,
         enable_input: bool = False,
+        workspace_root: str = ".",
+        langserver_path: str = "",
     ):
         self.branches = branches
         self.enable_input = enable_input
+        self.workspace_root = workspace_root
+        self.langserver_path = langserver_path
 
     def register(self, registry: ToolRegistry) -> None:
         from assistant.devices.computer.actions import register_actions
@@ -60,16 +64,30 @@ class DeviceRegistry:
         registry.register(NotificationTool())
         for branch in self.branches:
             if branch.name == "computer" and branch.status == "ACTIVE":
-                register_actions(registry, enable_input=self.enable_input)
+                register_actions(
+                    registry,
+                    enable_input=self.enable_input,
+                    workspace_root=self.workspace_root,
+                    langserver_path=self.langserver_path,
+                )
             elif branch.status == "MOCK":
                 registry.register(MockDeviceTool(branch))
 
 
 def build_tool_registry(
-    policy=None, enable_input: bool = False, repository=None, rate_limit=None
+    policy=None,
+    enable_input: bool = False,
+    repository=None,
+    rate_limit=None,
+    workspace_root: str = ".",
+    langserver_path: str = "",
 ) -> ToolRegistry:
     registry = ToolRegistry([], policy=policy, rate_limit=rate_limit)
-    DeviceRegistry(enable_input=enable_input).register(registry)
+    DeviceRegistry(
+        enable_input=enable_input,
+        workspace_root=workspace_root,
+        langserver_path=langserver_path,
+    ).register(registry)
     if repository is not None:
         # Task-scoped capabilities need the ledger, so they are only registered
         # when a repository exists (the API and CLI always provide one).

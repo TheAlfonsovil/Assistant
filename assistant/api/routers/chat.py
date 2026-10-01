@@ -46,7 +46,7 @@ async def chat_agent_command(request: Request, chat_request: ChatRequest) -> dic
             if normalized.startswith(keyword):
                 command, argument = "crear", message[len(keyword):].strip()
                 break
-    if command in {"cancela", "cancelar", "detÃ©n", "detener", "para"}:
+    if command in {"cancela", "cancelar", "detén", "detener", "para"}:
         command = "cancelar"
     if command in {"elimina", "eliminar", "borra", "borrar"}:
         command = "borrar"
@@ -71,7 +71,7 @@ async def chat_agent_command(request: Request, chat_request: ChatRequest) -> dic
 
     if command in {"crear", "create"}:
         if not argument:
-            raise HTTPException(422, "Indica el objetivo despuÃ©s de 'crear'.")
+            raise HTTPException(422, "Indica el objetivo después de 'crear'.")
         task = await context.service.create_task(
             TaskRequest(
                 goal=argument,
@@ -98,15 +98,15 @@ async def chat_agent_command(request: Request, chat_request: ChatRequest) -> dic
     action = operations.get(command)
     if action:
         if not argument:
-            raise HTTPException(422, f"Indica el id despuÃ©s de '{command}'.")
+            raise HTTPException(422, f"Indica el id después de '{command}'.")
         task = await context.service.get_task(argument)
         if task is None:
-            raise HTTPException(404, "No se encontrÃ³ esa tarea. Usa el id completo.")
+            raise HTTPException(404, "No se encontró esa tarea. Usa el id completo.")
         if action in {"cancel", "delete"} and not chat_request.confirm:
             verb = "cancelar" if action == "cancel" else "borrar"
             return {
                 "action": "confirmation_required",
-                "message": f"Voy a {verb} la tarea {task.id[:8]} ({task.goal}). Confirma la operaciÃ³n.",
+                "message": f"Voy a {verb} la tarea {task.id[:8]} ({task.goal}). Confirma la operación.",
                 "task": _task_json(task),
             }
         try:

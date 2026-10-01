@@ -61,10 +61,18 @@ class ToolDefinition(BaseModel):
     #: A single flag cannot describe a tool like ``http``, where GET must always
     #: observe fresh state while POST must never silently run twice.
     idempotent_methods: list[str] = Field(default_factory=list)
+    #: Methods whose effect is only knowable by looking at a surface (a page, a
+    #: screen). The runtime observes again right after them, so the next turn
+    #: decides from the result of its own action instead of assuming it worked.
+    observable_methods: list[str] = Field(default_factory=list)
     evidence: dict[str, Any] = Field(default_factory=dict)
 
     def arguments_for(self, method: str) -> dict[str, Any]:
         return self.method_argument_schema.get(method, self.argument_schema)
+
+    def observes_after(self, method: str) -> bool:
+        """True when this method must be followed by a fresh observation."""
+        return method in self.observable_methods
 
 
 class Tool(ABC):

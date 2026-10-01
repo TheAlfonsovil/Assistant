@@ -72,7 +72,12 @@ onMounted(load)
       <div v-if="p.description" class="muted" style="margin-bottom:8px">{{ p.description }}</div>
       <div>
         <span class="chip">{{ p.project_type }}</span>
-        <span class="chip">v{{ p.codegraph_version || 0 }}</span>
+        <span v-if="p.codegraph" class="chip">
+          {{ p.codegraph.module_count || 0 }} mód · {{ p.codegraph.edge_count || 0 }} aristas
+        </span>
+        <span v-if="p.codegraph?.partial" class="chip warn" title="El índice se recortó por los topes configurados">
+          ⚠ índice parcial
+        </span>
         <span v-if="p.is_default" class="chip">default</span>
       </div>
       <div class="row" style="margin-top:12px">
@@ -82,7 +87,10 @@ onMounted(load)
         <span class="grow" />
         <button class="btn danger" @click="remove(p)">Eliminar</button>
       </div>
-      <div class="muted" style="font-size:11px;margin-top:8px">Auditoría: {{ date(p.last_audited_at) }}</div>
+      <div class="muted" style="font-size:11px;margin-top:8px">
+        Índice: {{ p.codegraph_updated_at ? date(p.codegraph_updated_at) : 'sin construir' }}
+        · Auditoría: {{ date(p.last_audited_at) }}
+      </div>
     </div>
   </div>
   <div v-if="!projects.length" class="empty">Sin proyectos.</div>

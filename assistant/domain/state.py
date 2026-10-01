@@ -40,6 +40,21 @@ def validate_task_transition(previous: TaskStatus, current: TaskStatus) -> None:
         raise InvalidStateTransition(f"task cannot transition from {previous} to {current}")
 
 
+# Statuses from which work cannot be restarted. Defined beside the transition
+# table so the two cannot disagree, and used by anything that wants to re-arm a
+# task (recurring schedules, for instance).
+TERMINAL_TASK_STATUSES = frozenset(
+    {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
+
+
+def can_restart(status: TaskStatus) -> bool:
+    """True when a task in this state can still be put back into play."""
+    if status in TERMINAL_TASK_STATUSES:
+        return False
+    return status is TaskStatus.WAITING or TaskStatus.WAITING in _TASK_TRANSITIONS[status]
+
+
 def validate_node_transition(previous: NodeStatus, current: NodeStatus) -> None:
     if previous != current and current not in _NODE_TRANSITIONS[previous]:
         raise InvalidStateTransition(f"node cannot transition from {previous} to {current}")
