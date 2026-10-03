@@ -1,6 +1,7 @@
 .env
 
 data/processes/
+data/screenshots/
 data/browser-interactions.jsonl
 
 frontend/node_modules/
